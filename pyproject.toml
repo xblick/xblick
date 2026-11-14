@@ -39,6 +39,8 @@ dependencies = [
     "pillow>=10",
     # the terminal interface, `xblick` without a command (tui.py); its API changes between major versions
     "textual>=8.2,<9",
+    # the lists of xblick cam and xblick view without a source (pick.py); Textual depends on it as well
+    "rich>=14.2",
 ]
 
 [project.scripts]
