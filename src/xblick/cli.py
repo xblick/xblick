@@ -246,7 +246,7 @@ def _choose_camera(args, parser):
         raise cam.CamError(f"{', '.join(given)} without a source: the list chooses the mode; give the source as well, "
                            "or leave them out")
     prog = parser.prog.split()  # ["xblick", "cam"]
-    rest = args.argv[1:]  # the options given; no source, as there is none
+    rest = GIVEN[1:]  # the options given; no source, as there is none
     selected = cam.select_source(lambda chosen: [*prog, *chosen.arguments(), *rest])
     choice = selected.choice
     args.source = selected.source
@@ -842,7 +842,7 @@ def _view(args) -> int:
         if not bases:
             # the options given (no streams, as there are none) without the viewer's, which the list chooses
             flags = ("--browser", "--vlc", "--no-player")
-            rest = [o for o in args.argv[1:] if not (o.startswith("--") and len(o) > 2
+            rest = [o for o in GIVEN[1:] if not (o.startswith("--") and len(o) > 2
                                                      and any(f.startswith(o) for f in flags))]
 
             def command(chosen: list[str], viewer: str) -> list[str]:
@@ -875,6 +875,7 @@ def main(argv=None) -> int:
 
         return tui.run(_interface_connection(argv, prog))
     args = parse(argv, prog)
+    GIVEN[:] = argv  # as given: xblick cam and xblick view print the command that a list resolved to
     end_on_signals()  # SIGTERM and SIGINT as Ctrl-C, also as a background job of a script
     try:
         return args.run(args)
@@ -888,6 +889,7 @@ def main(argv=None) -> int:
         return 1
 
 
+GIVEN: list[str] = []  # main()'s arguments, the command first
 INTERFACE_OPTIONS = ("--connect", "--listen", "--zenoh-mode", "--config")  # without a command: the interface's
 
 
@@ -918,7 +920,6 @@ def parse(argv: list[str], prog: str = "xblick") -> argparse.Namespace:
     """A command line's arguments, checked; a wrong one exits as argparse does (SystemExit 2, the reason on stderr)."""
     parser = build_parser(prog)
     args = parser.parse_args(argv)
-    args.argv = list(argv)  # as given: xblick cam and xblick view print the command a list resolved to
     if args.command == "rerun" and args.web is not None and args.serve is None:
         parser.error("--web needs --serve")
     return args

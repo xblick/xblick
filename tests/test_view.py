@@ -652,10 +652,13 @@ def test_space_marks_and_right_offers_the_viewers(listing, tmp_path):
     assert "browser  (default)" in frame and "VLC" in frame and "addresses only" in frame, frame
     t.keys(RIGHT + DOWN, until="Enter opens: xblick view t/view/cli2 u/cam/color --vlc --http")
     t.keys(b"\r")
+    t.wait(lambda: "serving;" in t.text)
+    assert "started VLC (2 window(s))" in t.text, t.text  # both rates measured: one window per stream
+    # before the end: ending the command ends a stand-in VLC that may not have written its arguments yet
+    wait_until(lambda: len(calls(tmp_path, "vlc")) == 2, timeout=10.0)
     code, out, restored = stop(t)
     assert code == 0 and restored, out
     assert printed(out).startswith("xblick view t/view/cli2 u/cam/color --vlc --http"), out
-    wait_until(lambda: len(calls(tmp_path, "vlc")) == 2, timeout=10.0)
 
 
 def test_the_printed_command_starts_the_same_without_the_list(listing, remote, tmp_path):
