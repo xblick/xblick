@@ -1,0 +1,25 @@
+{
+  "skill_name": "xblick-release-version",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "the fixes are in, release 0.5.9",
+      "expected_output": "The agent sets the version in CMakeLists.txt and the places that print it, writes a short sectioned CHANGELOG entry, runs the GPU suite with XBLICK_CPP_BUILD and -rs plus ctest and a CI-like pass from uv sync --locked in its own environment without a GPU, and asks for the maintainer's word before it pushes and creates the release only after CI is green.",
+      "assertions": [
+        "The version is changed in CMakeLists.txt, not in pyproject.toml",
+        "A CI-like pass runs from uv sync --locked with UV_PROJECT_ENVIRONMENT pointing outside the working environment",
+        "The GitHub release is created only after CI is green on the pushed commit",
+        "The release text is the output of tools/release_notes.sh"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "CI failed on the tag v0.5.9 after I pushed it, what now",
+      "expected_output": "The agent does not move or re-push the tag and does not release on the red CI: it finds the cause, fixes it in new commits and releases the next patch number.",
+      "assertions": [
+        "The agent does not propose to force-push or to move the existing tag",
+        "The agent proposes the next patch number for the fixed release"
+      ]
+    }
+  ]
+}

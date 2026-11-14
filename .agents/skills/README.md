@@ -133,4 +133,4 @@ git clone --depth 1 https://github.com/agentskills/agentskills.git /tmp/agentski
 for d in .agents/skills/*/; do /tmp/skills-ref-venv/bin/skills-ref validate "$d"; done
 ```
 
-All four skills passed on 2026-11-11. Claude Code also offers `claude plugin validate .claude/skills`.
+All five skills passed on 2026-11-14. Claude Code also offers `claude plugin validate .claude/skills`.

@@ -28,6 +28,7 @@ one: `.agents/skills/README.md`.
 | `xblick-run-nodes` | several nodes for an experiment or a demo, on one or more GPUs and PCs |
 | `xblick-benchmark-nodes` | throughput, latency, GPU load and memory of nodes and setups |
 | `xblick-develop-tui` | the terminal interface (`xblick`): tabs, dialogs, layout, its tests and screenshots |
+| `xblick-release-version` | a release: the gate before a push, version, CHANGELOG entry, GitHub release, PyPI, follow-up |
 
 - Before a task, look for a matching skill and follow it. Read its `SKILL.md` in full.
 - After a complex task that is likely to recur and can be abstracted (no batch names, dates or results of one
@@ -68,6 +69,20 @@ Reference check: `tools/check_references.sh` (no internal or robot-framework nam
 - Documentation changes in the same commit as the code. New topic or option: update `docs/reference/`. History goes
   to `CHANGELOG.md`, never into a page.
 - A node stamps a result with the capture stamp of its input, never with the processing time.
+- Git: only new commits on a branch that equals the public `main`. Never amend, rebase or reset what is pushed; never
+  force-push. Write the message to a file and `git commit -F` it (subject, empty line, body).
+- Public repository: `tools/check_references.sh` exits 0; nothing internal in files or commit messages.
+- Within a minor line (0.5.x) nothing on the wire changes and no API breaks. An addition that older programs ignore
+  needs the maintainer's word, a new minor version his approval. A changed default or a new command is a patch,
+  named under `### Changed`.
+- Nothing chooses silently: fixed, documented defaults; convenience in the `xblick` command (nodes: "Node
+  repositories" below).
+- Code that sends commands to a robot's controllers (`session.command`, `ask_once`, the controller manager,
+  parameter sets, a torque step) gets an independent adversarial review before a release. State its guarantees as
+  they are: best effort or guaranteed.
+- Tests: never kill by name pattern; leave no process and no ring in `/dev/shm`; never rely on default ports being
+  free or on how the network treats an address that does not answer.
+- A problem found now and fixed later becomes a GitHub issue; name it by number in the report.
 - Code style: match the surrounding code. Docstrings say what, comments say why. 120 columns. No new dependency
   without need.
 

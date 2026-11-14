@@ -1,0 +1,18 @@
+[
+  {"query": "release 0.5.9", "should_trigger": true},
+  {"query": "put the new version on PyPI", "should_trigger": true},
+  {"query": "is this ready to push as a release candidate", "should_trigger": true},
+  {"query": "bump the version and tag it", "should_trigger": true},
+  {"query": "write the release notes for the next version", "should_trigger": true},
+  {"query": "ship the fixes we made today", "should_trigger": true},
+  {"query": "run the full gate before we push main", "should_trigger": true},
+  {"query": "the publish workflow failed after the tag, what now", "should_trigger": true},
+  {"query": "write a new node for a depth model", "should_trigger": false},
+  {"query": "start three nodes on two GPUs for a demo", "should_trigger": false},
+  {"query": "measure the latency of the yolox node", "should_trigger": false},
+  {"query": "the graph tab of xblick is hard to read", "should_trigger": false},
+  {"query": "raise the xblick pin of the sam3 node", "should_trigger": false},
+  {"query": "what changed in 0.5.3", "should_trigger": false},
+  {"query": "fix the failing test in test_view.py", "should_trigger": false},
+  {"query": "explain how the rings work", "should_trigger": false}
+]
