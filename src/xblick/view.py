@@ -1,8 +1,10 @@
-"""``xblick view``: streams as MJPEG over HTTP, shown in VLC or a browser, from Python's standard library.
+"""``xblick view``: streams as MJPEG over HTTP, shown in a browser or VLC, from Python's standard library.
 
-    xblick view test/camera/color                 # serves it and starts VLC (one window per stream)
-    xblick view a/color b/depth --browser         # the grid page of all streams, side by side, in the browser
+    xblick view test/camera/color                 # serves it and opens the grid page in the browser
+    xblick view a/color b/depth                   # both side by side on that page
+    xblick view test/camera/color --vlc           # ... in VLC instead, one window per stream
     xblick view test/camera/color --no-player     # serves it and prints the addresses only
+    xblick view                                   # choose the streams and the viewer in a list
 
 The command subscribes to each named stream's compressed transport and serves its JPEG frames unchanged, one URL per
 stream (``/<stream>.mjpg``, ``multipart/x-mixed-replace``) and a page with a grid of all of them (``/``).
@@ -10,16 +12,27 @@ Depth (16-bit, RVL or PNG) is decoded, coloured by ``overlay.depth_colours`` (a 
 green to blue at 5000 mm, no depth black) and encoded as JPEG; other frames that are no JPEG are encoded as JPEG.
 Point clouds and streams without compressed transport are refused.
 
-By default it starts VLC: the program ``vlc`` on PATH, one window per stream, ``--network-caching=100``. Without
-``vlc`` on PATH it says so and, on a terminal, asks whether to open the browser view instead; without a terminal it
-does not ask and keeps serving. ``--browser`` opens the grid page in the system's browser; ``--no-player`` starts
-nothing. On a system without a display (Linux: neither DISPLAY nor WAYLAND_DISPLAY set) it starts no VLC and no
-browser and asks nothing: it prints the addresses and how to open them from another PC (``--http``, or
-``ssh -L PORT:127.0.0.1:PORT <this PC>``), and keeps serving.
+By default it opens the grid page in the system's browser. ``--vlc`` starts VLC instead (the program ``vlc`` on
+PATH; without it the command ends with an error), one window per stream; ``--no-player`` starts nothing. On a system
+without a display (Linux: neither DISPLAY nor WAYLAND_DISPLAY set) it starts no VLC and no browser: it prints the
+addresses and how to open them from another PC (``--http``, or ``ssh -L PORT:127.0.0.1:PORT <this PC>``), and keeps
+serving.
+
+**VLC** plays such a stream only in time with a rate hint (``--mjpeg-fps``): without it, it lags behind whatever its
+cache. This is the one place where a measured value sets an option: the rate of a stream is the inverse of the median
+interval between its last RATE_FRAMES frames as they arrive here (at least RATE_MIN_FRAMES frames, waited for at
+most RATE_WAIT_S seconds), and VLC gets ``--mjpeg-fps`` = that rate times MJPEG_FPS_FACTOR, rounded up (35 for 30
+frames/s), with ``--network-caching=20 --no-audio``. A stream without enough frames in that time gets no VLC window,
+with one line that says so. A stream whose rate changes a lot plays badly in VLC; the browser has no such hint.
+The start lines give, per stream, its measured rate and the command to open it in VLC by hand.
+
+``xblick view`` without a stream on a terminal shows the image streams it finds as a tree by namespace and camera
+(pick.py): Space marks streams, Enter opens the marked ones (or the one under the cursor) in the browser, Right
+offers the viewers (browser, VLC, addresses only). It prints the command that starts the same without the list.
 
 While it serves on a terminal, the key v opens the VLC windows that are not open (any more) and b the browser view,
 without Enter, also with --no-player; on a headless system they start nothing. Without a terminal nothing reads
-stdin. The start lines give, per stream, the command to open it in VLC by hand.
+stdin.
 
 Each client gets the newest frame whenever it can take one: a slow client skips frames and holds up neither the
 subscriber nor the other clients. It listens on 127.0.0.1 by default (this PC only); ``--http 0.0.0.0:PORT`` opens
@@ -28,10 +41,13 @@ it to the network WITHOUT A PASSWORD: anyone who can reach the address can watch
 
 from __future__ import annotations
 
+import collections
 import html
 import http.server
 import io
+import math
 import os
+import shlex
 import shutil
 import socket
 import subprocess
@@ -40,7 +56,7 @@ import threading
 import time
 import webbrowser
 
-from . import topics
+from . import pick, topics
 from .camera import find_streams, wait_for_info
 from .codecs import JPEG, decompress, parse_format
 from .msg import CompressedImage
@@ -50,10 +66,15 @@ from .overlay import DEPTH_FAR_MM, DEPTH_NEAR_MM, depth_colours
 PORT = 8090  # the default port (fixed)
 LISTEN = f"127.0.0.1:{PORT}"
 BOUNDARY = "xblickframe"
-VLC_CACHE_MS = 100  # VLC's --network-caching when xblick view starts it: little delay, a few frames of buffer
+VLC_CACHE_MS = 20  # VLC's --network-caching when xblick view starts it (with the rate hint, kept up in tests)
+RATE_FRAMES = 31  # the rate of a stream from the intervals between its last frames (module docstring)
+RATE_MIN_FRAMES = 6
+RATE_WAIT_S = 5.0
+MJPEG_FPS_FACTOR = 1.15  # VLC's --mjpeg-fps a little above the rate: 35 for 30 frames/s
 CLIENT_TIMEOUT_S = 10.0  # a client that takes no frame for this long is dropped
 JPEG_QUALITY = 85
-DEPTH_RANGE = (DEPTH_NEAR_MM, DEPTH_FAR_MM)  # depth colours: red at 300 mm through green to blue at 5000 mm (fixed)  # for frames xblick view encodes itself (depth, PNG, raw)
+# depth colours for frames xblick view encodes itself: red at 300 mm through green to blue at 5000 mm (fixed)
+DEPTH_RANGE = (DEPTH_NEAR_MM, DEPTH_FAR_MM)
 
 
 class ViewError(RuntimeError):
@@ -76,16 +97,38 @@ class _Feed:
         self.number = 0
         self.cond = threading.Condition()
         self.error: BaseException | None = None
+        self.arrivals: collections.deque[float] = collections.deque(maxlen=RATE_FRAMES)  # time.monotonic()
 
     def put(self, jpeg: bytes):
         with self.cond:
             self.jpeg, self.number = jpeg, self.number + 1
+            self.arrivals.append(time.monotonic())
             self.cond.notify_all()
 
     def next_after(self, number: int, timeout: float) -> tuple[int, bytes | None]:
         with self.cond:
             self.cond.wait_for(lambda: self.number > number, timeout)
             return self.number, self.jpeg
+
+    def rate(self) -> float | None:
+        with self.cond:
+            return rate_of(list(self.arrivals))
+
+
+def rate_of(arrivals: list[float]) -> float | None:
+    """Frames per second from arrival times (seconds, ascending): the inverse of the median interval; None for fewer
+    than RATE_MIN_FRAMES times (module docstring)."""
+    if len(arrivals) < RATE_MIN_FRAMES:
+        return None
+    intervals = sorted(b - a for a, b in zip(arrivals, arrivals[1:]))
+    n = len(intervals)
+    median = intervals[n // 2] if n % 2 else (intervals[n // 2 - 1] + intervals[n // 2]) / 2
+    return 1.0 / median if median > 0 else None
+
+
+def mjpeg_fps(rate: float) -> int:
+    """VLC's --mjpeg-fps for a stream of ``rate`` frames/s: MJPEG_FPS_FACTOR times it, rounded up."""
+    return math.ceil(round(rate * MJPEG_FPS_FACTOR, 6))
 
 
 def to_jpeg(message: CompressedImage, depth_range: tuple[float, float]) -> bytes:
@@ -161,6 +204,13 @@ class View:
         for feed in self.feeds.values():
             if feed.error is not None:
                 raise ViewError(f"{feed.base}: {type(feed.error).__name__}: {feed.error}")
+
+    def rates(self, bases: list[str], wait: float = RATE_WAIT_S) -> dict[str, float | None]:
+        """The rate of each of ``bases`` (rate_of), waiting up to ``wait`` seconds for those without one yet."""
+        end = time.monotonic() + wait
+        while any(self.feeds[b].rate() is None for b in bases) and time.monotonic() < end:
+            time.sleep(0.05)
+        return {b: self.feeds[b].rate() for b in bases}
 
     def url(self, base: str | None = None) -> str:
         host = "127.0.0.1" if self.host in ("0.0.0.0", "") else self.host
@@ -247,10 +297,15 @@ class View:
         self.server.server_close()
 
 
-def start_vlc(vlc: str, urls: list[str]) -> list[subprocess.Popen]:
-    """One VLC per stream (``vlc`` the program), with a small network cache (VLC_CACHE_MS)."""
-    return [subprocess.Popen([vlc, f"--network-caching={VLC_CACHE_MS}", url], stdin=subprocess.DEVNULL,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for url in urls]
+def vlc_arguments(url: str, rate: float) -> list[str]:
+    """VLC's options for a stream of ``rate`` frames/s at ``url`` (module docstring), without the program."""
+    return [f"--mjpeg-fps={mjpeg_fps(rate)}", f"--network-caching={VLC_CACHE_MS}", "--no-audio", url]
+
+
+def start_vlc(vlc: str, url: str, rate: float) -> subprocess.Popen:
+    """One VLC window (``vlc`` the program) for a stream of ``rate`` frames/s."""
+    return subprocess.Popen([vlc, *vlc_arguments(url, rate)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
 
 
 def headless() -> bool:
@@ -277,18 +332,11 @@ def open_browser(url: str, prog: str):
         print(f"{prog}: no browser could be opened; open {url} yourself", flush=True)
 
 
-def _ask(question: str) -> bool:
-    """The question on stdout (input() would print it on stderr on a terminal), the answer from stdin; no answer
-    (end of input) is no."""
-    print(question, end="", flush=True)
-    return sys.stdin.readline().strip().lower() in ("y", "yes")
-
-
 NO_DISPLAY = "this system has no display (neither DISPLAY nor WAYLAND_DISPLAY is set)"
 
 
 class _Players:
-    """The VLC windows, one per stream; ``open`` starts those that are not open (any more)."""
+    """The VLC windows, one per stream; ``open_vlc`` starts those that are not open (any more)."""
 
     def __init__(self, view: View, prog: str):
         self.view, self.prog = view, prog
@@ -296,20 +344,28 @@ class _Players:
         self.closed_said = False
 
     def open_vlc(self, asked: bool):
-        """The windows that are not open; ``asked``: by the key v (then one line also when nothing is to start)."""
+        """The windows that are not open, each with its stream's rate hint (measured now, View.rates); ``asked``: by
+        the key v (then one line also when nothing is to start)."""
         if headless():
             print(f"{self.prog}: {NO_DISPLAY}: nothing started", flush=True)
             return
         vlc = shutil.which("vlc")
         if vlc is None:
-            print(f"{self.prog}: VLC is not installed (no vlc on PATH)", flush=True)
+            print(f"{self.prog}: {NO_VLC}", flush=True)
             return
         missing = [b for b in self.view.feeds if b not in self.processes or self.processes[b].poll() is not None]
-        for base, process in zip(missing, start_vlc(vlc, [self.view.url(b) for b in missing])):
-            self.processes[base] = process
-        if missing or asked:
-            print(f"{self.prog}: started VLC ({len(missing)} window(s))" if missing else
-                  f"{self.prog}: the VLC windows are open", flush=True)
+        if not missing:
+            if asked:
+                print(f"{self.prog}: the VLC windows are open", flush=True)
+            return
+        started = 0
+        for base, rate in self.view.rates(missing).items():
+            by_hand(self.view, base, rate, self.prog)
+            if rate is not None:
+                self.processes[base] = start_vlc(vlc, self.view.url(base), rate)
+                started += 1
+        if started:
+            print(f"{self.prog}: started VLC ({started} window(s))", flush=True)
         self.closed_said = False
 
     def all_closed(self) -> bool:
@@ -324,6 +380,19 @@ class _Players:
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 process.kill()
+
+
+NO_VLC = "VLC is not installed (no vlc on PATH)"
+
+
+def by_hand(view: View, base: str, rate: float | None, prog: str):
+    """The line with a stream's measured rate and the command that opens it in VLC by hand, or why there is none."""
+    if rate is None:
+        print(f"{prog}: {base}: its rate is unknown (fewer than {RATE_MIN_FRAMES} frames within {RATE_WAIT_S:g} s); "
+              "VLC needs it for --mjpeg-fps, so no VLC window is started for it", flush=True)
+        return
+    print(f"{prog}: {base} at {rate:.1f} frames/s, by hand: "
+          + shlex.join(["vlc", *vlc_arguments(view.url(base), rate)]), flush=True)
 
 
 def browser(view: View, prog: str):
@@ -369,14 +438,18 @@ class _Keys:
 KEYS = "press v for VLC, b for the browser view, Ctrl-C to end"
 
 
-def run(session, bases: list[str], listen: str = LISTEN, player: str = "vlc",
+def run(session, bases: list[str], listen: str = LISTEN, player: str = "browser",
         depth_range: tuple[float, float] = DEPTH_RANGE, seconds: float = 2.0, prog: str = "xblick view") -> int:
-    """The command: serve until Ctrl-C or SIGTERM (KeyboardInterrupt); the exit code. ``player``: "vlc" (the
-    default: VLC if ``vlc`` is on PATH, else ask whether to open the browser instead; without a terminal never asks),
-    "browser" (the grid page in the system's browser) or "none" (serve only). On a terminal the keys v (VLC windows
-    that are not open) and b (the browser view) work in every case."""
+    """The command: serve until Ctrl-C or SIGTERM (KeyboardInterrupt); the exit code. ``player``: "browser" (the
+    default: the grid page in the system's browser), "vlc" (one window per stream; an error without ``vlc`` on PATH)
+    or "none" (serve only). On a terminal the keys v (VLC windows that are not open) and b (the browser view) work in
+    every case."""
     if player not in ("vlc", "browser", "none"):
-        raise ValueError(f"player {player!r}: vlc, browser or none")
+        raise ValueError(f"player {player!r}: browser, vlc or none")
+    if player == "vlc" and not headless() and shutil.which("vlc") is None:
+        print(f"{prog}: --vlc: {NO_VLC}; install it, or leave out --vlc for the browser view", file=sys.stderr,
+              flush=True)
+        return 1
     try:
         view = View(session, bases, parse_listen(listen), depth_range, seconds)
     except ViewError as error:
@@ -393,24 +466,16 @@ def run(session, bases: list[str], listen: str = LISTEN, player: str = "vlc",
         for base in bases:
             print(f"{prog}: {base}: {view.url(base)}", flush=True)
         print(f"{prog}: all of them: {view.url()}", flush=True)
-        for base in bases:
-            print(f"{prog}: by hand: vlc --network-caching={VLC_CACHE_MS} {view.url(base)}", flush=True)
-        terminal = sys.stdin is not None and sys.stdin.isatty()
-        if player == "none":
-            pass
-        elif headless():
-            print(f"{prog}: {NO_DISPLAY}, so no player is started; {remote_hint(view)}", flush=True)
-        elif player == "browser":
-            open_browser(view.url(), prog)
-        elif shutil.which("vlc") is not None:
-            players.open_vlc(asked=False)
-        elif terminal and sys.stdout.isatty():
-            print(f"{prog}: VLC is not installed (no vlc on PATH)", flush=True)
-            if _ask(f"{prog}: open the browser view instead? [y/N] "):
-                open_browser(view.url(), prog)
+        if player == "vlc" and not headless():
+            players.open_vlc(asked=False)  # measures the rates, prints the lines by hand
         else:
-            print(f"{prog}: VLC is not installed (no vlc on PATH); --browser opens the browser view", flush=True)
-        keys = _Keys()  # after the question: it reads a line
+            if player == "browser" and not headless():
+                open_browser(view.url(), prog)
+            for base, rate in view.rates(bases).items():
+                by_hand(view, base, rate, prog)
+            if player != "none" and headless():
+                print(f"{prog}: {NO_DISPLAY}, so no player is started; {remote_hint(view)}", flush=True)
+        keys = _Keys()
         print(f"{prog}: serving; " + (KEYS if keys.fd is not None else "Ctrl-C to stop"), flush=True)
         while True:
             key = keys.get(0.5)
@@ -434,3 +499,97 @@ def run(session, bases: list[str], listen: str = LISTEN, player: str = "vlc",
             keys.close()
         players.close()
         view.close()
+
+
+# ------------------------------------------------------------------------------- choosing streams without a name
+
+LIST_TITLE = "Select streams / viewer:"
+LIST_KEYS = ("\u2191\u2193 Navigate   \u2192 Viewers   \u2190 Back   Space Mark   Enter Open   Esc Back/Exit   "
+             "q Quit")
+VIEWERS = (("browser", "browser"), ("VLC", "vlc"), ("addresses only", "none"))  # label, player
+PLAYER_OPTIONS = {"browser": [], "vlc": ["--vlc"], "none": ["--no-player"]}
+
+
+def showable(found: list[tuple[str, dict]]) -> list[str]:
+    """The streams of find_streams that xblick view can show: images with a compressed transport."""
+    return [b for b, r in found if r.get("kind") == "image" and "compressed" in r.get("transports", ())]
+
+
+def stream_items(bases: list[str], default: str = "browser") -> list[pick.Item]:
+    """The list's items: namespace, camera, then each stream (the rest of its name, markable) with the viewers as its
+    children, ``default`` marked and first under the cursor. A viewer that cannot be carried out here is disabled,
+    its note says why."""
+    unavailable = {}
+    if headless():
+        unavailable = {"browser": NO_DISPLAY, "vlc": NO_DISPLAY}
+    elif shutil.which("vlc") is None:
+        unavailable = {"vlc": NO_VLC}
+    roots: list[pick.Item] = []
+
+    def group(items: list[pick.Item], label: str) -> pick.Item:
+        for item in items:
+            if item.label == label and item.value is None:
+                return item
+        items.append(pick.Item(label))
+        return items[-1]
+
+    for base in bases:
+        parts = base.split("/")
+        items = roots
+        for part in parts[:min(2, len(parts) - 1)]:
+            items = group(items, part).children
+        viewers = [pick.Item(label, value=player, enabled=player not in unavailable,
+                             note=f"(unavailable: {unavailable[player]})" if player in unavailable else
+                             "(default)" if player == default else "")
+                   for label, player in VIEWERS]
+        items.append(pick.Item("/".join(parts[min(2, len(parts) - 1):]), viewers, value=base, markable=True,
+                               chosen=[p for _, p in VIEWERS].index(default)))
+    return roots
+
+
+def choose_streams(session, seconds: float, command, default: str = "browser", stdin=None,
+                   stdout=None) -> tuple[list[str], str]:
+    """The streams and the viewer of ``xblick view`` without a stream, chosen in a list on the terminal (module
+    docstring); Enter on a stream opens it with ``default``. ``command(bases, player)``: the complete command, shown
+    in the status line. ViewError when no stream is found (with the reason the session knows), when stdin or stdout
+    is no terminal, or when nothing was chosen."""
+    stdin, stdout = stdin or sys.stdin, stdout or sys.stdout
+    bases = showable(find_streams(session, "", seconds))
+    if not bases:
+        why = why_nothing(session)
+        raise ViewError(f"no image streams found within {seconds:g} s" + (f" ({why})" if why else ""))
+    if not (stdin.isatty() and stdout.isatty()):
+        raise ViewError("no streams given, and no terminal to choose them in: give the streams, of these: "
+                        + ", ".join(bases))
+    tree = pick.Tree(stream_items(bases, default))
+
+    def resolve(tree: pick.Tree):
+        """(bases, player) that Enter starts now, or a line why it starts nothing."""
+        item = tree.cursor
+        marked = [i.value for i in tree.marked()]
+        if item.parent is not None and item.parent.markable:  # a viewer
+            if not item.enabled:
+                return f"{item.label} {item.note}"
+            return marked or [item.parent.value], item.value
+        if item.markable:
+            return marked or [item.value], default
+        if marked:
+            return marked, default
+        return f"{item.label}: Space marks its streams, Right opens it"
+
+    def status(tree: pick.Tree) -> str:
+        chosen = resolve(tree)
+        return chosen if isinstance(chosen, str) else "Enter opens: " + shlex.join(command(*chosen))
+
+    def enter(tree: pick.Tree):
+        chosen = resolve(tree)
+        if isinstance(chosen, str):
+            tree.message = chosen
+            return None
+        return chosen
+
+    chosen = pick.run(tree, title=LIST_TITLE, keys=LIST_KEYS, status=status, enter=enter, fd=stdin.fileno(),
+                      out=stdout)
+    if chosen is None:
+        raise ViewError("no stream chosen")
+    return chosen

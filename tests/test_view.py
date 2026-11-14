@@ -3,6 +3,8 @@ holds up nobody else and is cleaned up when it goes; the index page; depth colou
 such stream, a point cloud, no compressed transport, a taken port, VLC not installed); the start lines and Ctrl-C."""
 
 import io
+import re
+import shlex
 import os
 import pty
 import select
@@ -198,15 +200,22 @@ def cli(*args):
     return [sys.executable, "-m", "xblick.cli", "view", *args]
 
 
+THREE = ("t/view/cli", "t/view/cli2", "u/cam/color")
+
+
 @pytest.fixture
 def remote():
-    """A session that listens, with the streams t/view/cli and t/view/cli2: the command line connects to it."""
+    """A session that listens, with the streams t/view/cli, t/view/cli2 and u/cam/color publishing some 30 frames
+    a second, and t/view/quiet, which publishes nothing: the command line connects to it."""
     port = free_port()
     listening = open_session(listen=[f"127.0.0.1:{port}"])
-    publishers = [CameraPublisher(listening, base, encoding="rgb8", frame_id="cam")
-                  for base in ("t/view/cli", "t/view/cli2")]
+    publishers = [CameraPublisher(listening, base, encoding="rgb8", frame_id="cam") for base in THREE]
+    quiet = CameraPublisher(listening, "t/view/quiet", encoding="rgb8", frame_id="cam")
+    publishing = [Publishing(p, period=0.03) for p in publishers]
     yield port, publishers[0]
-    for publisher in publishers:
+    for p in publishing:
+        p.close()
+    for publisher in [*publishers, quiet]:
         publisher.close()
     listening.close()
 
@@ -228,7 +237,8 @@ def environment(tmp_path, vlc: bool, display: bool) -> dict:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     for tool in (sys.executable, "/bin/sh", "/bin/sleep"):
-        os.symlink(tool, bin_dir / os.path.basename(tool))
+        if not (bin_dir / os.path.basename(tool)).exists():
+            os.symlink(tool, bin_dir / os.path.basename(tool))
     if vlc:
         stand_in(bin_dir, "vlc", tmp_path / "vlc_calls")
     stand_in(tmp_path / "browser", "browser", tmp_path / "browser_calls", wait=False)
@@ -253,13 +263,27 @@ def interrupt(process, sig=signal.SIGINT, timeout=3.0) -> str:
 
 
 def addresses(port, *bases, host="127.0.0.1"):
-    """The start lines up to the player's."""
+    """The first start lines."""
     reach = ("(this PC only; --http 0.0.0.0:PORT opens it to the network)" if host == "127.0.0.1" else
              "(open to the network: anyone who can reach this address can watch, there is no password)")
     return ([f"xblick view: serving {len(bases)} stream(s) on http://{host}:{port}/ {reach}\n"]
             + [f"xblick view: {b}: http://127.0.0.1:{port}/{b}.mjpg\n" for b in bases]
-            + [f"xblick view: all of them: http://127.0.0.1:{port}/\n"]
-            + [f"xblick view: by hand: vlc --network-caching=100 http://127.0.0.1:{port}/{b}.mjpg\n" for b in bases])
+            + [f"xblick view: all of them: http://127.0.0.1:{port}/\n"])
+
+
+def by_hand(line: str, port: int, base: str) -> int:
+    """The hint of a line with a stream's measured rate and its VLC command, checked: rate times 1.15, rounded up."""
+    found = re.fullmatch(rf"xblick view: {base} at (\d+\.\d) frames/s, by hand: vlc --mjpeg-fps=(\d+) "
+                         rf"--network-caching=20 --no-audio http://127.0.0.1:{port}/{base}\.mjpg\n", line)
+    assert found, line
+    rate, hint = float(found[1]), int(found[2])
+    assert 15 < rate < 40 and abs(hint - rate * view.MJPEG_FPS_FACTOR) <= 1.1, line  # some 30 frames/s, published
+    return hint
+
+
+def vlc_call(line: str, port: int, base: str) -> bool:
+    return re.fullmatch(rf"--mjpeg-fps=\d+ --network-caching=20 --no-audio http://127.0.0.1:{port}/{base}\.mjpg",
+                        line) is not None
 
 
 def headless_line(port):
@@ -293,8 +317,7 @@ class Command:
                                             text=True, env=env)
 
     def until(self, text: str, timeout=20.0) -> list[str]:
-        """The lines printed until (and with) the first line that contains ``text``; also a prompt without its
-        newline."""
+        """The lines printed until (and with) the first line that contains ``text``."""
         lines = []
         if self.master is None:
             end = time.monotonic() + timeout
@@ -347,64 +370,77 @@ def command(remote):
 TWO = ("t/view/cli", "t/view/cli2")
 
 
-def test_vlc_starts_one_window_per_stream(command, tmp_path):
-    c = command(*TWO, env=environment(tmp_path, vlc=True, display=True))
+def test_the_browser_is_the_default(command, tmp_path):
+    c = command("t/view/cli", env=environment(tmp_path, vlc=True, display=True))
     lines = c.until("serving;")
-    assert lines == addresses(c.port, *TWO) + ["xblick view: started VLC (2 window(s))\n", SERVING], "".join(lines)
-    wait_until(lambda: len(calls(tmp_path, "vlc")) == 2, timeout=10.0)
-    assert sorted(calls(tmp_path, "vlc")) == [f"--network-caching=100 http://127.0.0.1:{c.port}/t/view/cli.mjpg",
-                                              f"--network-caching=100 http://127.0.0.1:{c.port}/t/view/cli2.mjpg"]
-    interrupt(c.process)  # the stand-ins end with it (communicate would otherwise wait for their pipes)
-    assert calls(tmp_path, "browser") == []
-
-
-def test_closing_the_vlc_windows_leaves_it_serving(command, tmp_path):
-    env = environment(tmp_path, vlc=False, display=True)
-    stand_in(tmp_path / "bin", "vlc", tmp_path / "vlc_calls", wait=False)  # a VLC whose window is closed at once
-    c = command(*TWO, env=env)
-    lines = c.until("were closed")
-    assert lines[-3:] == ["xblick view: started VLC (2 window(s))\n", SERVING,
-                          "xblick view: the VLC windows were closed; still serving. "
-                          f"At http://127.0.0.1:{c.port}/ until Ctrl-C.\n"], "".join(lines)
-    c.serves()
+    assert lines[:-2] == addresses(c.port, "t/view/cli") and lines[-1] == SERVING, "".join(lines)
+    by_hand(lines[-2], c.port, "t/view/cli")
+    wait_until(lambda: calls(tmp_path, "browser") == [f"http://127.0.0.1:{c.port}/"], timeout=10.0)
     interrupt(c.process)
+    assert calls(tmp_path, "vlc") == []  # VLC installed, but not the default
 
 
-def test_without_vlc_and_without_a_terminal_it_does_not_ask_and_leaves_stdin_alone(command, tmp_path):
+def test_without_vlc_the_default_asks_nothing_and_leaves_stdin_alone(command, tmp_path):
     r, w = os.pipe()
     os.write(w, b"vb\nyes\n")  # input that is not for it
     os.close(w)
     try:
         c = command("t/view/cli", env=environment(tmp_path, vlc=False, display=True), stdin=r)
         lines = c.until("serving;")
-        assert lines == addresses(c.port, "t/view/cli") + [
-            "xblick view: VLC is not installed (no vlc on PATH); --browser opens the browser view\n", SERVING], \
-            "".join(lines)
+        assert "[y/N]" not in "".join(lines) and lines[-1] == SERVING, "".join(lines)
         c.serves()
-        time.sleep(1.0)
+        wait_until(lambda: calls(tmp_path, "browser") == [f"http://127.0.0.1:{c.port}/"], timeout=10.0)
+        time.sleep(0.5)
         interrupt(c.process)
-        assert calls(tmp_path, "browser") == [] and calls(tmp_path, "vlc") == []
         assert os.read(r, 100) == b"vb\nyes\n"  # nothing of the pipe's input was read
     finally:
         os.close(r)
 
 
-@pytest.mark.parametrize("answer", ["y", "n", ""])
-def test_without_vlc_on_a_terminal_it_asks_for_the_browser(command, tmp_path, answer):
-    c = command("t/view/cli", env=environment(tmp_path, vlc=False, display=True), terminal=True)
-    shown = c.until("[y/N] ")
-    assert shown[-2:] == ["xblick view: VLC is not installed (no vlc on PATH)\n",
-                          "xblick view: open the browser view instead? [y/N] "], "".join(shown)
-    c.key(f"{answer}\n")
-    assert c.until("serving;")[-1] == SERVING_KEYS
-    c.serves()  # either way it keeps serving
-    if answer == "y":
-        wait_until(lambda: calls(tmp_path, "browser") == [f"http://127.0.0.1:{c.port}/"], timeout=10.0)
-    else:
-        time.sleep(0.3)
-        assert calls(tmp_path, "browser") == []
+def test_vlc_starts_one_window_per_stream_with_the_rate_hint(command, tmp_path):
+    c = command(*TWO, "--vlc", env=environment(tmp_path, vlc=True, display=True))
+    lines = c.until("serving;")
+    assert lines[:4] == addresses(c.port, *TWO), "".join(lines)
+    hints = [by_hand(lines[4], c.port, TWO[0]), by_hand(lines[5], c.port, TWO[1])]
+    assert lines[6:] == ["xblick view: started VLC (2 window(s))\n", SERVING], "".join(lines)
+    wait_until(lambda: len(calls(tmp_path, "vlc")) == 2, timeout=10.0)
+    started = sorted(calls(tmp_path, "vlc"))
+    assert vlc_call(started[0], c.port, TWO[0]) and vlc_call(started[1], c.port, TWO[1]), started
+    assert [int(re.match(r"--mjpeg-fps=(\d+)", s)[1]) for s in started] == hints  # as printed
+    interrupt(c.process)  # the stand-ins end with it (communicate would otherwise wait for their pipes)
+    assert calls(tmp_path, "browser") == []
+
+
+def test_a_stream_without_frames_gets_no_vlc_window(command, tmp_path, monkeypatch):
+    c = command("t/view/cli", "t/view/quiet", "--vlc", env=environment(tmp_path, vlc=True, display=True))
+    lines = c.until("serving;", timeout=30.0)
+    assert ("xblick view: t/view/quiet: its rate is unknown (fewer than 6 frames within 5 s); VLC needs it for "
+            "--mjpeg-fps, so no VLC window is started for it\n") in lines, "".join(lines)
+    assert lines[-2:] == ["xblick view: started VLC (1 window(s))\n", SERVING], "".join(lines)
+    wait_until(lambda: len(calls(tmp_path, "vlc")) == 1, timeout=10.0)
+    assert vlc_call(calls(tmp_path, "vlc")[0], c.port, "t/view/cli")
     interrupt(c.process)
-    c.mode_restored()
+
+
+def test_vlc_asked_for_but_not_installed_is_an_error(remote, tmp_path):
+    out = subprocess.run(cli("t/view/cli", "--vlc", "--connect", f"127.0.0.1:{remote[0]}"), capture_output=True,
+                         text=True, timeout=60, env=environment(tmp_path, vlc=False, display=True))
+    assert out.returncode == 1 and out.stderr.endswith(
+        "xblick view: --vlc: VLC is not installed (no vlc on PATH); install it, or leave out --vlc for the browser "
+        "view\n"), out.stderr
+    assert calls(tmp_path, "browser") == []
+
+
+def test_closing_the_vlc_windows_leaves_it_serving(command, tmp_path):
+    env = environment(tmp_path, vlc=False, display=True)
+    stand_in(tmp_path / "bin", "vlc", tmp_path / "vlc_calls", wait=False)  # a VLC whose window is closed at once
+    c = command(*TWO, "--vlc", env=env)
+    lines = c.until("were closed")
+    assert lines[-3:] == ["xblick view: started VLC (2 window(s))\n", SERVING,
+                          "xblick view: the VLC windows were closed; still serving. "
+                          f"At http://127.0.0.1:{c.port}/ until Ctrl-C.\n"], "".join(lines)
+    c.serves()
+    interrupt(c.process)
 
 
 def test_browser_opens_the_grid_page(command, tmp_path):
@@ -418,20 +454,20 @@ def test_browser_opens_the_grid_page(command, tmp_path):
 def test_keys_v_reopens_closed_windows_only_and_b_opens_the_browser(command, tmp_path):
     env = environment(tmp_path, vlc=False, display=True)
     stand_in(tmp_path / "bin", "vlc", tmp_path / "vlc_calls")  # waits: a window that stays open
-    c = command(*TWO, env=env, terminal=True)
+    c = command(*TWO, "--vlc", env=env, terminal=True)
     assert c.until("serving;")[-2:] == ["xblick view: started VLC (2 window(s))\n", SERVING_KEYS]
     wait_until(lambda: len(calls(tmp_path, "vlc")) == 2, timeout=10.0)
     c.key("v")  # both still open: nothing started
     assert c.until("VLC")[-1] == "xblick view: the VLC windows are open\n"
-    first = sorted(calls(tmp_path, "vlc"))
     pids = (tmp_path / "vlc_calls.pids").read_text().splitlines()
     os.kill(int(next(line for line in pids if line.endswith("/t/view/cli2.mjpg")).split()[0]), signal.SIGTERM)
     time.sleep(1.0)  # the window of cli2 closed; that of cli stays open
     c.key("v")
-    assert c.until("VLC")[-1] == "xblick view: started VLC (1 window(s))\n"
+    shown = c.until("VLC (")
+    assert shown[-1] == "xblick view: started VLC (1 window(s))\n", "".join(shown)
+    by_hand(shown[-2], c.port, "t/view/cli2")  # measured again
     wait_until(lambda: len(calls(tmp_path, "vlc")) == 3, timeout=10.0)
-    assert calls(tmp_path, "vlc")[2] == f"--network-caching=100 http://127.0.0.1:{c.port}/t/view/cli2.mjpg"
-    assert first == sorted(calls(tmp_path, "vlc")[:2])  # the same arguments as at the start
+    assert vlc_call(calls(tmp_path, "vlc")[2], c.port, "t/view/cli2")
     c.key("b")
     wait_until(lambda: calls(tmp_path, "browser") == [f"http://127.0.0.1:{c.port}/"], timeout=10.0)
     interrupt(c.process)
@@ -441,7 +477,7 @@ def test_keys_v_reopens_closed_windows_only_and_b_opens_the_browser(command, tmp
 def test_keys_after_all_windows_closed(command, tmp_path):
     env = environment(tmp_path, vlc=False, display=True)
     stand_in(tmp_path / "bin", "vlc", tmp_path / "vlc_calls", wait=False)  # windows that close at once
-    c = command(*TWO, env=env, terminal=True)
+    c = command(*TWO, "--vlc", env=env, terminal=True)
     closed = c.until("were closed")
     assert closed[-1] == ("xblick view: the VLC windows were closed; still serving. Press v for VLC, b for the "
                           "browser view, Ctrl-C to end.\n"), "".join(closed)
@@ -449,21 +485,24 @@ def test_keys_after_all_windows_closed(command, tmp_path):
     assert c.until("VLC (")[-1] == "xblick view: started VLC (2 window(s))\n"
     assert c.until("were closed")[-1].startswith("xblick view: the VLC windows were closed")  # once more
     wait_until(lambda: len(calls(tmp_path, "vlc")) == 4, timeout=10.0)
-    assert sorted(calls(tmp_path, "vlc")[:2]) == sorted(calls(tmp_path, "vlc")[2:])  # the same arguments again
+    assert all(vlc_call(line, c.port, base) for line, base in zip(sorted(calls(tmp_path, "vlc")),
+                                                                    (TWO[0], TWO[0], TWO[1], TWO[1])))
     interrupt(c.process, signal.SIGTERM)  # SIGTERM restores the terminal as well
     c.mode_restored()
 
 
 @pytest.mark.parametrize("vlc, option, terminal", [(True, None, False), (False, None, False), (False, None, True),
-                                                   (True, None, True), (True, "--browser", False),
-                                                   (False, "--browser", True)])
+                                                   (True, "--vlc", True), (False, "--vlc", False),
+                                                   (True, "--browser", False), (False, "--browser", True)])
 def test_headless_starts_no_player_and_asks_nothing(command, tmp_path, vlc, option, terminal):
     args = ("t/view/cli",) + ((option,) if option else ())
     c = command(*args, env=environment(tmp_path, vlc=vlc, display=False), terminal=terminal)
     lines = c.until("serving;")
-    assert "".join(lines).count("[y/N]") == 0
-    assert lines[-len(addresses(c.port, "t/view/cli")) - 2:] == addresses(c.port, "t/view/cli") + [
-        headless_line(c.port), SERVING_KEYS if terminal else SERVING], "".join(lines)
+    assert "[y/N]" not in "".join(lines)
+    n = len(addresses(c.port, "t/view/cli"))
+    assert lines[-n - 3:-3] == addresses(c.port, "t/view/cli"), "".join(lines)
+    by_hand(lines[-3], c.port, "t/view/cli")  # how to open it in VLC elsewhere
+    assert lines[-2:] == [headless_line(c.port), SERVING_KEYS if terminal else SERVING], "".join(lines)
     c.serves()
     if terminal:
         for k in "vb":
@@ -481,7 +520,8 @@ def test_no_player_still_has_the_keys(command, tmp_path):
     assert calls(tmp_path, "vlc") == []
     c.key("v")
     assert c.until("VLC (")[-1] == "xblick view: started VLC (1 window(s))\n"
-    wait_until(lambda: calls(tmp_path, "vlc") == [f"--network-caching=100 http://127.0.0.1:{c.port}/t/view/cli.mjpg"])
+    wait_until(lambda: len(calls(tmp_path, "vlc")) == 1)
+    assert vlc_call(calls(tmp_path, "vlc")[0], c.port, "t/view/cli")
     interrupt(c.process)
     c.mode_restored()
 
@@ -494,13 +534,11 @@ def test_no_player_prints_the_addresses_and_ends_on_ctrl_c(remote, host):
                                    f"127.0.0.1:{zenoh_port}"), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, text=True)
     try:
-        expected = addresses(port, "t/view/cli", host=host) + [SERVING]
-        lines = [process.stdout.readline() for _ in expected]
-        assert lines == expected, "".join(lines)
+        expected = addresses(port, "t/view/cli", host=host)
+        lines = [process.stdout.readline() for _ in range(len(expected) + 2)]
+        assert lines[:-2] == expected and lines[-1] == SERVING, "".join(lines)
+        by_hand(lines[-2], port, "t/view/cli")
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/t/view/cli.mjpg", timeout=10) as response:
-            end = time.monotonic() + 10
-            while not select.select([response.fp], [], [], 0.05)[0] and time.monotonic() < end:
-                publisher.publish(pattern(2))
             assert read_frame(response)
             interrupt(process)  # with a client connected
     finally:
@@ -512,3 +550,176 @@ def test_no_player_prints_the_addresses_and_ends_on_ctrl_c(remote, host):
 def test_the_help_says_there_is_no_password():
     out = subprocess.run(cli("--help"), capture_output=True, text=True, timeout=60).stdout
     assert "WITHOUT A PASSWORD" in " ".join(out.split())
+
+
+# ------------------------------------------------------------------------------------------------- the rate rule
+
+def test_the_rate_from_arrival_times():
+    period = 1 / 30
+    steady = [i * period for i in range(31)]
+    assert view.rate_of(steady) == pytest.approx(30.0)
+    jitter = [t + (0.004 if i % 2 else -0.004) for i, t in enumerate(steady)]
+    jitter[10:] = [t + 0.5 for t in jitter[10:]]  # one gap of half a second: the median does not see it
+    assert view.rate_of(jitter) == pytest.approx(30.0, rel=0.3)
+    assert view.rate_of(steady[:6]) == pytest.approx(30.0)  # RATE_MIN_FRAMES
+    assert view.rate_of(steady[:5]) is None and view.rate_of([]) is None
+    assert view.rate_of([1.0] * 8) is None  # no time between them: no rate
+    ntsc = [i * 1001 / 30000 for i in range(31)]
+    assert view.rate_of(ntsc) == pytest.approx(29.97, abs=0.01)
+
+
+def test_the_hint():
+    assert [view.mjpeg_fps(r) for r in (30.0, 29.97, 15.0, 25.0, 60.0, 5.0)] == [35, 35, 18, 29, 69, 6]
+    assert view.vlc_arguments("http://h/x.mjpg", 30.0) == ["--mjpeg-fps=35", "--network-caching=20", "--no-audio",
+                                                          "http://h/x.mjpg"]
+
+
+def test_the_rate_of_a_served_stream(served):
+    v, _, _ = served
+    rates = v.rates(["t/view/color"])
+    assert 5 < rates["t/view/color"] < 60, rates  # Publishing: one frame every 20 ms plus the time to publish it
+
+
+# ---------------------------------------------------------------------------------------- choosing in a list
+
+STREAM_TITLE = "Select streams / viewer:"
+
+
+@pytest.fixture
+def listing(remote, tmp_path):
+    """A function that starts ``xblick view <options>`` without streams in a pseudo-terminal (test_cam_list's
+    Terminal), with the stand-in VLC and browser."""
+    from test_cam_list import Terminal
+
+    made = []
+
+    def start(*options, vlc=True, display=True):
+        port = free_port()
+        argv = cli(*options, "--http", f"127.0.0.1:{port}", "--connect", f"127.0.0.1:{remote[0]}")
+        made.append(Terminal(argv, STREAM_TITLE, env=environment(tmp_path, vlc=vlc, display=display)))
+        made[-1].port, made[-1].zenoh = port, remote[0]
+        made[-1].shown()
+        return made[-1]
+
+    yield start
+    for t in made:
+        t.close()
+
+
+def printed(out: str) -> str:
+    """The command that the list printed."""
+    lines = out.splitlines()
+    return lines[lines.index(next(x for x in lines if "the same without the list" in x)) + 1]
+
+
+def stop(t) -> tuple[int, str, bool]:
+    t.wait(lambda: "serving;" in t.text)
+    t.process.send_signal(signal.SIGINT)
+    return t.end()
+
+
+def test_the_list_groups_by_namespace_and_camera(listing, tmp_path):
+    t = listing()
+    frame = t.frame()
+    assert "❯ ▸ t" in frame and "▸ u" in frame, frame
+    assert "t/view/quiet" not in frame and "quiet" not in frame  # found only when expanded
+    RIGHT = b"\x1b[C"
+    t.keys(RIGHT + RIGHT + RIGHT, until="▾ view")
+    frame = t.frame()
+    for name in ("[ ] cli", "[ ] cli2", "[ ] quiet"):
+        assert name in frame, frame
+    assert "Space marks its streams, Right opens it" in frame
+    t.keys(RIGHT, until="\u276f \u25b8 [ ] cli\n")
+    assert f"Enter opens: xblick view t/view/cli --http 127.0.0.1:{t.port}" in t.frame()
+    t.keys(b"\r")
+    code, out, restored = stop(t)
+    assert code == 0 and restored, out
+    assert printed(out) == f"xblick view t/view/cli --http 127.0.0.1:{t.port} --connect 127.0.0.1:{t.zenoh}"
+    assert "xblick view: starting t/view/cli in the browser; the same without the list:" in out
+    wait_until(lambda: calls(tmp_path, "browser") == [f"http://127.0.0.1:{t.port}/"], timeout=10.0)
+
+
+def test_space_marks_and_right_offers_the_viewers(listing, tmp_path):
+    t = listing()
+    RIGHT, DOWN, UP = b"\x1b[C", b"\x1b[B", b"\x1b[A"
+    t.keys(DOWN + RIGHT + RIGHT + RIGHT, until="▾ cam")  # u, cam: its stream color
+    t.keys(RIGHT + b" ", until="[x] color")
+    t.keys(b"\x1b", until="\u276f \u25b8 u")  # Esc: back to the top level, the mark kept
+    t.keys(UP + RIGHT + RIGHT + RIGHT + RIGHT + DOWN + b" ", until="[x] cli2")  # t/view/cli2 marked as well
+    assert "Enter opens: xblick view t/view/cli2 u/cam/color --http" in t.frame()
+    t.keys(RIGHT, until="▾ [x] cli2")  # the viewers
+    frame = t.frame()
+    assert "browser  (default)" in frame and "VLC" in frame and "addresses only" in frame, frame
+    t.keys(RIGHT + DOWN, until="Enter opens: xblick view t/view/cli2 u/cam/color --vlc --http")
+    t.keys(b"\r")
+    code, out, restored = stop(t)
+    assert code == 0 and restored, out
+    assert printed(out).startswith("xblick view t/view/cli2 u/cam/color --vlc --http"), out
+    wait_until(lambda: len(calls(tmp_path, "vlc")) == 2, timeout=10.0)
+
+
+def test_the_printed_command_starts_the_same_without_the_list(listing, remote, tmp_path):
+    t = listing()
+    RIGHT, DOWN = b"\x1b[C", b"\x1b[B"
+    t.keys(RIGHT * 4 + RIGHT + RIGHT + DOWN * 2, until="Enter opens: xblick view t/view/cli --no-player")
+    t.keys(b"\r")
+    code, out, restored = stop(t)
+    assert code == 0 and restored, out
+    command = shlex.split(printed(out))
+    again = subprocess.Popen([sys.executable, "-m", "xblick.cli", *command[1:]], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             env=environment(tmp_path, vlc=True, display=True))
+    try:
+        lines = [again.stdout.readline() for _ in range(5)]
+        assert lines[:3] == addresses(t.port, "t/view/cli") and lines[-1] == SERVING, "".join(lines)
+        interrupt(again)
+    finally:
+        if again.poll() is None:
+            again.kill()
+            again.communicate()
+    assert calls(tmp_path, "vlc") == [] and calls(tmp_path, "browser") == []  # --no-player both times
+
+
+def test_headless_viewers_are_unavailable_and_addresses_work(listing, tmp_path):
+    t = listing(display=False)
+    RIGHT, DOWN = b"\x1b[C", b"\x1b[B"
+    t.keys(RIGHT * 6, until="browser (unavailable")  # on the viewer browser: the status line says why
+    frame = t.frame()
+    assert "browser  (unavailable: this system has no display" in frame, frame
+    assert "VLC  (unavailable: this system has no display" in frame
+    t.keys(b"\r", until="browser (unavailable")  # refused: the list stays
+    t.keys(DOWN + DOWN + b"\r")
+    code, out, restored = stop(t)
+    assert code == 0 and restored and printed(out).startswith("xblick view t/view/cli --no-player"), out
+    assert calls(tmp_path, "vlc") == [] and calls(tmp_path, "browser") == []
+
+
+def test_vlc_missing_is_unavailable_in_the_list(listing):
+    t = listing(vlc=False)
+    t.keys(b"\x1b[C" * 6, until="VLC  (unavailable: VLC is not installed (no vlc on PATH))")
+    t.keys(b"q")
+    code, out, restored = t.end()
+    assert code == 1 and restored and out.rstrip().endswith("xblick view: no stream chosen"), out
+
+
+def test_ctrl_c_in_the_list(listing):
+    t = listing()
+    t.keys(b"\x1b[C", until="▾ t")
+    t.keys(b"\x03")
+    code, out, restored = t.end()
+    assert code == 1 and restored and out.rstrip().endswith("xblick view: no stream chosen"), out
+
+
+def test_without_a_terminal_the_streams_must_be_given(remote):
+    out = subprocess.run(cli("--connect", f"127.0.0.1:{remote[0]}"), stdin=subprocess.DEVNULL, capture_output=True,
+                         text=True, timeout=60)
+    assert out.returncode == 1 and out.stderr.endswith(
+        "xblick view: no streams given, and no terminal to choose them in: give the streams, of these: t/view/cli, "
+        "t/view/cli2, t/view/quiet, u/cam/color\n"), out.stderr
+
+
+def test_no_streams_found():
+    port = free_port()
+    out = subprocess.run(cli("--listen", f"tcp/127.0.0.1:{port}", "--seconds", "0.5"), stdin=subprocess.DEVNULL,
+                         capture_output=True, text=True, timeout=60)
+    assert out.returncode == 1 and "xblick view: no image streams found within 0.5 s" in out.stderr, out.stderr

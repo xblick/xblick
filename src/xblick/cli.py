@@ -9,7 +9,7 @@
     xblick cam /dev/video0                        # a live camera FFmpeg opens as cam/video0/color (needs xblick[cam])
     xblick cam                                    # ... camera and mode chosen in a list of this PC's cameras
     xblick rerun --connect …                      # every stream and node result in the Rerun viewer
-    xblick view test/camera/color                 # a stream in VLC or a browser, served as MJPEG (view.py)
+    xblick view test/camera/color                 # a stream in a browser or VLC, served as MJPEG (view.py)
     xblick diagnostics test --connect …          # how the cameras' publishers are doing (<camera>/diagnostics)
     xblick mps --pipe-dir /tmp/xblick-mps         # NVIDIA MPS for the nodes on this PC's GPU (mps.py)
     xblick record --dir ~/recordings --connect …  # everything into MCAP files until stopped (recording.py)
@@ -643,13 +643,16 @@ def build_parser(prog: str = "xblick") -> argparse.ArgumentParser:
                    help="the routers of other PCs to connect to (zenohd's -e), e.g. tcp/other-pc:7447")
     p.set_defaults(run=lambda a: router.serve(a.listen, a.connect))
 
-    p = commands.add_parser("view", help="show camera streams in VLC (one window per stream) or a browser, served as MJPEG over "
-                                         "HTTP",
+    p = commands.add_parser("view", help="show camera streams in a browser or VLC, served as MJPEG over HTTP",
                             description=view.__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("streams", nargs="+", metavar="STREAM", help="the stream bases to show, e.g. test/camera/color")
+    p.add_argument("streams", nargs="*", metavar="STREAM",
+                   help="the stream bases to show, e.g. test/camera/color (none: choose them and the viewer in a list "
+                        "of the streams found, which prints the command that starts the same without it)")
     opener = p.add_mutually_exclusive_group()
     opener.add_argument("--browser", action="store_true",
-                        help="open the grid page in the system's browser instead of VLC: all streams side by side")
+                        help="open the grid page in the system's browser, all streams side by side (the default)")
+    opener.add_argument("--vlc", action="store_true",
+                        help="start VLC instead, one window per stream, with a rate hint measured from the frames")
     opener.add_argument("--no-player", action="store_true", help="start no player: serve and print the addresses")
     p.add_argument("--http", default=view.LISTEN, metavar="ADDRESS:PORT",
                    help=f"where the HTTP server listens (default {view.LISTEN}: this PC only). 0.0.0.0:{view.PORT} "
@@ -832,10 +835,29 @@ def build_parser(prog: str = "xblick") -> argparse.ArgumentParser:
 
 
 def _view(args) -> int:
-    session = zsession.open_from_args(args, prog=f"xblick {args.command}")
+    prog = f"xblick {args.command}"
+    session = zsession.open_from_args(args, prog=prog)
     try:
-        player = "browser" if args.browser else "none" if args.no_player else "vlc"
-        return view.run(session, args.streams, args.http, player, seconds=args.seconds)
+        bases, player = args.streams, "vlc" if args.vlc else "none" if args.no_player else "browser"
+        if not bases:
+            # the options given (no streams, as there are none) without the viewer's, which the list chooses
+            flags = ("--browser", "--vlc", "--no-player")
+            rest = [o for o in args.argv[1:] if not (o.startswith("--") and len(o) > 2
+                                                     and any(f.startswith(o) for f in flags))]
+
+            def command(chosen: list[str], viewer: str) -> list[str]:
+                return [*prog.split(), *chosen, *view.PLAYER_OPTIONS[viewer], *rest]
+
+            try:
+                bases, player = view.choose_streams(session, args.seconds, command, default=player)
+            except view.ViewError as error:
+                print(f"{prog}: {error}", file=sys.stderr, flush=True)
+                return 1
+            print(f"{prog}: starting {', '.join(bases)} in "
+                  + {"browser": "the browser", "vlc": "VLC", "none": "no viewer"}[player]
+                  + "; the same without the list:", flush=True)
+            print(shlex.join(command(bases, player)), flush=True)
+        return view.run(session, bases, args.http, player, seconds=args.seconds)
     finally:
         session.close()
 

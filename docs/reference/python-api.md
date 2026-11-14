@@ -266,7 +266,7 @@ The controller side, for a simulation that takes the controller's place, is `Com
 | `xblick.overlay` | a node's drawn results (`--overlay`) and drawing helpers | [Writing nodes](../guides/writing-nodes.md#drawn-results---overlay) |
 | `xblick.weights` | a node's weight download at its start, into its cache directory | [Writing nodes](../guides/writing-nodes.md#rules-every-node-keeps), [Where files are](files.md) |
 | `xblick.paths` | `cache_dir`, `data_dir`, `config_dir` of a node; `expand_path` for paths on a node's command line | [Where files are](files.md) |
-| `xblick.view` | `xblick view`: streams as MJPEG over HTTP (`View`, `to_jpeg`) | [Streams in VLC or a browser](../guides/view.md) |
+| `xblick.view` | `xblick view`: streams as MJPEG over HTTP (`View`, `to_jpeg`) | [Streams in a browser or VLC](../guides/view.md) |
 | `xblick.parameters` | parameters of a node; `declare_options` makes a node's command-line options its parameters | [Parameters](parameters.md) |
 | `xblick.poses` | poses of a camera or a robot at the stamp of an image, rotations and quaternions | |
 | `xblick.rectify` | `rectify_map(info)`: the rectification map of a CameraInfo, as `cv2.initUndistortRectifyMap` gives it; `rectified_info(info)`: the CameraInfo of the rectified image | [C++](cpp-api.md#rectify-an-image) |

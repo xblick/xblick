@@ -1,6 +1,6 @@
-# Streams in VLC or a browser
+# Streams in a browser or VLC
 
-`xblick view` shows camera streams in VLC or a browser. It serves them as MJPEG over HTTP, so any MJPEG player can
+`xblick view` shows camera streams in a browser or in VLC. It serves them as MJPEG over HTTP, so any MJPEG player can
 show them. The server is Python's standard library; the package needs nothing more.
 
 ```bash
@@ -11,8 +11,7 @@ xblick view test/camera/color
 xblick view: serving 1 stream(s) on http://127.0.0.1:8090/ (this PC only; --http 0.0.0.0:PORT opens it to the network)
 xblick view: test/camera/color: http://127.0.0.1:8090/test/camera/color.mjpg
 xblick view: all of them: http://127.0.0.1:8090/
-xblick view: by hand: vlc --network-caching=100 http://127.0.0.1:8090/test/camera/color.mjpg
-xblick view: started VLC (1 window(s))
+xblick view: test/camera/color at 15.0 frames/s, by hand: vlc --mjpeg-fps=18 --network-caching=20 --no-audio http://127.0.0.1:8090/test/camera/color.mjpg
 xblick view: serving; press v for VLC, b for the browser view, Ctrl-C to end
 ```
 
@@ -20,12 +19,12 @@ xblick view: serving; press v for VLC, b for the browser view, Ctrl-C to end
 
 | Call | What happens |
 | --- | --- |
-| `xblick view STREAM ...` | VLC, one window per stream |
-| ... without VLC, on a terminal | one line that VLC is not installed, then the question `open the browser view instead? [y/N]` |
-| ... without VLC, without a terminal | one line that VLC is not installed and that `--browser` opens the browser view; no question |
-| `xblick view STREAM ... --browser` | the page with all streams side by side, in the system's browser |
+| `xblick view STREAM ...` | the page with all streams side by side, in the system's browser |
+| `xblick view STREAM ... --browser` | the same |
+| `xblick view STREAM ... --vlc` | VLC, one window per stream. Without VLC the command ends with an error. |
 | `xblick view STREAM ... --no-player` | no player; the addresses only |
-| any of these on a system without a display | no player and no question; the addresses and how to open them from another PC |
+| `xblick view` | a list of the streams found, to choose the streams and the viewer (below) |
+| any of these on a system without a display | no player; the addresses and how to open them from another PC |
 
 In every case the command keeps serving until Ctrl-C.
 
@@ -33,20 +32,18 @@ In every case the command keeps serving until Ctrl-C.
 
 | Key | Action |
 | --- | --- |
-| `v` | open the VLC windows that are not open (any more), with the same arguments as at the start |
+| `v` | open the VLC windows that are not open (any more), each with its stream's rate measured again |
 | `b` | open the browser view |
 | Ctrl-C | end the command |
 
 On a system without a display both keys print one line and start nothing. Without a terminal (stdin a pipe or a
 file) there are no keys, and the command reads nothing from stdin. When you close all VLC windows, the command says
-so in one line and keeps serving; press `v` to open them again.
-
-The start lines give, once per stream, the command that opens it in VLC by hand, for example
-`vlc --network-caching=100 http://127.0.0.1:8090/test/camera/color.mjpg`.
+so in one line and keeps serving. Press `v` to open them again.
 
 ```bash
-xblick view test/camera/color                                 # VLC
-xblick view test/camera/color test/camera/depth --browser     # both streams side by side in the browser
+xblick view test/camera/color                                 # the browser
+xblick view test/camera/color test/camera/depth               # both streams side by side in the browser
+xblick view test/camera/color --vlc                           # VLC
 xblick view cam/video0/color --connect tcp/192.0.2.10:7447 --zenoh-mode client   # a stream of another PC
 ```
 
@@ -54,17 +51,81 @@ Put the streams before `--connect`, because `--connect` accepts several endpoint
 from a PC without a router, connect as a client. The router of the other PC then routes the frames. As a peer, the
 command would listen on loopback only, and the programs there could not reach it. It says so at the start.
 
-**VLC** is the program `vlc` on `PATH`. Install it yourself, for example with `sudo apt install vlc`. It starts with
-`--network-caching=100`, a cache of 100 ms: little delay and a few frames of buffer. With several streams, VLC opens
-one window per stream. The browser page shows them side by side.
-
 **The browser** is the system's browser, as Python's `webbrowser` module finds it. The environment variable `BROWSER`
 chooses another one.
 
 **No display**: on Linux, a system on which neither `DISPLAY` (X11) nor `WAYLAND_DISPLAY` (Wayland) is set has no
 display. Every graphical program needs one of the two. On such a system the command starts neither VLC nor a browser.
-Python would otherwise start a text browser such as `lynx` in the terminal. It asks no question either. macOS and
-Windows always count as having a display.
+Python would otherwise start a text browser such as `lynx` in the terminal. macOS and Windows always count as having
+a display.
+
+## VLC and the rate hint
+
+VLC is the program `vlc` on `PATH`. Install it yourself, for example with `sudo apt install vlc`. With several
+streams, VLC opens one window per stream.
+
+VLC plays an MJPEG stream over HTTP in time only with a hint of its rate. Without the option `--mjpeg-fps`, VLC 3.0
+fell behind a 30 Hz stream whatever its cache. With `--mjpeg-fps=35 --network-caching=20 --no-audio` it kept up with
+the browser. `xblick view` therefore measures the rate of each stream before it starts VLC. This is the one place
+where a measured value sets an option:
+
+1. The command keeps the arrival times of the last 31 frames of each stream.
+2. The rate is the inverse of the median interval between them. It needs at least 6 frames and waits for them for at
+   most 5 s.
+3. VLC gets `--mjpeg-fps` at 1.15 times the rate, rounded up: 35 for 30 frames/s, 18 for 15 frames/s.
+4. VLC also gets `--network-caching=20` (a cache of 20 ms) and `--no-audio`.
+
+A stream that delivers fewer than 6 frames within 5 s gets no VLC window, and the command says so in one line. The
+start lines give each stream's measured rate and the command that opens it in VLC by hand, so that you can start VLC
+on another PC as well. A stream whose rate changes a lot plays badly in VLC, because the hint fits one rate only. The
+browser needs no hint.
+
+## Choose streams in a list
+
+Without streams on a terminal, `xblick view` lists the image streams that it finds, as a tree by namespace and
+camera. Each stream has the viewers below it. The list is the same as that of [`xblick cam`](cam.md).
+
+```text
+Select streams / viewer:
+├── ▾ cam
+│   └── ▾ video2
+│       ├── ❯ ▾ [x] color
+│       │   ├── browser  (default)
+│       │   ├── VLC
+│       │   └── addresses only
+│       └── ▸ [x] yolox/overlay
+└── ▸ test
+
+Enter opens: xblick view cam/video2/color cam/video2/yolox/overlay
+```
+
+| Key | Action |
+| --- | --- |
+| Up, Down | move to the previous or the next line |
+| Space | mark or unmark the stream. On a namespace or a camera, it marks all of its streams. |
+| Enter | open the marked streams together, or the stream under the cursor if none is marked |
+| Right | expand the line. On a stream, it shows the viewers for the marked streams, and Enter on one starts it. |
+| Left | collapse the line, or move to the line it belongs to |
+| Esc | go back to the top level, or leave there |
+| `q`, Ctrl-C | leave without starting anything, with exit code 1 |
+
+Enter on a stream opens the browser, or the viewer of `--vlc` or `--no-player` if you gave one. Several marked streams
+open side by side on one browser page. In VLC each stream gets its own window. The line under the list shows the
+command that Enter would start. Before the streams open, `xblick view` prints that command:
+
+```text
+xblick view: starting cam/video2/color, cam/video2/yolox/overlay in the browser; the same without the list:
+xblick view cam/video2/color cam/video2/yolox/overlay
+```
+
+The same command typed later opens the same view without the list. It also contains the other options that you gave,
+such as `--connect`. A viewer that cannot start here is shown as unavailable with the reason: without a display, the
+browser and VLC; without `vlc` on `PATH`, VLC. "addresses only" always works.
+
+The list holds the streams that answer within `--seconds` (2 s) and that have a compressed transport. When it finds
+none, the command ends with one line and exit code 1. The line names the cause where the session knows it, for
+example that no router was reached. Without a terminal it shows no list. It ends with a line that names the streams
+found, and you give the streams.
 
 ## What it shows
 
@@ -113,5 +174,12 @@ Each client gets the newest frame whenever it can take one. A slow client skips 
 subscriber nor the other clients. A client that takes no frame for 10 s is dropped, and a client that disconnects is
 cleaned up at once. Ctrl-C ends the command, also while clients watch. VLC windows that the command started end with
 it.
+
+## Status and limits
+
+- The players, the rate hint and the list were tested with stand-in programs for VLC and the browser, in a
+  pseudo-terminal. No real VLC and no real browser were started in the tests.
+- The values of the rate hint come from one test of the maintainer with VLC 3.0.23 and a 30 Hz stream.
+- The example output above was written for this page. Its rate and hint follow the rules above.
 
 The [command line reference](../reference/cli.md#xblick-view-streams-) lists all options.

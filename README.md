@@ -55,7 +55,7 @@ xblick cam /dev/video0   # a webcam as cam/video0/color (needs xblick[cam], not 
 xblick list              # show every stream
 xblick hz test/camera/color
 xblick rerun             # show every stream and result in the Rerun viewer
-xblick view test/camera/color  # show a stream in VLC or a browser
+xblick view test/camera/color  # show a stream in a browser or VLC
 ```
 
 ```python
