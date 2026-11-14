@@ -11,6 +11,23 @@ Each version below is a heading with its release notes: one summary sentence, th
 (and Known limit), one line on compatibility. `tools/release_notes.sh <version>` prints a version's notes for its
 GitHub release. The rule is in [Development](docs/project/development.md#release-notes).
 
+## 0.5.8
+
+`xblick view` opens the browser by default, and `xblick cam` and `xblick view` without arguments show a list to choose from.
+
+### Changed
+- `xblick view` opens the browser by default (was VLC). VLC is `--vlc` or the key `v`; the question "open the browser view instead?" is gone, and `--vlc` without VLC is an error.
+- VLC gets a rate hint measured from the stream (`--mjpeg-fps` a little above its rate), which keeps it in time; the start lines print it ([view guide](docs/guides/view.md#vlc-and-the-rate-hint)).
+- A node's start line says where it reads its frames: `reading the host ring: shm (this subscriber takes frames as arrays in host memory)` instead of "works on the CPU".
+- `xblick cam` without a source refuses `--format`, `--pixel-format`, `--size` and `--fps`: the list chooses the mode.
+
+### Added
+- `xblick cam` without a source: a tree of this PC's cameras, pixel formats, sizes and rates, the recommended mode marked; Enter starts at any level and prints the command that starts the same without the list ([guide](docs/guides/cam.md#choose-a-camera-and-its-mode)).
+- `xblick view` without a stream: a list of the streams found; Space marks several, Right chooses the viewer, and it prints the equivalent command.
+- A guide for [upgrading from 0.4 to 0.5](docs/guides/upgrade-to-0.5.md).
+
+Works with programs of 0.5.0 and later.
+
 ## 0.5.7
 
 Clearer messages, and Zenoh's own terms in the docs. 0.5.6 was not released.
