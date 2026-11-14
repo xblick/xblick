@@ -452,7 +452,7 @@ namespace xblick
                                     std::optional<std::chrono::milliseconds> timeout = std::nullopt);
         // The transport in use; empty while Auto has not found the publisher yet.
         std::optional<Transport> transport() const;
-        // Why it took that transport, e.g. "cuda (publisher on this GPU)"; empty before it chose.
+        // Why it took that transport, e.g. "cuda (on this subscriber's GPU)"; empty before it chose.
         std::string transport_reason() const;
         std::optional<CameraInfo> camera_info() const;
         std::uint64_t received() const;

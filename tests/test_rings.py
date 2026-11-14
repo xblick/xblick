@@ -300,7 +300,7 @@ def test_a_reader_on_another_gpu_gets_the_frame_on_its_own_gpu():
         for copy in (True, False):
             sub = ImageSubscriber(session, "t/x/color", "auto", device=1, copy=copy)
             frame = wait_frame(sub, 60)
-            assert sub.transport == "cuda" and "copied from the publisher's GPU" in sub.transport_reason
+            assert sub.transport == "cuda" and "copied to this subscriber's GPU" in sub.transport_reason
             assert isinstance(frame.image, CudaImage) and frame.image.device == 1
             assert frame.is_valid()
             host = frame.image.numpy()
@@ -308,7 +308,7 @@ def test_a_reader_on_another_gpu_gets_the_frame_on_its_own_gpu():
             assert host[0, 0, 0] == host[-1, -1, 0] and 1 <= host[0, 0, 0] <= 5
             sub.close()
         same = ImageSubscriber(session, "t/x/color", "auto", device=0)
-        assert wait_frame(same, 60).image.device == 0 and same.transport_reason == "cuda (publisher on this GPU)"
+        assert wait_frame(same, 60).image.device == 0 and same.transport_reason == "cuda (on this subscriber's GPU)"
     finally:
         n.value = 0
         session.close()
@@ -340,7 +340,7 @@ def test_a_reader_that_does_not_see_the_publishers_gpu_takes_the_host_ring(monke
     reader.start()
     try:
         reason, on_host = result.get(timeout=90)
-        assert reason == f"shm (publisher's ring is on GPU {ring_gpu[:8]}, which this process does not see)"
+        assert reason == f"shm (the CUDA ring is on GPU {ring_gpu[:8]}, which this process does not see)"
         assert on_host
     finally:
         n.value = 0

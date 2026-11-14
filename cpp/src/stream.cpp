@@ -502,12 +502,13 @@ namespace xblick::detail
                         const bool same = not mine.empty() and mine == ring_uuid;
                         const bool reachable = not mine.empty() and (same or cuda_device_ordinal(ring_uuid) >= 0);
                         t = cuda and reachable ? Transport::Cuda : Transport::Shm;
-                        why = not cuda_device_  ? "this subscriber works on the CPU"
+                        why = not cuda_device_  ? "this subscriber takes frames as arrays in host memory"
                               : not cuda        ? "publisher offers no CUDA ring"
-                              : mine.empty()    ? "no CUDA driver here"
-                              : same            ? "publisher on this GPU"
-                              : reachable       ? "copied from the publisher's GPU " + ring_uuid.substr(0, 8)
-                                                : "publisher's ring is on GPU " + ring_uuid.substr(0, 8) +
+                              : mine.empty()    ? "no CUDA device here"
+                              : same            ? "on this subscriber's GPU"
+                              : reachable       ? "on GPU " + ring_uuid.substr(0, 8) +
+                                                      ", copied to this subscriber's GPU"
+                                                : "the CUDA ring is on GPU " + ring_uuid.substr(0, 8) +
                                                       ", which this process does not see";
                     }
                     const std::string gpu =

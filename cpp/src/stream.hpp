@@ -184,7 +184,7 @@ namespace xblick::detail
         std::optional<std::pair<std::vector<std::shared_ptr<const Item>>, Transport>> recent() const;
 
         std::optional<Transport> transport() const;
-        // Why Auto took the transport it took, e.g. "cuda (publisher on this GPU)"; empty before it chose.
+        // Why Auto took the transport it took, e.g. "cuda (on this subscriber's GPU)"; empty before it chose.
         std::string transport_reason() const;
         std::uint64_t received() const;
         std::uint64_t overwritten() const;

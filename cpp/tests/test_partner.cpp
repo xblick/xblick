@@ -130,8 +130,9 @@ int main()
         ImageSubscriber shm(session, "t/partner/gpu", {.local = Transport::Shm});
         expect(wait_until([&] { return cpu.transport() and automatic.transport() and shm.transport(); }),
                "auto chose");
-        expect(cpu.transport_reason() == "shm (this subscriber works on the CPU)", "auto without a device: shm");
-        expect(automatic.transport_reason() == "cuda (publisher on this GPU)", "auto: the CUDA ring on this GPU");
+        expect(cpu.transport_reason() == "shm (this subscriber takes frames as arrays in host memory)",
+               "auto without a device: shm");
+        expect(automatic.transport_reason() == "cuda (on this subscriber's GPU)", "auto: the CUDA ring on this GPU");
         expect(shm.transport_reason() == "shm (asked for)", "shm as asked");
     }
     if (failures == 0)

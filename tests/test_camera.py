@@ -356,17 +356,17 @@ def test_local_auto_takes_the_cuda_ring_on_its_gpu(sessions, monkeypatch):  # no
             subscriber.close()
 
     # without a device the subscriber works on the CPU: shared memory, though the ring is on this very GPU
-    assert chosen() == "shm (this subscriber works on the CPU)"
-    assert chosen(device="cuda:0") == "cuda (publisher on this GPU)"
-    assert chosen(device=0) == "cuda (publisher on this GPU)"
+    assert chosen() == "shm (this subscriber takes frames as arrays in host memory)"
+    assert chosen(device="cuda:0") == "cuda (on this subscriber's GPU)"
+    assert chosen(device=0) == "cuda (on this subscriber's GPU)"
     assert chosen(local="shm") == "shm (asked for)"
     assert chosen(local="cuda") == "cuda (asked for)"
-    assert chosen(device="cpu") == "shm (this subscriber works on the CPU)"
+    assert chosen(device="cpu") == "shm (this subscriber takes frames as arrays in host memory)"
     monkeypatch.setattr(camera.Subscription, "_own_uuid", lambda self: "f" * 32)  # this subscriber on another GPU
     ring = _core.cuda_device_uuid(0)[:8]  # a GPU that this process sees: copied from GPU to GPU
-    assert chosen(device="cuda:0") == f"cuda (copied from the publisher's GPU {ring})"
+    assert chosen(device="cuda:0") == f"cuda (on GPU {ring}, copied to this subscriber's GPU)"
     monkeypatch.setattr(camera._core, "cuda_device_ordinal", lambda uuid: -1)  # a GPU that this process does not see
-    assert chosen(device="cuda:0") == f"shm (publisher's ring is on GPU {ring}, which this process does not see)"
+    assert chosen(device="cuda:0") == f"shm (the CUDA ring is on GPU {ring}, which this process does not see)"
     publisher.close()
     plain = CameraPublisher(a, f"{BASE}2", encoding="rgb8", frame_id="cam")
     subscriber = ImageSubscriber(b, f"{BASE}2", transport="auto", device="cuda:0")

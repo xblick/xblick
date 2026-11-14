@@ -101,7 +101,7 @@ xblick diagnostics <namespace>    # every node: OK, or WARN with what it waits f
 xblick rerun                      # look at the results
 ```
 
-Read each node's start log for the transport it chose and why (`cuda (publisher on this GPU)`). A node that waits
+Read each node's start log for the transport it chose and why (`cuda (on this subscriber's GPU)`). A node that waits
 names what it waits for in its diagnostics.
 
 ## 7. Hand over and stop

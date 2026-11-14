@@ -134,19 +134,24 @@ On the publisher's host, the option `local` can narrow the choice. Python subscr
 | `shm` | the host ring |
 | `cuda` | the CUDA ring if the publisher offers one, otherwise the host ring |
 
-A subscriber without a `device`, or with `device="cpu"`, works on the CPU. It takes the host ring even when the
-publisher has a CUDA ring on a GPU of this host. A node that needs device arrays and gets the host ring with
+A subscriber without a `device`, or with `device="cpu"`, takes its frames as arrays in host memory. It therefore
+reads the host ring even when the publisher has a CUDA ring on a GPU of this host. This says nothing about where the
+node computes: a node may copy the frames to a GPU itself. A node that needs device arrays and gets the host ring with
 `--local cuda` stops at its first frame with an error (`camera.check_local`).
 
 A subscriber tells you what it chose and why. Python has `describe()` and `transport_reason`, C++ has
 `transport_reason()`, and every node prints the choice in its start log:
 
 ```
-cuda (publisher on this GPU)
-cuda (copied from the publisher's GPU 7bce07b5)
-shm (publisher's ring is on GPU 7bce07b5, which this process does not see)
+shm (this subscriber takes frames as arrays in host memory)
+cuda (on this subscriber's GPU)
+cuda (on GPU 7bce07b5, copied to this subscriber's GPU)
+shm (the CUDA ring is on GPU 7bce07b5, which this process does not see)
 shm (publisher offers no CUDA ring)
+compressed (publisher on another host)
 ```
+
+The start line of a node says first what it reads, for example `reading the host ring: shm (...)`.
 
 ## The order of starting does not matter
 

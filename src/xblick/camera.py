@@ -558,6 +558,9 @@ HANDOVER_S = 2.0
 HANDOVER_NS = int(HANDOVER_S * 1_000_000_000)  # the window in stamp time, an integer as C++'s
 WAIT_HINT_S = 5.0  # a subscription that has no publisher this long says once what may be wrong
 SETTLE_ROUNDS = 3  # info queries after a publisher came or went (its queryable can be known later than its token)
+# what a subscriber reads, for its start line: where the frames are (host or GPU memory) or how they come
+READS = {"shm": "the host ring", "cuda": "the CUDA ring", "compressed": "compressed frames over Zenoh",
+         "raw": "raw frames over Zenoh"}
 LOCAL = ("auto", "shm", "cuda")
 REMOTE = ("compressed", "raw")
 
@@ -989,7 +992,8 @@ class Subscription:
                         where = "this host" if local else "host " + ", ".join(str(r.get("host"))[:8] for r in records)
                         sources = ", ".join(sorted({str(r.get("source")) for r in records if r.get("source")}))
                         log.info(f"{self.base}: publisher found on {where}" + (f" ({sources})" if sources else "")
-                                 + f", reading {self.transport_reason}" + (f" (was {before})" if before else ""))
+                                 + f", reading {READS.get(chosen, chosen)}: {self.transport_reason}"
+                                 + (f" (was {before})" if before else ""))
                         self._use(chosen, gpu)
                 if self._recheck.wait(0.5 if not records or settle else None):
                     settle = SETTLE_ROUNDS
@@ -1022,7 +1026,7 @@ class Subscription:
         if self.local == "cuda":
             return ("cuda", "asked for") if cuda else ("shm", "publisher offers no CUDA ring")
         if self._on_cpu:  # no device given: frames for the CPU, whatever the publisher offers
-            return "shm", "this subscriber works on the CPU"
+            return "shm", "this subscriber takes frames as arrays in host memory"
         if not cuda:
             return "shm", "publisher offers no CUDA ring"
         mine = self._own_uuid()
@@ -1030,12 +1034,12 @@ class Subscription:
             return "shm", "no CUDA device here"
         rings = {r.get("cuda_device_uuid") for r in records}
         if rings == {mine}:
-            return "cuda", "publisher on this GPU"
+            return "cuda", "on this subscriber's GPU"
         where = ", ".join(str(u)[:8] for u in sorted(rings, key=str))
         # a ring on another GPU of this host: its frames are copied from GPU to GPU, if this process sees that GPU
         if all(u and _core.cuda_device_ordinal(u) >= 0 for u in rings):
-            return "cuda", f"copied from the publisher's GPU {where}"
-        return "shm", f"publisher's ring is on GPU {where}, which this process does not see"
+            return "cuda", f"on GPU {where}, copied to this subscriber's GPU"
+        return "shm", f"the CUDA ring is on GPU {where}, which this process does not see"
 
     # -------------------------------------------------------------------------------------------- reading
 

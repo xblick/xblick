@@ -239,7 +239,7 @@ def test_videos_in_cuda_rings(videos, tmp_path):
             frame = frame_of(subscriber)
             assert subscriber.transport == "cuda", subscriber.transport_reason
             assert isinstance(frame.image, CudaImage) and frame.image.shape == shape
-            assert subscriber.transport_reason == "cuda (publisher on this GPU)"
+            assert subscriber.transport_reason == "cuda (on this subscriber's GPU)"
         client = ParameterClient(session, "xblick/video_gpu")
         before = frame_of(color).stamp_ns
         assert client.set({"position_s": 0.0})[0].successful

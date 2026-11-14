@@ -70,7 +70,7 @@ python brightness_node.py
 ```
 
 ```
-brightness: test/camera/color: publisher found on this host (test), reading shm (this subscriber works on the CPU)
+brightness: test/camera/color: publisher found on this host (test), reading the host ring: shm (this subscriber takes frames as arrays in host memory)
 brightness: 14.9 frames/s
 ```
 
