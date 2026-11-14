@@ -37,6 +37,10 @@ if camera.subscribed:
 `publish()` accepts a NumPy array or a device array. `camera.subscribed` is false while nobody reads the stream.
 You can set `camera_info` and `frame_id` of a publisher at any time.
 
+`publish_compressed(message, image=None)` publishes a frame that is compressed already, such as a camera's own JPEG
+or a recording's `image_raw/compressed`. Compressed subscribers get it unchanged. Raw, shm and cuda subscribers get
+the frame decoded once, or `image` when you pass the decoded frame yourself.
+
 To use a real calibration, read a ROS calibration file. This is the YAML format of `camera_calibration`. The file
 contains no frame, so you set it. Any other format raises `ValueError`.
 

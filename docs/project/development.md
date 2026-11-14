@@ -90,7 +90,8 @@ auditwheel. It also builds the sdist and imports each wheel in a new environment
 To release a version:
 
 1. Set the version in `CMakeLists.txt` (`project(xblick VERSION x.y.z)`). Python reads it from there.
-2. Add the entry to `CHANGELOG.md` and update the status in `README.md`.
+2. Add the entry to `CHANGELOG.md` in the form of [Release notes](#release-notes) and update the status in
+   `README.md`.
 3. Merge, then tag `vx.y.z`. The pipeline checks that the tag names the version and builds the wheels.
 4. The tag also starts `.github/workflows/publish.yml`. It builds the same files and uploads them to PyPI with
    trusted publishing. PyPI's publisher for `xblick` names the owner `xblick`, the repository `xblick`, the
@@ -101,6 +102,24 @@ index has the version it asks for. A new minor version of `xblick-relay`: publis
 and release `xblick`.
 
 Node repositories pin a version of `xblick`. After a release that a node needs, raise its pin and run `uv lock`.
+
+## Release notes
+
+The entry of a version in `CHANGELOG.md` is the text of its GitHub release. Each version is a heading `## x.y.z`, so
+that `tools/release_notes.sh x.y.z` cuts its notes out by heading. It prints the section without the heading and
+makes the links into the repository absolute. An entry has this form, in about 10 to 20 lines:
+
+1. One sentence that sums up the version.
+2. The sections `### Added`, `### Changed` and `### Fixed`, and `### Known limit` only when one is needed. Leave out
+   a section without content.
+3. One line per bullet, written from the user's view: what you can do now, what behaves differently, what no
+   longer goes wrong. A safety fix comes first, in bold.
+4. No test internals and no file names of the code, unless a user types them. Details go into the pages in `docs/`,
+   which a bullet may link.
+5. One closing line on compatibility, for example "Works with programs of 0.5.0 and later."
+
+A change of a default that users notice is named under `### Changed`, first. Versions before 0.5.0 stay in their old
+form under "Earlier versions".
 
 ## Layout
 

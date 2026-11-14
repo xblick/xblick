@@ -59,6 +59,10 @@ Reference check: `tools/check_references.sh` (no internal or robot-framework nam
   A ring layout change raises `kVersion` in `ring.hpp`. Either one also raises the package's minor version.
 - Version: only in `CMakeLists.txt` (`project(xblick VERSION x.y.z)`). Every user-visible change: patch bump,
   entry in `CHANGELOG.md`, status line in `README.md`. Release: tag `vx.y.z`, CI builds the wheels.
+- CHANGELOG entry = the release notes: heading `## x.y.z`, one summary sentence, `### Added` / `### Changed` /
+  `### Fixed` (`### Known limit` only if needed), one-line bullets from the user's view, safety fix first and bold,
+  no test internals or code file names, one compatibility line, 10 to 20 lines. Details into `docs/`. Cut out with
+  `tools/release_notes.sh x.y.z`. Rule: `docs/project/development.md#release-notes`.
 - Python and C++ stay equivalent. A feature of the camera, points or detections API exists in both.
   `tests/test_cpp_interop.py` checks it.
 - Documentation changes in the same commit as the code. New topic or option: update `docs/reference/`. History goes
@@ -101,7 +105,7 @@ Reference check: `tools/check_references.sh` (no internal or robot-framework nam
 | `src/xblick/cli.py`, `tui.py`, `tui_graph.py`, `rerun_bridge.py`, `recording.py`, `video.py`, `cam.py`, `v4l2.py`, `pick.py` | tools |
 | `src/xblick/robot.py`, `sim.py`, `controller.py`, `poses.py`, `mps.py` | robot state, simulation, controller link, poses, MPS |
 | `tests/`, `cpp/tests/` | Python and C++ tests |
-| `tools/` | `check_references.sh` (+ `reference_allowlist.txt`), `install_zenoh.sh`, `gen_msgdefs.py`, `setup_python.sh`, `tui_screenshots.py` |
+| `tools/` | `check_references.sh` (+ `reference_allowlist.txt`), `install_zenoh.sh`, `gen_msgdefs.py`, `setup_python.sh`, `tui_screenshots.py`, `release_notes.sh` |
 | `.github/workflows/ci.yml` | CI |
 | `docs/` | `getting-started/`, `concepts/`, `guides/`, `reference/`, `integrations/`, `project/` |
 | `.agents/skills/` | agent skills; `.claude/skills` links here |

@@ -71,9 +71,12 @@ through `--connect <pc> --zenoh-mode client`. `<pc>` means port 7447 of that PC.
 
 A peer that connects only to another PC and listens on loopback only usually finds nothing. The programs of that
 PC learn its loopback address and cannot connect to it. Every `xblick` command and every node says so in one line at
-the start, with the three ways out from the table. The rule uses the options alone. It does not know whether the
-programs of the other PC listen on network addresses, in which case the connection works. The terminal interface
-refuses a peer that only connects.
+the start, with the three ways out from the table. The C++ programs `xblick-cpp-camera`, `xblick-cpp-probe` and
+`xblick-points` print the same line. The rule uses the options alone. It does not know whether the programs of the
+other PC listen on network addresses, in which case the connection works. Each of these turns the line off: a
+connect endpoint on this PC (loopback, `localhost`, its host name or one of its interface addresses), a listen
+endpoint on a network address, client mode, and a Zenoh configuration file. The terminal interface refuses a peer
+that only connects.
 
 ## Other ways to connect
 

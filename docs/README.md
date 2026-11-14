@@ -39,6 +39,7 @@ Instructions for one task each.
 - [Viewer](guides/viewer.md)
 - [Streams in a browser or VLC](guides/view.md) with `xblick view`
 - [Terminal interface](guides/tui.md)
+- [Upgrade from 0.4 to 0.5](guides/upgrade-to-0.5.md)
 
 ## Reference
 

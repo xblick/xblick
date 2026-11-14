@@ -7,208 +7,127 @@ Within 0.3.x, 0.3.59 changed the rings' keys and the info record's version (3): 
 or newer. 0.4.0 to 0.4.3 speak the protocol of 0.3.59 to 0.3.68: their programs and those of 0.3.68 work together.
 0.5.0 renamed every name on the wire and on disk: programs of 0.5 do not work with programs of 0.3 or 0.4.
 
-* **0.5.7** Nothing on the wire changed: programs of 0.5.7 work with those of 0.5.0 to 0.5.6. 0.5.6 was not
-  released, because a test failed on CI.
-  **Fixed:** the documentation described Zenoh's `Timeout` reply wrongly. It said that a node which keeps a query
-  after its reply makes Zenoh send a late `Timeout` reply. In fact a queryable ends its part of a query when it drops
-  the query object, and at the query's timeout the caller's own session ends a query that is still open and adds the
-  error reply `Timeout`. Nothing comes over the network for it. The docs, `AGENTS.md`, the build-node skill,
-  docstrings and comments now say so. The check before a command is unchanged: a `Timeout` reply still means that a
-  queryable got the query and had not finished it. Its messages now say "the query was still open at its timeout"
-  instead of "a reply came late" (Python `session.count` and `session.command`, C++ `ParameterClient`).
-  **Fixed:** a client whose `--connect` endpoints do not answer ended with a Python traceback (`zenoh.ZError: Unable
-  to connect to any of [...]`), and the C++ programs printed `Failed to open session(Error code: -4 )`. Every command,
-  every node that opens its session with `session.open_from_args` and the C++ programs now end with one line and
-  exit code 1. The line names the endpoints and says that a client needs its router there. Other errors at the
-  start of a session, such as a taken `--listen` port, give Zenoh's text in one line. `session.open_session` raises
-  `session.OpenError`, a `zenoh.ZError`.
-  **Fixed:** the terminal interface could not end while its session was still opening, because it waited for
-  `zenoh.open`, which cannot be interrupted. On CI such an open did not return for more than 90 s. The interface
-  now ends at once and gives the terminal back. The process ends when the open returns, and the thread that opened
-  the session closes it. `sessions.md` states that a program in client mode needs its router at the start.
-  **Added:** a node that was given a stream as its camera ends with one line and exit code 1. Started with
-  `--camera cam/video2/color`, a node read `cam/video2/color/color` and waited for good. Now a subscriber with
-  `transport="auto"` whose stream nobody publishes checks whether the name before its last part answers as a
-  stream. It then raises `camera.StreamGivenAsCamera`, a `SystemExit` whose line names the camera (`cam/video2`).
-  It never reads the camera in its place. Nodes need no change. A subscriber that has found no publisher after 5 s
-  logs one line: the camera may not have started yet, or the name may be wrong.
-  **Changed:** `xblick cam` and `xblick test-camera` print `publishing the stream <stream>` and, on the next line,
-  `start a node with --camera <camera> (the camera, not the stream)`.
-  **Changed:** the documentation uses Zenoh's terms. A router routes data. "Relay" names only our program.
-  `sessions.md` introduces gossip scouting, the peer-to-peer region below a router, the clique and the gateway.
-  `--connect` takes a Zenoh endpoint, and `--key` of `xblick play` and `xblick recorder` takes a key expression
-  (`KEY_EXPR`). The pages link Zenoh's documentation, and the glossary has a table of Zenoh's terms. Its Router row
-  said that the router is the program `zenohd`. A router is a session in router mode: `xblick router` or `zenohd`.
-  A stated guarantee now names its condition: a command reaches every queryable of its key because Zenoh's default
-  query target does so while no queryable is declared complete, and a test pins that none is.
-  **Tests:** the tests of the notice for a peer across PCs no longer wait for a session to an address that does not
-  answer. Where such packets are dropped, as on CI, the close of that session took more than 5 s.
-  **Fixed:** a node that closed its session before its `Parameters` printed a traceback of the parameters' server
-  thread (`zenoh.ZError: channel is empty and closed`). The thread now ends quietly when its channels close.
-  **Tests:** a test whose threads still run 6 s after it fails, with their stacks, and an exception in a thread is
-  an error of its test. A watchdog that needs no GIL ends a hung run 30 s after the test's timeout. Tests that
-  raced with a session just opened (a second node, the tracks over an image) wait for a condition instead of a
-  fixed time.
-  **Docs:** the check before a command has a limit that the pages did not name. A session that was just opened
-  links to the serving sessions one after the other. For a short time its read can miss a second node, which may then
-  get the command too, or reach only a busy one and refuse with "no node answered in time". The command path is
-  unchanged. `python-api.md`, `parameters.md`, `cpp-api.md`, `AGENTS.md` and `session.count` say so.
-  **Docs:** the README has shields. The recipe for programs without a router in `video.md` was replaced by one that
-  was tried.
-* **0.5.6** Nothing on the wire changed: programs of 0.5.6 work with those of 0.5.0 to 0.5.5.
-  **Added:** a notice for a peer that connects only to other PCs and listens on loopback only. Behind a Zenoh 1.10
-  router the programs of the other PC then usually cannot reach it. Every `xblick` command, every node that opens its
-  session with `session.open_from_args`, `xblick mps`, and the C++ programs `xblick-cpp-camera`, `xblick-cpp-probe` and
-  `xblick-points` print one line on stderr at the start. The line names three ways out with the given endpoints:
-  `--zenoh-mode client`, a router on this PC (`xblick router --connect <endpoint>`), or `--listen tcp/0.0.0.0:0`.
-  The rule uses the options alone (`xblick.session.across_pcs`, C++ `xblick::across_pcs`). A connect endpoint on this
-  PC (loopback, `localhost`, its name or one of its interface addresses), a listen endpoint on a network address,
-  client mode and a Zenoh config file each turn it off. The session keeps the result. The messages for an empty result
-  (`no stream answered`, `nothing received`, `xblick view`'s `no publisher answers`) then name the same cause
-  (`session.why_nothing`). `xblick rerun`'s `no stream answered` names a cause now as well. The C++ programs accept
-  `--zenoh-mode peer|client`, and C++ `SessionOptions` has `program`, which `Options::session_options` sets.
-  **Docs:** a table "Which mode when" in [Sessions and routers](docs/concepts/sessions.md), in brief in the
-  [command line reference](docs/reference/cli.md). The examples that watch another PC's streams connect as a client.
-* **0.5.5** Nothing on the wire changed: programs of 0.5.5 work with those of 0.5.0 to 0.5.4.
-  **Added:** a fixed place for the files of nodes (issue #11), the same for a checkout and a pip install. The cache
-  (weights, engines, compiled kernels) is `~/.cache/xblick/<node>/`, the data a user made is
-  `~/.local/share/xblick/<node>/`, and `XBLICK_HOME` moves both to `<it>/cache/<node>/` and `<it>/data/<node>/`.
-  `xblick.paths.cache_dir`, `data_dir`, `config_dir` and `check_node_name`, and the same rule in C++
-  (`xblick/paths.hpp` in `xblick::core`). `<node>` is the short name (`yolox`, not `xblick-yolox`).
-  `xblick.weights.Store(prog, node=..., terms=...)` takes the node's cache directory as its root, `Weight` paths
-  relative to the root, `--weights-dir DIR` (from `add_arguments`) with `Store.at`, and `former`: the places where a
-  node kept its weights before. A file there is not used. The node prints once the command that moves it and then
-  goes on as for a missing file. A `Store` with an explicit root works as before. The page
-  [Where files are](docs/reference/files.md) lists the places and variables.
-  **Changed:** the terminal interface's presets file follows the XDG rule: a relative `XDG_CONFIG_HOME` is ignored,
-  and a leading `~` in it is expanded. An absolute or unset `XDG_CONFIG_HOME` gives the same path as before.
-* **0.5.4** Nothing on the wire changed: programs of 0.5.4 work with those of 0.5.0 to 0.5.3.
-  **Fixed:** a node ends on SIGINT also as a background job of a script (issue #11). `xblick.node.start` now restores
-  Python's SIGINT handler, as the commands did since 0.5.3: a non-interactive shell starts background jobs with SIGINT
-  ignored, so `kill -INT` and Ctrl-C on the script did not end the node. One function does it for the commands and
-  the nodes (`xblick.node.end_on_signals`). `xblick-cpp-probe` restores SIGINT's default action for the same reason.
-  `xblick-cpp-camera` and `xblick-points` already installed their own handler.
-  **Added:** `xblick.weights`: `Store.ensure` and `Store.download_only` take `options`, the node's options that
-  select the weights (`options=["--model", "s"]`). The lines for `--no-download` and for a failed download name the
-  command with them, so that it downloads exactly the missing files. Without `options` the lines are as before.
-  **Docs:** the terminal interface guide said that a peer that only connects would receive nothing. It now states the
-  interface's own rule: it refuses such a peer, while a command accepts it and listens on a loopback port.
-* **0.5.3** Nothing on the wire changed: programs of 0.5.3 work with those of 0.5.0 to 0.5.2.
-  **Fixed:** a peer session with `--connect` and without `--listen` (Python and C++) now listens on a free loopback
-  port, as a session without endpoints always did. Behind a Zenoh 1.10 router (`zenohd` or `xblick router`) peers
-  reach each other only directly, and such peers found nothing (`xblick list --connect tcp/127.0.0.1:PORT`). The
-  commands end on SIGINT also as background jobs of a script (a non-interactive shell starts those with SIGINT
-  ignored).
-  **Added:** `xblick router`, the Zenoh router from the Zenoh library in the package, instead of `zenohd`
-  (`--listen`, default `tcp/0.0.0.0:7447`; `--connect` for the routers of other PCs, `zenohd`'s `-e`). It has no
-  plugins and reads no configuration file; a taken port ends it with one line. `zenohd` works as before.
-  `xblick view STREAM ...` shows camera streams in VLC (one window per stream) or with `--browser` in the browser
-  (all streams side by side), served as MJPEG over HTTP from Python's standard library on 127.0.0.1:8090: the
-  JPEGs unchanged, depth coloured with a fixed range (red at 300 mm to blue at 5000 mm). Without VLC it asks on a
-  terminal whether to open the browser instead; on a system without a display (Linux: neither `DISPLAY` nor
-  `WAYLAND_DISPLAY` set) it starts no player and prints how to open the addresses from another PC. `--http
-  0.0.0.0:PORT` opens it to the network without a password. `--no-player` serves only. A slow client skips frames
-  and holds up nobody else. On a terminal, the key `v` opens the VLC windows again and `b` the browser view.
-  `xblick.weights`: the weight download that every node repository carried as its own copy (`Store`,
-  `HuggingFace`, `Url`, `Weight`, `add_arguments`). The nodes move to it with their next versions.
-  `xblick.overlay` and the convention for drawn results: a node's `--overlay` (off by default) publishes
-  `<camera>/<node>/overlay` (rgb8, the colour frame's stamp, frame id and camera_info), drawn in a thread of its own
-  only while somebody subscribes; drawing helpers for boxes, masks, keypoints, tracks and depth colours. The rules
-  every node keeps are in the [node guide](docs/guides/writing-nodes.md#rules-every-node-keeps).
-* **0.5.2** **Fixed (safety):** 0.5.1's parameter client (Python and C++ `ParameterClient`) sent a parameter set again
-  every 250 ms, up to the client's timeout (default 2 s: up to about 8 times), when the query ended without a reply. A
-  node that drops a set without replying (a bridge, or a node closing with sets in its queue) applied it several
-  times. Controller manager and recorder commands were sent once in 0.5.1 as well. Do not use 0.5.1 to set parameters
-  of a robot's controllers: update. Now every query command (a parameter set, the controller manager's create, switch
-  and unload, a torque step, a record and play node's command sent with `recording.request` or `send_command`) is sent
-  once to each queryable of its key, after the session knows one (`session.command`, `session.ask_once`, C++
-  `xblick::ask_once`). Before it, a read of the same node must have exactly one answer and no node's late "Timeout"
-  reply, else the command is not sent. This check is best effort: it catches two nodes that both answer the read and a
-  node that answers it late. A second node that drops the read, that appears between the read and the command, or that
-  serves a broad key expression still gets the command; for a torque step the read counts the controller's parameter
-  servers, not its torque_step servers. The check can also stop a command that worked before: a node whose read takes
-  longer than the timeout now gets nothing ("not sent"), which fails safe. `xblick.NotReached` (a `TimeoutError`): not
-  sent. `xblick.NoAnswer` (a `RuntimeError`, deliberately no `TimeoutError`): sent once, no answer, it may still be
-  executed, not sent again. `xblick.PartlyAnswered` (a `NoAnswer`): sent once, answered, and a reply came late:
-  another node may still execute it. `xblick.SeveralExecuted` (a `NoAnswer`): sent once, several nodes answered and
-  each executed it. A receiver must reply and drop the query at once: one that keeps the query after its reply makes
-  Zenoh send a late "Timeout" reply, which the check takes for a second node ("not sent"); Durchblick's own parameter
-  servers and record and play node do so, a receiver outside this repository (a robot's bridge) must be checked before
-  0.5.2 commands it. C++ has the same types; Zenoh's own `Timeout` reply is handled in C++ as in Python. A command has
-  no expiry: a busy or briefly unreachable receiver may execute it after the caller gave up. The protocol is 0.5.0's:
-  programs of 0.5.0, 0.5.1 and 0.5.2 work together. `xblick cam`: `--reconnect [SECONDS]` opens a camera that stopped
-  or cannot be opened (also at the start) again every SECONDS (default 2) until it delivers; each loss and return is a
-  log line, a WARN diagnostics status while it is away; it must come back in its first mode. `--option KEY=VALUE`
-  passes FFmpeg input options and refuses one FFmpeg does not have for the source (FFmpeg and PyAV would ignore it).
-  `--mjpeg passthrough` (opt-in, not tested on a real camera) sends an MJPEG camera's JPEG unchanged on the compressed
-  transport, with the standard Huffman tables inserted where a frame has none. `CameraPublisher.publish_compressed`
-  takes the decoded frame (`image=`). Queries of a session just opened: reads (`session.ask`, C++ `xblick::ask`) are
-  asked again until the first reply: `xblick hz`'s check for point clouds, the rays of compressed clouds, the
-  controller manager's reads. Examples in the documentation and help texts use the test camera's `test/camera` and the
-  device nodes' `cam/rc_visard` and `cam/azurekinect` in place of `robot/camera`. `xblick cam` and `xblick
-  test-camera` print the stream they publish and the camera for a node (`--camera ...`) on lines of their own, and a
-  hint at the start when their session reached no router and no other session. `xblick test-camera`'s first line no
-  longer names the stream; the next one does. **Changed:** C++ `ParameterClient` throws `xblick::NotReached` and
-  `xblick::NoAnswer` (with `xblick::PartlyAnswered` and `xblick::SeveralExecuted`), which derive from
-  `std::runtime_error` and not from `ParameterError` (also a `std::runtime_error`); a caller that catches only
-  `ParameterError` must add them, or catch `std::runtime_error`. `recording.send_command` sends its command as
-  `request` does (a query, checked, sent once) and then returns the node's status; it put the command on the control
-  key before, which a session just opened could lose. With `request` its timeout is 30 s (was 10 s), and a `stop`
-  whose check fails raises `RecordingError` instead of returning the status.
-* **0.5.1** **Changed default:** `xblick test-camera` publishes `test/camera/color`, no longer
-  `robot/test_camera/color`. `xblick-cpp-camera` and `xblick-cpp-probe` default to `test/camera/color` and
-  `test/camera/points`. A script that subscribes to the old name needs the new one, or the test camera started with
-  `--namespace robot --camera test_camera`. New command `xblick cam` with the extra `xblick[cam]` (PyAV): a live
-  camera that FFmpeg opens, as a V4L2 device, an RTSP or HTTP URL, or another FFmpeg input with `--format`, published
-  as an ordinary camera stream ([guide](docs/guides/cam.md)). Without a source it lists the V4L2 capture devices of
-  the PC to choose from with the arrow keys. Without `--stream` the stream is `cam/<device node>/color`
-  (`cam/video0/color`), or `cam/camera/color` for a URL, with `/mono` for a grey camera. A mode that the camera does
-  not deliver, a missing device and a camera that stops end it with one line. The stamps are the arrival on the PC.
-  Fixes from the release test of 0.5.0: `xblick param` as a peer behind a router timed out, because `find_nodes` and
-  `ParameterClient` sent one query right after the session opened. They now ask again until their timeout, in Python
-  and C++. `xblick play rec/file.mcap` (a relative path with a directory) looked for `rec/rec/file.mcap`. A timeout
-  prints one line instead of a traceback. `xblick list` says when it reached no router. The play node logs as `xblick
-  play`. The docs say where `zenohd` comes from and that the point cloud build needs `nvcc` or
-  `-DCMAKE_CUDA_COMPILER`. Four CUDA tests no longer leave rings in `/dev/shm`. The protocol is the one of 0.5.0:
-  programs of 0.5.0 and 0.5.1 work together.
-* **0.5.0** Every name in code, on the wire and on disk is `xblick`. Only the prose name of the project stays
-  Durchblick. **Breaking for everything:** programs of 0.5 do not talk to programs of 0.3 or 0.4. Their own message
-  types, info records, ring names and keys differ, and a 0.5 reader refuses a 0.4 info record (its version is 4
-  now). Only samples of ROS types (for example `image_raw`, `image_raw/compressed`, `camera_info`) keep their bytes.
-  Every program and node of a setup must run 0.5. Recordings of 0.4 still play, but their channels lack the info
-  record of `xblick_info`, so `play` serves their streams as plain topics, as it does for other MCAP files. The
-  repository is `github.com/xblick/xblick`. Node repositories are `xblick-<name>`, the relay is `xblick-relay`.
-  The versions of the message types (`@1`) and of the rings (`kVersion`) stay, since their fields and layouts did not
-  change. The ring magics `DBLKRING` and `DBLKCUDA` stay as well.
+Each version below is a heading with its release notes: one summary sentence, the sections Added, Changed, Fixed
+(and Known limit), one line on compatibility. `tools/release_notes.sh <version>` prints a version's notes for its
+GitHub release. The rule is in [Development](docs/project/development.md#release-notes).
 
-  | What | Old (0.4) | New (0.5) |
-  | --- | --- | --- |
-  | Python package, extension | `import blick`, `blick._core` | `import xblick`, `xblick._core` |
-  | Distribution, extras | `xblick`, `xblick[relay]` with `blick-relay` 0.3 | unchanged, `xblick[relay]` with `xblick-relay` 0.4 |
-  | Command | `blick` (`blick list`, `blick relay`, `blick mps`, ...) | `xblick` (`xblick list`, `xblick relay`, ...) |
-  | Logger | `blick` | `xblick` |
-  | Terminal interface class | `tui.DurchblickApp` | `tui.XblickApp` |
-  | Relay package and program | `blick_relay`, `durchblick-relay` | `xblick_relay`, `xblick-relay` |
-  | C++ namespace | `durchblick::` | `xblick::` |
-  | C++ headers | `#include <durchblick/camera.hpp>`, `<durchblick/version.hpp>` | `#include <xblick/camera.hpp>`, `<xblick/version.hpp>` |
-  | Version macros | `DURCHBLICK_VERSION`, `DURCHBLICK_VERSION_MAJOR/MINOR/PATCH` | `XBLICK_VERSION`, `XBLICK_VERSION_MAJOR/MINOR/PATCH` |
-  | CMake package | `find_package(durchblick 0.4)`, `lib/cmake/durchblick` | `find_package(xblick 0.5)`, `lib/cmake/xblick` |
-  | CMake targets | `durchblick::core`, `durchblick::durchblick`, `durchblick::points` | `xblick::core`, `xblick::xblick`, `xblick::points` |
-  | CMake options and variables | `DURCHBLICK_CAMERA`, `DURCHBLICK_POINTS`, `DURCHBLICK_CUDA_INCLUDE_DIR`, `durchblick_points_FOUND` | `XBLICK_CAMERA`, `XBLICK_POINTS`, `XBLICK_CUDA_INCLUDE_DIR`, `xblick_points_FOUND` |
-  | Libraries | `libdurchblick_core.a`, `libdurchblick.a`, `libdurchblick_points.a` | `libxblick_core.a`, `libxblick.a`, `libxblick_points.a` |
-  | Programs | `durchblick-points`, `durchblick-cpp-camera`, `durchblick-cpp-probe` | `xblick-points`, `xblick-cpp-camera`, `xblick-cpp-probe` |
-  | Test variables | `DURCHBLICK_CPP_BUILD`, `DURCHBLICK_TUI_SCREENS` | `XBLICK_CPP_BUILD`, `XBLICK_TUI_SCREENS` |
-  | Message types | `durchblick_msgs/msg/...`, `durchblick_msgs/srv/...` | `xblick_msgs/msg/...`, `xblick_msgs/srv/...` |
-  | Info record (`<base>/info`, detections' info) | `{"v":3, ..., "durchblick":"<version>"}` | `{"v":4, ..., "xblick":"<version>"}` |
-  | Shared-memory rings | `/dev/shm/durchblick-<16 hex>` | `/dev/shm/xblick-<16 hex>` |
-  | CUDA ring handshake socket | `\0durchblick-<16 hex>` | `\0xblick-<16 hex>` |
-  | Record and play node | `durchblick/<name>/control`, `durchblick/<name>/status`, parameters of `durchblick/<name>` | `xblick/<name>/control`, `xblick/<name>/status`, parameters of `xblick/<name>` |
-  | MPS daemon | token `durchblick/mps/<name>`, `.../status` `{"v":1, ..., "durchblick":...}`, line `durchblick mps: ready` | token `xblick/mps/<name>`, `.../status` `{"v":2, ..., "xblick":...}`, line `xblick mps: ready` |
-  | MCAP files | library `durchblick <version>`, channel metadata `durchblick_info`, record `durchblick_recording` | library `xblick <version>`, `xblick_info`, `xblick_recording` |
-  | Rerun application id | `durchblick` | `xblick` |
-  | Presets of the terminal interface | `$XDG_CONFIG_HOME/durchblick/rerun_presets.json` | `$XDG_CONFIG_HOME/xblick/rerun_presets.json` |
-  | Test pattern's JPEG comment | `durchblick-test-jpeg <seq>` | `xblick-test-jpeg <seq>` |
-  | Agent skills | `durchblick-build-node`, `durchblick-run-nodes`, `durchblick-benchmark-nodes`, `durchblick-develop-tui` | `xblick-build-node`, `xblick-run-nodes`, `xblick-benchmark-nodes`, `xblick-develop-tui` |
+## 0.5.7
+
+Clearer messages, and Zenoh's own terms in the docs. 0.5.6 was not released.
+
+### Added
+- A node given a stream as its camera (`--camera cam/video2/color`) ends with one line that names the camera, instead of waiting.
+- A notice when a program connects to another PC's router in the default mode, where it usually reaches nobody, with the three remedies.
+
+### Changed
+- `xblick cam` and `xblick test-camera` print the `--camera` value directly after the stream.
+- The docs use Zenoh's terms and link Zenoh's documentation; the glossary has a table of them.
+
+### Fixed
+- The docs described Zenoh's `Timeout` reply wrongly. Behaviour is unchanged; messages now say "the query was still open at its timeout".
+- A client that cannot reach its router ends with one line instead of a traceback.
+- The terminal interface can end while its session is still opening.
+- A node that closed its session before its parameters printed a traceback.
+
+Works with programs of 0.5.0 and later.
+
+## 0.5.6
+
+Not released: a test failed on CI. Its changes are part of 0.5.7.
+
+## 0.5.5
+
+One fixed place for the files of nodes.
+
+### Added
+- Weights and other downloads in `~/.cache/xblick/<node>/`, files a user made in `~/.local/share/xblick/<node>/`; `XBLICK_HOME` moves both. The same rule in Python (`xblick.paths`) and C++.
+- `--weights-dir` for every node.
+- A page "Where files are": offline PCs, one directory for several users.
+
+### Changed
+- Weights at a node's former place are not used silently: the node prints the command that moves them.
+
+Works with programs of 0.5.0 and later.
+
+## 0.5.4
+
+Small fixes for nodes.
+
+### Fixed
+- A node started in the background of a script ends on Ctrl-C, as the commands do since 0.5.3.
+- The hint for missing weights names the full command, with the options that select them.
+- The terminal interface's guide stated an outdated rule for programs that only connect.
+
+Works with programs of 0.5.0 and later.
+
+## 0.5.3
+
+A router and a viewer in the package: `xblick router`, `xblick view`.
+
+### Added
+- `xblick router`: a Zenoh router from the package; no separate `zenohd` download.
+- `xblick view`: camera streams as MJPEG over HTTP, in VLC or a browser grid. Nothing is opened on a PC without a display.
+- `xblick.weights`: the nodes' download of model weights (checksums, a lock, `--download-only`, `--no-download`).
+- `xblick.overlay`: an image with a node's results drawn in, published only on request (`--overlay`).
+- The conventions for nodes in `AGENTS.md` and the docs.
+
+### Fixed
+- A program with `--connect` and without `--listen` reached nobody behind a router. It now listens on a free local port.
+- Commands started in the background of a script end on Ctrl-C.
+
+Works with programs of 0.5.0 and later.
+
+## 0.5.2
+
+**Safety fix: update from 0.5.1.** 0.5.1 could send a parameter set several times.
+
+### Fixed
+- **Commands are sent exactly once.** In 0.5.1 a parameter set was sent again every 250 ms while no reply came. Do not use 0.5.1 to set parameters of a robot's controllers.
+- A command's outcome has its own error type: `NotReached` (not sent), `NoAnswer` (sent once, no answer: it may still be executed), `PartlyAnswered`, `SeveralExecuted`. Python and C++.
+- A command is refused before it is sent when more than one node answers for its key (a best-effort check).
+
+### Added
+- `xblick cam --reconnect`, `--option KEY=VALUE` for FFmpeg settings, and `--mjpeg passthrough` (opt-in).
+- `xblick cam` and `xblick test-camera` print their stream and the `--camera` value for a node.
+
+### Changed
+- Examples in the docs use neutral names (`test/camera`, `cam/...`).
+- C++: `ParameterClient` throws `NotReached` and `NoAnswer`, which are not `ParameterError`.
+
+### Known limit
+- A command has no expiry: a busy receiver may execute it after the sender gave up ([#1](https://github.com/xblick/xblick/issues/1)).
+
+Works with programs of 0.5.0 and later.
+
+## 0.5.1
+
+A live camera as a stream: `xblick cam`.
+
+### Added
+- `xblick cam`: any camera FFmpeg opens (a webcam, a capture card, an RTSP or HTTP stream). Without a source it lists this PC's cameras to choose from. Needs `pip install "xblick[cam]"`.
+
+### Changed
+- Default stream names without "robot": `xblick test-camera` publishes `test/camera/color` (was `robot/test_camera/color`); `xblick cam` publishes `cam/<device>/color`.
+
+### Fixed
+- `xblick param` timed out behind a router.
+- `xblick play` failed on a relative path with a directory.
+- A timeout prints one line instead of a traceback.
+
+Works with programs of 0.5.0 and later.
+
+## 0.5.0
+
+Every name is now `xblick`. Programs of 0.5 do not work with programs of 0.3 or 0.4.
+
+### Changed
+- **Breaking:** every name in code, on the wire and on disk is `xblick`: the package and command, the C++ namespace and headers, the CMake package, the programs, the message types and the rings. Update every program and node of a setup at once; the [upgrade guide](docs/guides/upgrade-to-0.5.md) lists each old and new name.
+- Recordings of 0.4 still play; `xblick play` serves their streams as plain topics.
+- The repository is `github.com/xblick/xblick`; node repositories are `xblick-<name>`, the relay is `xblick-relay`.
+
+Works with programs of 0.5.0 and later.
+
+## Earlier versions
 
 * **0.4.3** The first version on PyPI. The distribution is `xblick` there (`pip install xblick`; PyPI does not allow
   the name `blick`); the module `blick` and the command `blick` keep their names. The extra `xblick[relay]` installs

@@ -33,6 +33,10 @@ if (camera.subscribed())
 
 `publish` also accepts a `DeviceImage` for a frame in GPU memory.
 
+Set `SessionOptions::program` to the program's name (`Options::session_options` sets it). `open_session` then prints
+one line on stderr, `<program>: ...`, when the options make a peer that connects only to other PCs and listens on
+loopback only, as the Python commands do ([sessions](../concepts/sessions.md#which-mode-when)).
+
 ## Pass a camera's JPEG through
 
 A camera that delivers JPEG needs no decoding for subscribers that want JPEG.
