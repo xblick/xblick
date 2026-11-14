@@ -7,7 +7,7 @@
     xblick snapshot test/camera/color out.png --connect …
     xblick test-camera                            # a moving test pattern as test/camera/color
     xblick cam /dev/video0                        # a live camera FFmpeg opens as cam/video0/color (needs xblick[cam])
-    xblick cam                                    # ... chosen from this PC's cameras with the arrow keys
+    xblick cam                                    # ... camera and mode chosen in a list of this PC's cameras
     xblick rerun --connect …                      # every stream and node result in the Rerun viewer
     xblick view test/camera/color                 # a stream in VLC or a browser, served as MJPEG (view.py)
     xblick diagnostics test --connect …          # how the cameras' publishers are doing (<camera>/diagnostics)
@@ -30,6 +30,7 @@ import argparse
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import sys
 import time
@@ -209,7 +210,7 @@ def _cam(args, parser) -> int:
         if args.stream is not None:
             camera_of(args.stream)  # checked before a camera is chosen
         if args.source is None:
-            args.source = cam.select_source()
+            _choose_camera(args, parser)
         camera = cam.camera_for(args.source, cam.input_format(args.source, args.format), args.stream)
         namespace, _, name = camera.rpartition("/")
     except (ImportError, VideoError, cam.CamError) as error:
@@ -234,6 +235,29 @@ def _cam(args, parser) -> int:
         finally:
             params.close()
     return 0
+
+
+def _choose_camera(args, parser):
+    """``xblick cam`` without a source: the camera and its mode chosen in the list (cam.select_source), written into
+    ``args``; prints the command that starts the same without the list."""
+    given = [option for option, value in (("--format", args.format), ("--pixel-format", args.pixel_format),
+                                          ("--size", args.size), ("--fps", args.fps)) if value is not None]
+    if given:
+        raise cam.CamError(f"{', '.join(given)} without a source: the list chooses the mode; give the source as well, "
+                           "or leave them out")
+    prog = parser.prog.split()  # ["xblick", "cam"]
+    rest = args.argv[1:]  # the options given; no source, as there is none
+    selected = cam.select_source(lambda chosen: [*prog, *chosen.arguments(), *rest])
+    choice = selected.choice
+    args.source = selected.source
+    if choice.format is not None:
+        args.pixel_format = choice.format.name
+    if choice.size is not None:
+        args.size = (choice.size.width, choice.size.height)
+    if choice.rate is not None:
+        args.fps = float(cam.v4l2.rate_text(choice.rate))  # as --fps reads the printed value
+    print(f"{parser.prog}: starting {selected.source} with {choice.text()}; the same without the list:", flush=True)
+    print(shlex.join([*prog, *selected.arguments(), *rest]), flush=True)
 
 
 def _diagnostics(args) -> int:
@@ -872,6 +896,7 @@ def parse(argv: list[str], prog: str = "xblick") -> argparse.Namespace:
     """A command line's arguments, checked; a wrong one exits as argparse does (SystemExit 2, the reason on stderr)."""
     parser = build_parser(prog)
     args = parser.parse_args(argv)
+    args.argv = list(argv)  # as given: xblick cam and xblick view print the command a list resolved to
     if args.command == "rerun" and args.web is not None and args.serve is None:
         parser.error("--web needs --serve")
     return args

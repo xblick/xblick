@@ -205,7 +205,8 @@ def _symbols(out) -> dict[str, str]:
 
 
 def render(tree: Tree, title: str, status: str, keys: str, symbols: dict[str, str]):
-    """The list as a Rich renderable: the title, the items as a tree, the status line, the keys and the message."""
+    """The list as a Rich renderable: the items as a tree below the title, the status line, the message and the
+    keys."""
     from rich.console import Group
     from rich.text import Text
     from rich.tree import Tree as RichTree
@@ -213,7 +214,8 @@ def render(tree: Tree, title: str, status: str, keys: str, symbols: dict[str, st
     def label(item: Item) -> Text:
         here = item is tree.cursor
         text = Text(f"{symbols['cursor'] if here else ' '} ", style="bold" if here else "")
-        text.append((symbols["open"] if item.expanded else symbols["closed"]) + " " if item.children else "  ")
+        if item.children:
+            text.append((symbols["open"] if item.expanded else symbols["closed"]) + " ")
         if item.markable:
             text.append("[x] " if item.marked else "[ ] ")
         text.append(item.label, style=("reverse " if here else "") + ("" if item.enabled else "dim"))
@@ -221,7 +223,7 @@ def render(tree: Tree, title: str, status: str, keys: str, symbols: dict[str, st
             text.append("  " + item.note, style="green" if item.note == "[recommended]" else "dim")
         return text
 
-    root = RichTree("", hide_root=True, guide_style="dim")
+    root = RichTree(Text(title), guide_style="dim")
 
     def add(node, items):
         for item in items:
@@ -230,7 +232,7 @@ def render(tree: Tree, title: str, status: str, keys: str, symbols: dict[str, st
                 add(branch, item.children)
 
     add(root, tree.roots)
-    parts = [Text(title), Text(""), root, Text(""), Text(status)]
+    parts = [root, Text(""), Text(status)]
     if tree.message:
         parts.append(Text(tree.message, style="yellow"))
     parts.append(Text(keys, style="dim"))

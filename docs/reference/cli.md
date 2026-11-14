@@ -132,7 +132,7 @@ extra `xblick[cam]`. See the [guide](../guides/cam.md).
 
 | Option | Meaning |
 | --- | --- |
-| `source` | `/dev/videoN`, a URL, or with `--format` another FFmpeg input. Without it, choose one of the V4L2 cameras of this PC in a list (arrow keys, Enter). |
+| `source` | `/dev/videoN`, a URL, or with `--format` another FFmpeg input. Without it, choose a V4L2 camera of this PC and its mode in a tree (camera, pixel format, size, rate). `xblick cam` prints the command that starts the same without the list. |
 | `--stream BASE` | the stream, `<camera>/<stream>`. The default is `cam/<device node>/color`, for example `cam/video0/color`, or `cam/camera/color` for a URL or a `--format` source. A grey camera gets `/mono` in place of `/color`. |
 | `--format FORMAT` | FFmpeg's input format, for example `lavfi`. The default is `video4linux2` for `/dev/...` and the protocol for a URL. |
 | `--size WxH`, `--fps FPS`, `--pixel-format FORMAT` | the mode to ask the camera for. The camera must deliver it. `--pixel-format` is for V4L2 only. |

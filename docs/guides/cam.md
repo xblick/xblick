@@ -46,27 +46,111 @@ replaces the default.
 FFmpeg's filter `realtime` makes the test pattern deliver at its rate, as a camera does. Without it, the filter
 graph delivers frames as fast as it can.
 
-## Choose a camera
+## Choose a camera and its mode
 
-Leave out the source to choose one of the cameras of this PC:
+Leave out the source to choose one of the cameras of this PC and its mode in a list:
 
 ```bash
 xblick cam
 ```
 
-`xblick cam` lists the V4L2 devices that capture video, each with its path and name. Move with the arrow keys and
-press Enter to start the marked camera. Esc, `q` or Ctrl-C leave without starting anything, with exit code 1.
+The list is a tree with four levels: camera, pixel format, size and rate. This example was drawn with stand-in
+cameras in a test:
 
-```
-xblick cam: choose a camera (arrow keys, Enter; Esc or q: none)
-> /dev/video0  Integrated Camera: Integrated C
-  /dev/video2  USB Capture HDMI
+```text
+Select camera / configuration:
+├── ▸ /dev/video0  Azure Kinect 4K Camera
+└── ▾ /dev/video2  C922 Pro Stream Webcam  (by-id: usb-046d_C922_Pro_Stream_Webcam_A1B2C3D4-video-index0)
+    ├── ▾ mjpeg  [recommended]
+    │   ├── ▾ 1920x1080  [recommended]
+    │   │   ├── ❯ 30 fps  [recommended]
+    │   │   └── 15 fps
+    │   ├── ▸ 1280x720
+    │   └── ▸ 640x480
+    └── ▸ yuyv422
+
+Enter starts: xblick cam /dev/video2 --pixel-format mjpeg --size 1920x1080 --fps 30
+↑↓ Navigate   → Expand   ← Collapse   Enter Stream   Esc Back/Exit   q Quit
 ```
 
-A webcam usually has two device nodes, one for video and one for metadata. The list leaves out the metadata node.
-The kernel tells the two apart in the capabilities of each node (`VIDIOC_QUERYCAP`). A node that you may not open
-stays in the list with the note `capabilities unknown: Permission denied`. Add your user to the group `video` to
-open it.
+| Key | Action |
+| --- | --- |
+| Up, Down | move to the previous or the next line |
+| Right | expand the line, or move into it when it is expanded |
+| Left | collapse the line, or move to the line it belongs to |
+| Enter | start the stream in the mode of the line |
+| Esc | go back to the cameras, or leave when the cursor is on a camera |
+| `q`, Ctrl-C | leave without starting anything, with exit code 1 |
+
+Expanding a line collapses the other lines of its level, so only one branch is open. When you move into a line
+again, the cursor goes to the entry you left there. At first that is the recommended entry. The line under the
+tree shows the command that Enter would start.
+
+Enter works on every level. The ranking in the next section fills in what you have not chosen:
+
+| Enter on | Starts |
+| --- | --- |
+| a camera | its recommended mode |
+| a pixel format | the recommended size in that format, at its highest rate |
+| a size | that size at its highest rate |
+| a rate | exactly that format, size and rate |
+
+Before the stream starts, `xblick cam` prints the command that starts the same mode without the list:
+
+```text
+xblick cam: starting /dev/video2 with mjpeg 1920x1080 at 30 frames/s; the same without the list:
+xblick cam /dev/video2 --pixel-format mjpeg --size 1920x1080 --fps 30
+```
+
+The command also contains the other options that you gave, such as `--stream`. The camera then starts as with a
+given source. `xblick cam` checks the delivered mode as described in
+[Size, rate and pixel format](#size-rate-and-pixel-format). `--format`, `--pixel-format`, `--size` and `--fps`
+without a source are refused, because the list chooses the mode.
+
+### The recommended mode
+
+`xblick cam` ranks the modes that the camera advertises. It measures nothing and knows no camera models. These
+rules apply in this order:
+
+1. Only pixel formats that FFmpeg's V4L2 input reads count.
+2. Modes with at least 29.97 frames/s win, if there are any. The NTSC rate 30000/1001 counts as 30. Without such a
+   mode, all modes count.
+3. Among those, the size with the most pixels up to 1920 x 1080 wins. If every size is larger, the smallest one
+   wins. A smaller size never wins for a higher rate.
+4. At that size, the highest rate wins. So 60 frames/s beats 30 frames/s only at the same size.
+5. Then the pixel format decides: `mjpeg`, then `h264`, then `hevc`, then other compressed formats, then
+   uncompressed formats. Every MJPEG frame decodes on its own. H.264 saves bandwidth, but its decoder adds delay.
+6. Then the order of the device decides: the format that it lists first, then the size and the rate it lists first.
+
+A camera with `h264` 1920x1080 at 30, `mjpeg` 1920x1080 at 30, `mjpeg` 1280x720 at 60 and `yuyv422` 1920x1080 at 5
+frames/s gets `mjpeg` 1920x1080 at 30. A camera with 3840x2160 at 30 and 1920x1080 at 15 frames/s gets 3840x2160,
+because rule 2 comes before rule 3.
+
+### What the list shows
+
+- The list leaves out metadata nodes. A webcam usually has two device nodes, one for video and one for metadata.
+  The kernel tells the two apart in the capabilities of each node (`VIDIOC_QUERYCAP`).
+- `xblick cam` reads the modes with the ioctls `VIDIOC_ENUM_FMT`, `VIDIOC_ENUM_FRAMESIZES` and
+  `VIDIOC_ENUM_FRAMEINTERVALS`. These ioctls only read, so no setting of the camera changes before the stream
+  starts.
+- The pixel formats have the names that `--pixel-format` takes, which are FFmpeg's names. A format that FFmpeg's
+  V4L2 input does not read is grey, marked `(not supported)`, and cannot be started. Two codes of V4L2 can share one
+  name: `yuv420p` is `YU12` and `YV12`. `--pixel-format yuv420p` asks FFmpeg for the first code, so the second code
+  counts as not supported.
+- A device can give its sizes or rates as a range instead of a list. The list then offers the common values inside
+  the range and its two ends. The common sizes are 3840x2160, 2560x1440, 1920x1080, 1600x1200, 1280x960, 1280x720,
+  1024x768, 800x600, 640x480 and 320x240. The common rates are 120, 90, 60, 50, 30, 25, 24, 20, 15, 10 and 5
+  frames/s.
+- Rates are exact fractions, as the device states them. The command gives a rate in the decimal form that `--fps`
+  takes, such as `--fps 29.97` for 30000/1001. The driver chooses the nearest rate it has.
+- A camera that you may not open shows the reason on its line and cannot be expanded. Add your user to the group
+  `video` to open it. A device that another program holds shows `busy` only if it refuses to be opened, because
+  `xblick cam` does not try to start it.
+- A camera that reports no formats can still be started in its own mode. Its line says so.
+- A camera with a stable name in `/dev/v4l/by-id/` shows it on its line. The command uses the device node, such as
+  `/dev/video2`, because the default stream name is made from it. A name in `/dev/v4l/by-id/` contains characters
+  that a stream name cannot have, so such a source needs `--stream`. The device node's number can change when you
+  plug the camera in again. The name in `/dev/v4l/by-id/` stays.
 
 `xblick cam` checks a given `--stream` before it shows the list. Without a terminal, for example in a script or a
 service, it shows no list. It ends with an error that names the cameras, and you give the source.
@@ -100,8 +184,8 @@ xblick cam: testsrc=size=320x240:rate=30,realtime: asked for 640x480, the camera
 ```
 
 The rate of the stream is the rate that FFmpeg states for it. A camera that states no rate cannot be checked, so
-`xblick cam` refuses `--fps` for it. To see the modes of a V4L2 device, run `v4l2-ctl --list-formats-ext -d
-/dev/video0` from the package v4l-utils (untested here).
+`xblick cam` refuses `--fps` for it. To see the modes of a V4L2 device, run `xblick cam` without a source, or `v4l2-ctl
+--list-formats-ext -d /dev/video0` from the package v4l-utils (untested here).
 
 A colour camera becomes an `rgb8` stream, a grey camera `mono8`, and a 16-bit grey camera `16UC1`. The stream
 offers `image_raw` with the transports `shm` and `compressed` (JPEG, or RVL for `16UC1`), its `camera_info`, an info
@@ -239,8 +323,13 @@ xblick param --node cam/video0
 
 - Tested on 2026-11-13 with FFmpeg's `lavfi` test pattern and with an HTTP URL that served a Matroska file with
   MJPEG frames. No V4L2 device, RTSP camera or other IP camera was tested.
-- The list of cameras was tested in a pseudo-terminal with fake devices. Reading the capabilities was tested with
-  sample data of a webcam. Neither was tested on a PC with a real camera.
+- The list of cameras was tested in a pseudo-terminal with stand-in cameras. Reading the capabilities and the modes
+  was tested with sample answers of the ioctls. Neither was tested on a PC with a real camera.
+- The list does not read the formats of a multi-planar capture node. Such a camera can be started in its own mode.
+  Whether FFmpeg's V4L2 input reads such a node was not tested.
+- Whether FFmpeg reaches the second code of a shared name, such as `YV12`, when the device lacks the first one was
+  not tested. The list therefore offers only the first.
+- A list taller than the terminal is cut at the bottom.
 - The command decodes the JPEG frames of an MJPEG camera and encodes them again for the transport `compressed`.
   It does not pass the camera's JPEG frames on unchanged.
 - The command publishes the first video stream of a source.

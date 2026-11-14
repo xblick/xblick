@@ -1,4 +1,5 @@
-"""The V4L2 devices of this PC and whether each captures video: ``xblick cam`` without a source lists them (cam.py).
+"""The V4L2 devices of this PC, whether each captures video, and the modes it offers: ``xblick cam`` without a source
+shows them in a tree (cam.py).
 
 A webcam usually has two or more device nodes: one that captures video and one that delivers metadata (UVC). The
 kernel tells them apart in the node's capabilities, which the ioctl VIDIOC_QUERYCAP returns (struct v4l2_capability,

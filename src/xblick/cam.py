@@ -21,20 +21,17 @@ closes the publisher at once (its ring goes with it), also while the thread is b
 from __future__ import annotations
 
 import argparse
-import os
-import select
+import shlex
 import sys
-import termios
 import threading
 import time
-import tty
 from dataclasses import dataclass
 from pathlib import Path
 
 import zenoh
 
 from .camera import CameraPublisher
-from . import ffopts, mjpeg, topics, v4l2
+from . import ffopts, mjpeg, pick, topics, v4l2
 from .codecs import JPEG, RVL
 from .diagnostics import DiagnosticsPublisher
 from .msg import CompressedImage, Header, Time
@@ -425,64 +422,86 @@ class LiveCamera:
 
 # --------------------------------------------------------------------------------- choosing a camera without a source
 
-UP, DOWN = (b"\x1b[A", b"\x1bOA", b"k"), (b"\x1b[B", b"\x1bOB", b"j")
-ENTER, LEAVE = (b"\r", b"\n"), (b"\x1b", b"q", b"Q", b"\x03")
+@dataclass(frozen=True)
+class Selected:
+    """What the list of ``xblick cam`` resolved: a V4L2 device and the mode to ask it for."""
+
+    source: str
+    choice: v4l2.Choice
+
+    def arguments(self) -> list[str]:
+        """The source and the options that start it: ``/dev/video2 --pixel-format mjpeg --size ...``."""
+        return [self.source, *self.choice.options()]
 
 
-def _key(fd: int) -> bytes:
-    """One key from the terminal: an arrow's escape sequence comes in one piece; Esc alone is followed by nothing
-    within 50 ms."""
-    data = os.read(fd, 16)
-    if data == b"\x1b" and select.select([fd], [], [], 0.05)[0]:
-        data += os.read(fd, 16)
-    return data
+TREE_TITLE = "Select camera / configuration:"
+TREE_KEYS = "↑↓ Navigate   → Expand   ← Collapse   Enter Stream   Esc Back/Exit   q Quit"
+RECOMMENDED = "[recommended]"
 
 
-def choose(devices: list[v4l2.Device], fd: int, out, title: str) -> v4l2.Device | None:
-    """A list of ``devices`` on the terminal (input ``fd``, output ``out``) moved through with the arrow keys (or j,
-    k): Enter returns the marked one; Esc, q, Ctrl-C, SIGTERM (KeyboardInterrupt) or the end of the input return
-    None. The terminal's mode and cursor are restored, and the list erased, on every way out, an exception too."""
-    saved = termios.tcgetattr(fd)
-    index, drawn = 0, False
-    height = len(devices) + 1
-
-    def draw():
-        nonlocal drawn
-        out.write((f"\x1b[{height}A" if drawn else "") + f"\x1b[2K{title}\n")
-        for i, device in enumerate(devices):
-            out.write("\x1b[2K" + (f"\x1b[7m> {device.text()}\x1b[0m" if i == index else f"  {device.text()}") + "\n")
-        out.flush()
-        drawn = True
-
-    try:
-        tty.setcbreak(fd)  # keys one by one, no echo; Ctrl-C stays a signal
-        out.write("\x1b[?25l")  # no cursor while choosing
-        draw()
-        while True:
-            key = _key(fd)
-            if key in ENTER:
-                return devices[index]
-            if key in LEAVE or key == b"":
-                return None
-            if key in UP:
-                index = (index - 1) % len(devices)
-            elif key in DOWN:
-                index = (index + 1) % len(devices)
-            draw()
-    except KeyboardInterrupt:
-        return None
-    finally:
-        try:
-            out.write((f"\x1b[{height}A\x1b[J" if drawn else "") + "\x1b[?25h")
-            out.flush()
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+def _mark(items: list, best: int):
+    """Marks the recommended one of ``items``, ``best`` its index."""
+    items[best].note = RECOMMENDED
 
 
-def select_source(stdin=None, stdout=None, prog: str = "xblick cam") -> str:
-    """The source of ``xblick cam`` without one: a V4L2 capture device of this PC, chosen in a list on the terminal
-    (``choose``). CamError when there is none, when stdin or stdout is no terminal (never waits for keys in a pipe),
-    or when nothing was chosen."""
+def camera_items(cameras: list[v4l2.Camera]) -> list[pick.Item]:
+    """The list's items: camera, pixel format, size, rate. Each item's value is the Selected that Enter on it starts
+    (the ranking, v4l2.recommend, fills what is not chosen), None for an item that cannot be started (``note`` says
+    why). Each level's recommended item is marked, and Right goes to it first."""
+    items = []
+    for camera in cameras:
+        label = f"{camera.path}  {camera.name or '(no name)'}"
+        about = f"(by-id: {camera.by_id[0]})" if camera.by_id else ""
+        if camera.why:
+            items.append(pick.Item(label, note=f"({camera.why})", enabled=False))
+            continue
+        if not camera.formats:
+            note = "(reports no formats: Enter starts its own mode)"
+            items.append(pick.Item(label, value=Selected(camera.path, v4l2.Choice()), note=f"{note} {about}".strip()))
+            continue
+        best = v4l2.recommend(camera.formats)
+        if best is None:
+            item = pick.Item(label, enabled=False,
+                             note=f"(no pixel format FFmpeg's V4L2 input reads) {about}".strip())
+        else:
+            item = pick.Item(label, value=Selected(camera.path, best), note=about)
+        for fmt in camera.formats:
+            item.children.append(_format_item(camera, fmt))
+        if best is not None:
+            item.chosen = camera.formats.index(best.format)
+            _mark(item.children, item.chosen)
+        items.append(item)
+    return items
+
+
+def _format_item(camera: v4l2.Camera, fmt: v4l2.Format) -> pick.Item:
+    if not fmt.supported:
+        return pick.Item(f"{fmt.code.strip()}  {fmt.description}", enabled=False, note=f"(not supported: {fmt.why})")
+    best = v4l2.recommend([fmt])
+    item = pick.Item(fmt.name, value=Selected(camera.path, best),
+                     note="" if fmt.sizes else "(reports no sizes: Enter asks for this format only)")
+    for size in fmt.sizes:
+        choice = v4l2.recommend([fmt], only=size)
+        child = pick.Item(size.text(), value=Selected(camera.path, choice),
+                          note="" if size.rates else "(reports no rates: Enter asks for this size only)")
+        for rate in size.rates:
+            child.children.append(pick.Item(f"{v4l2.rate_text(rate)} fps",
+                                            value=Selected(camera.path, v4l2.Choice(fmt, size, rate))))
+        if size.rates:
+            child.chosen = size.rates.index(choice.rate)
+            _mark(child.children, child.chosen)
+        item.children.append(child)
+    if fmt.sizes:
+        item.chosen = fmt.sizes.index(best.size)
+        _mark(item.children, item.chosen)
+    return item
+
+
+def select_source(command, stdin=None, stdout=None) -> Selected:
+    """The camera and mode of ``xblick cam`` without a source, chosen in a tree on the terminal (pick.py): camera,
+    pixel format, size, rate. ``command(selected)``: the complete command that starts it, shown in the status line.
+    CamError when there is no camera, when stdin or stdout is no terminal (never waits for keys in a pipe), or when
+    nothing was chosen. Reading the modes changes no setting of a camera (v4l2.py)."""
     stdin, stdout = stdin or sys.stdin, stdout or sys.stdout
     listed = v4l2.devices()
     usable = v4l2.capture_devices(listed)
@@ -493,11 +512,25 @@ def select_source(stdin=None, stdout=None, prog: str = "xblick cam") -> str:
     if not (stdin.isatty() and stdout.isatty()):
         raise CamError("no source given, and no terminal to choose one in: give the source, one of "
                        + "; ".join(d.text() for d in usable))
-    chosen = choose(usable, stdin.fileno(), stdout, f"{prog}: choose a camera (arrow keys, Enter; Esc or q: none)")
+    tree = pick.Tree(camera_items(v4l2.cameras(listed)))
+
+    def status(tree: pick.Tree) -> str:
+        item = tree.cursor
+        if item.value is None:
+            return f"{item.label}: cannot be started {item.note}"
+        return "Enter starts: " + shlex.join(command(item.value))
+
+    def enter(tree: pick.Tree):
+        item = tree.cursor
+        if item.value is None:
+            tree.message = f"{item.label} cannot be started {item.note}"
+        return item.value
+
+    chosen = pick.run(tree, title=TREE_TITLE, keys=TREE_KEYS, status=status, enter=enter, fd=stdin.fileno(),
+                      out=stdout)
     if chosen is None:
         raise CamError("no camera chosen")
-    print(f"{prog}: {chosen.text()}", flush=True)
-    return chosen.path
+    return chosen
 
 
 def parse_options(given: list[str] | None) -> dict:
@@ -524,7 +557,8 @@ def add_arguments(parser: argparse.ArgumentParser):
     parser.add_argument("source", nargs="?", default=None,
                         help="a V4L2 device (/dev/video0), a URL (rtsp://..., http://...), or with --format another "
                              "FFmpeg input (e.g. --format lavfi testsrc=size=640x480:rate=30); none: choose one of "
-                             "this PC's V4L2 cameras in a list")
+                             "this PC's V4L2 cameras and its mode in a list, which prints the command that starts the "
+                             "same without it")
     parser.add_argument("--stream", default=None, metavar="BASE",
                         help="the stream base, <camera>/<stream> (default: cam/<device node>/color, e.g. "
                              "cam/video0/color, or cam/camera/color for a URL or --format source; /mono instead of "
