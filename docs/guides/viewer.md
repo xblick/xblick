@@ -8,9 +8,30 @@ pip install "xblick[rerun]"
 xblick rerun
 ```
 
-Without arguments, the command shows every stream, label image and detection topic that it finds. It looks again
-every 5 s, so a node that starts later appears too. It starts a viewer on this machine and sends its own layout: a
-3D view and a 2D view per stream.
+Without arguments, the command shows every stream, label image and detection topic that it finds, and the bodies,
+IMU and diagnostics of their cameras. It looks again every 5 s, so a node that starts later appears too. It starts a
+viewer on this machine and sends its own layout: a 3D view and a 2D view per stream.
+
+## Choose what it shows
+
+Name the streams as arguments and the results with options. The command then shows only what you named.
+
+```bash
+xblick rerun cam/azurekinect/color --bodies cam/azurekinect/bodies --segmentation cam/azurekinect/sam3/instances
+```
+
+| Option | Shows |
+| --- | --- |
+| `--points BASE` | a point cloud stream |
+| `--detections KEY` | a node's 2D or 3D boxes, or its classification |
+| `--segmentation KEY` | a node's label image, drawn over the image of its frame |
+| `--bodies KEY` | body tracking results, `<camera>/bodies` or `<camera>/<node>/bodies` |
+| `--trajectory KEY` | poses in the world as a path |
+| `--imu KEY`, `--diagnostics KEY` | a camera's `<camera>/imu` or `<camera>/diagnostics` |
+
+The transforms of a camera (`tf_static`, `tf`) come with its streams and results, because they place them in 3D.
+`--no-transforms <camera>` leaves them out. The terminal interface builds such a command line from the entries that
+you mark in its [Rerun tab](tui.md#rerun).
 
 ## Common calls
 
@@ -52,12 +73,33 @@ trajectories compare two pose sources:
 xblick rerun --trajectory <camera>/vslam/tf --trajectory <camera>/tf
 ```
 
+## Change the selection while it runs
+
+The selection is a set of parameters of the node `xblick/rerun`. Each parameter has the name of its option:
+`streams`, `points`, `detections`, `segmentation`, `trajectory`, `bodies`, `imu`, `diagnostics` and
+`no_transforms`. A change applies at once. The bridge subscribes to a new topic and ends the subscription to a
+removed one. The viewer keeps what it already received.
+
+```bash
+xblick param --node xblick/rerun --set bodies:='[cam/azurekinect/bodies]'
+```
+
+`drawn_over` names each result that is drawn over images, and over which images. The Rerun tab of the terminal
+interface sets the parameters when you mark an entry while the viewer runs. A second bridge needs its own name
+(`--name`). A bridge that was started without a selection shows everything that it finds, and its parameters are
+read-only.
+
+The bridge sends the viewer its layout once, 2 s after the start (`--layout-after`). It builds the layout from the
+data that arrived by then, so it knows which results belong over which image. A topic that you add later appears in
+the viewer's list of data and not in the layout. The viewer therefore never rearranges what you arranged.
+
 ## How results are found
 
 Node results announce themselves in the same way as streams. A `DetectionPublisher` answers `<key>/info` with the
 kind `detections`. The info record of a label image says `labels`. A publisher sets this with
 `CameraPublisher(..., labels=True)`. For a node that does not announce its results, name the topics with
-`--detections <key>` and `--segmentation <key>`.
+`--detections <key>` and `--segmentation <key>`. Without a selection, the command takes the bodies, IMU and
+diagnostics of every camera that it shows.
 
 ## Rates and ages
 
@@ -82,8 +124,10 @@ rate. `--no-ages` removes all of these. [Timestamps](../concepts/timestamps.md#a
 ## What you should know
 
 - **The viewer keeps publishers busy.** Rerun cannot tell which streams you look at, so `xblick rerun`
-  subscribes to every stream that it shows for as long as it runs. A publisher that renders only for subscribers
-  renders all that time.
+  subscribes to every stream of its selection. A publisher that renders only for subscribers renders all that time.
+  Remove a stream from the selection to end it.
+- **A result over another frame's image needs the camera's transforms.** Without them, the bridge draws bodies and
+  3D boxes only over the image of their own frame, and it places every stream at the camera's origin in 3D.
 - **A point cloud from another host arrives compressed only where its publisher has rays**, as the point cloud node has. Other clouds arrive whole and are large. See [point clouds](point-clouds.md).
 - **A publisher must be reachable.** Zenoh peers do not route data for each other. A publisher to which the viewer
   has no direct connection must listen on an endpoint of its own.

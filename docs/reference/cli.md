@@ -92,14 +92,21 @@ Prints the state of every program that publishes for a camera, once per second.
 
 ### `xblick rerun [streams ...]`
 
-Shows streams and node results in the Rerun viewer. Without arguments it shows everything that it finds. Needs the
-extra `xblick[rerun]`. See the [viewer guide](../guides/viewer.md).
+Shows streams and node results in the Rerun viewer. It shows its selection: the streams given as arguments and the
+topics that the options below name. Without a selection it shows everything that it finds. Needs the extra
+`xblick[rerun]`. See the [viewer guide](../guides/viewer.md).
 
 | Option | Meaning |
 | --- | --- |
-| `--prefix P`, `--seconds S` | without streams: where and how long to look for them |
-| `--points BASE` | a point cloud stream to show as well. `--cloud-rate` limits its rate. |
-| `--detections KEY`, `--segmentation KEY`, `--trajectory KEY` | additional results to draw |
+| `streams` | the stream bases to show |
+| `--points BASE` | a point cloud stream to show. `--cloud-rate` limits its rate. |
+| `--detections KEY`, `--segmentation KEY`, `--trajectory KEY` | a node's detections, label image or poses to draw |
+| `--bodies KEY` | body tracking results, `<camera>/bodies` or `<camera>/<node>/bodies` |
+| `--imu KEY`, `--diagnostics KEY` | a camera's `<camera>/imu` or `<camera>/diagnostics` |
+| `--no-transforms CAMERA` | leave out the camera's `tf_static` and `tf`. Otherwise they come with its streams and results. |
+| `--prefix P`, `--seconds S` | without a selection: where and how long to look for streams |
+| `--layout-after S` | send the viewer its layout once, S seconds after the start (default 2) |
+| `--name NAME` | the node name of its parameters, `xblick/<name>` (default `rerun`). The selection is live there. |
 | `--no-ages` | leave out the plots of rates and ages |
 | `--stale-after S` | when a stream counts as stale |
 | `--spawn` | start a viewer on this machine (the default) |

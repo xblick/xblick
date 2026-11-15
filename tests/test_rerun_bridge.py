@@ -1084,3 +1084,100 @@ def test_without_a_viewer_the_command_says_where_it_looked(monkeypatch, tmp_path
     monkeypatch.setattr(sys, "executable", str(tmp_path / "python"))
     with pytest.raises(SystemExit, match=f"neither {tmp_path}/rerun .* nor 'rerun' on PATH"):
         rerun_bridge.viewer_executable()
+
+
+def test_a_selection_shows_what_it_names(sessions):  # noqa: F811
+    """Without camera_extras (xblick rerun with a selection): the bodies, IMU and diagnostics of a stream's camera
+    only when named; the camera's transforms with its streams, unless in no_transforms."""
+    a, b = sessions
+    color = CameraPublisher(a, f"{CAMERA}/color", encoding="rgb8", frame_id="color_cam")
+    kinect, gemx = a.declare_publisher(f"{CAMERA}/bodies"), a.declare_publisher(f"{CAMERA}/gem_x/bodies")
+    rr = FakeRerun()
+    bridge = RerunBridge(b, rr, [f"{CAMERA}/color"], bodies=[f"{CAMERA}/gem_x/bodies"], camera_extras=False)
+    assert bridge.cameras == [CAMERA] and bridge.imu == [] and bridge.bodies == [f"{CAMERA}/gem_x/bodies"]
+    time.sleep(0.3)
+    kinect.put(bodies_json([1], 100))
+    gemx.put(bodies_json([2], 100, frame_id="color_cam"))
+    a.put(f"{CAMERA}/imu", bytes(Imu(Header(Time(100, 0), "imu")).serialize()), encoding=cdr_encoding(Imu))
+    wait_until(lambda: bridge.frames[f"{CAMERA}/gem_x/bodies"] == 1 or bridge._error is not None)
+    time.sleep(0.3)
+    bridge.check()
+    assert {e for e, *_ in of(rr, "Points3D")} == {f"{CAMERA}/gem_x/bodies/2"}  # the tracker's: not named
+    assert f"{CAMERA}/imu" not in bridge.frames
+    with pytest.raises(ValueError, match="<camera>/imu expected"):
+        bridge.select(imu=[f"{CAMERA}/imu_raw"])
+    assert bridge.select(no_transforms=[CAMERA]) == ([], []) and bridge.cameras == []
+    bridge.close()
+    for closable in (kinect, gemx):
+        closable.undeclare()
+    color.close()
+
+
+def test_the_selection_changes_while_it_runs_and_the_layout_stays(sessions):  # noqa: F811
+    """select: a stream added is subscribed to and logged, one removed is not any more; the layout went to the viewer
+    once (layout_after), with what had arrived by then, and is not sent again."""
+    a, b = sessions
+    color_base, depth_base, key = f"{CAMERA}/color", f"{CAMERA}/depth", f"{CAMERA}/sam3/instances"
+    info = CameraInfo.pinhole(64, 48, 50.0, 50.0, 31.5, 23.5, frame_id="color_cam")
+    color = CameraPublisher(a, color_base, encoding="rgb8", frame_id="color_cam", camera_info=info)
+    depth = CameraPublisher(a, depth_base, encoding="16UC1", frame_id="color_cam", camera_info=info, codec=PNG)
+    labels = CameraPublisher(a, key, encoding="mono16", frame_id="color_cam", camera_info=info, codec=PNG)
+    rr = FakeRerun()
+    bridge = RerunBridge(b, rr, [color_base], segmentations=[key], camera_extras=False, layout_after=1.0)
+    assert rr.blueprints == []  # not at the start: once, from what arrived
+    wait_until(lambda: color.subscribed and labels.subscribed)
+    color.publish(pattern(0))
+    wait_until(lambda: len(of(rr, "Pinhole")) == 1)
+    labels.publish(instances())
+    wait_until(lambda: bridge.frames[key] == 1 or bridge._error is not None)
+    wait_until(lambda: bridge.layout_sent)
+    bridge.check()
+    assert len(rr.blueprints) == 1 and without_ages(rr.blueprints[0]) == {"3D": None, color_base: ["$origin/**"]}
+    assert "rates and ages now" in rr.blueprints[0]
+    assert bridge.drawn_over() == {key: [color_base]}
+
+    assert bridge.select(bases=[color_base, depth_base]) == ([depth_base], [])
+    wait_until(lambda: depth.subscribed)
+    depth.publish(sixteen_bit())
+    wait_until(lambda: bridge.frames[depth_base] == 1 or bridge._error is not None)
+    assert bridge.select(bases=[depth_base], segmentations=[]) == ([], [color_base, key])
+    wait_until(lambda: not color.subscribed)
+    frames = bridge.frames[color_base]
+    color.publish(pattern(1))
+    depth.publish(sixteen_bit(1))
+    wait_until(lambda: bridge.frames[depth_base] == 2 or bridge._error is not None)
+    bridge.check()
+    assert bridge.frames[color_base] == frames and bridge.cameras == [CAMERA]
+    assert len(rr.blueprints) == 1  # what came later is in the viewer's data, the layout as it was
+    for closable in (bridge, labels, depth, color):
+        closable.close()
+
+
+def test_the_selection_is_a_live_parameter(sessions):  # noqa: F811
+    """xblick rerun's node: each kind of the selection a string array named as its option, a set changes the bridge at
+    once or is refused with the reason; read-only without a selection; drawn_over read-only."""
+    from xblick.parameters import ParameterClient, Parameters
+
+    a, b = sessions
+    color = CameraPublisher(a, BASE, encoding="rgb8", frame_id="cam")
+    bridge = RerunBridge(b, FakeRerun(), [BASE], camera_extras=False)
+    params = Parameters(b, "rerun_test", "xblick")
+    said = []
+    rerun_bridge.declare_selection(params, bridge, live=True, said=said.append)
+    client = ParameterClient(a, "xblick/rerun_test")
+    names = client.list()
+    assert set(rerun_bridge.SELECTION_OPTIONS) | {"drawn_over"} <= set(names)
+    assert client.get(["streams"])[0].value() == [BASE]
+    result, = client.set({"bodies": [f"{CAMERA}/bodies"]})
+    assert result.successful and bridge.bodies == [f"{CAMERA}/bodies"] and said == [f"now also {CAMERA}/bodies"]
+    result, = client.set({"imu": ["robot/imu"]})
+    assert not result.successful and "<camera>/imu expected" in result.reason and bridge.imu == []
+    assert client.set({"streams": []})[0].successful and bridge.bases == [] and bridge.cameras == [CAMERA]
+    params.close()
+    params = Parameters(b, "rerun_fixed", "xblick")
+    rerun_bridge.declare_selection(params, bridge, live=False)
+    result, = ParameterClient(a, "xblick/rerun_fixed").set({"streams": [BASE]})
+    assert not result.successful and "read-only" in result.reason
+    params.close()
+    bridge.close()
+    color.close()

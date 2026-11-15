@@ -6,18 +6,34 @@ encoded again); 16-bit images decoded, ``16UC1`` as a depth image in millimetres
 ``mono16`` (infrared) as a grey image. Its ``camera_info`` becomes a pinhole camera at the same entity (logged when it
 changes), so the image also shows in 3D views.
 
-Body tracking results on ``<camera>/bodies`` (JSON of xblick-azure-kinect's ``xblick-k4abt``, model
-``K4ABT_BODY_32``; ``<camera>`` = a bridged stream's base without its last part) and on ``<camera>/<node>/bodies``
-(the same JSON from a node, xblick-gem-x's ``gem_x``) are drawn as skeletons at that topic's entity, each in its
-own frame, in 3D and projected into the image of every bridged stream of that camera whose frame the camera's transforms
-relate to the bodies' ``frame_id`` (or that is the same frame). The bridge sends the viewer its layout for this: a 3D
-view and a 2D view per stream. The bodies' publisher is reached like every other program, through the PCs' Zenoh
-routers (docs/concepts/sessions.md, "Zenoh routers").
+What it shows is its selection: the streams named as arguments and the topics named by the options (``--points``,
+``--detections``, ``--segmentation``, ``--trajectory``, ``--bodies``, ``--imu``, ``--diagnostics``), nothing else,
+but the transforms of their cameras (below). Without a selection it shows everything it finds (below).
 
-A camera's IMU on ``<camera>/imu`` goes to time series (linear acceleration in m/s^2, angular velocity in rad/s,
-x y z each), its ``<camera>/diagnostics`` to a text log (each publisher's level and message) and time series (their
-numeric values), at ``<camera>/imu`` and ``<camera>/diagnostics/<publisher>``; the layout gets their views once they
-arrive.
+Body tracking results (``--bodies``) on ``<camera>/bodies`` (JSON of xblick-azure-kinect's ``xblick-k4abt``, model
+``K4ABT_BODY_32``; ``<camera>`` = a stream's base without its last part) or ``<camera>/<node>/bodies`` (the same
+JSON from a node, xblick-gem-x's ``gem_x``) are drawn as skeletons at that topic's entity, each in its own frame, in
+3D and projected into the image of every bridged stream of that camera whose frame the camera's transforms relate to
+the bodies' ``frame_id`` (or that is the same frame). The bodies' publisher is reached like every other program,
+through the PCs' Zenoh routers (docs/concepts/sessions.md, "Zenoh routers").
+
+A camera's IMU (``--imu <camera>/imu``) goes to time series (linear acceleration in m/s^2, angular velocity in rad/s,
+x y z each), its diagnostics (``--diagnostics <camera>/diagnostics``) to a text log (each publisher's level and
+message) and time series (their numeric values), at ``<camera>/imu`` and ``<camera>/diagnostics/<publisher>``.
+
+The layout (``--layout-after``, 2 s): the bridge sends the viewer its layout once, that long after the start, made
+from what arrived by then: a 3D view, a 2D view per stream (colour before depth and IR) with the results that are
+drawn over it, and below them tabs of the classifications, IMU, diagnostics, rates and ages. Until then the viewer
+arranges the data itself. What is added or first arrives later goes only into the viewer's data (its streams panel),
+so that nothing the user arranged is rearranged.
+
+The selection is a set of live parameters of the bridge's node ``xblick/<name>`` (``--name``, default ``rerun``),
+named as the options: ``streams``, ``points``, ``detections``, ``segmentation``, ``trajectory``, ``bodies``, ``imu``,
+``diagnostics``, ``no_transforms`` (string arrays). A set (``xblick param --node xblick/rerun --set
+bodies:='[test/camera/bodies]'``, the terminal interface's Rerun tab) makes that part of the selection exactly the
+given topics at once: a new one is subscribed to, a removed one is not any more, and what the viewer has of it stays
+there. ``drawn_over`` (read-only) names each result drawn over images and over which. Started without a selection,
+the parameters are read-only.
 
 Point cloud streams (``clouds``, e.g. ``test/camera/points`` of xblick-points) go to the viewer as
 coloured 3D points at the stream's entity, placed by the cloud's frame like a camera stream, at most ``cloud_rate``
@@ -53,11 +69,13 @@ arriving here a second, over the last second) in Hz at ``rates/<topic>``; the ne
 second the publisher sent that never arrived (gaps in the attachment's seq), as a Markdown table at ``ages_now``
 (about once a second). ``ages=False`` (``--no-ages``) leaves all of them out.
 
-``xblick rerun`` without arguments bridges everything that answers ``**/info``: image and point cloud streams,
-label images (their info record says ``labels``) and detections (kind ``detections``); and looks again every
-``--report`` seconds, so that a node started later appears too.
+``xblick rerun`` without a selection bridges everything that answers ``**/info``: image and point cloud streams,
+label images (their info record says ``labels``) and detections (kind ``detections``), and of each of their cameras
+the bodies (``<camera>/bodies``, ``<camera>/*/bodies``), IMU and diagnostics; and looks again every ``--report``
+seconds, so that a node started later appears too (in the viewer's data).
 
-A camera's fixed transforms on ``<camera>/tf_static`` (tf2_msgs/TFMessage, e.g. the Azure Kinect's depth camera ->
+A camera's transforms come with its streams and results (``--no-transforms <camera>`` leaves them out). Its fixed
+transforms on ``<camera>/tf_static`` (tf2_msgs/TFMessage, e.g. the Azure Kinect's depth camera ->
 colour camera) place its streams and its bodies: each at its frame's pose relative to the root of the camera's
 transform tree, which is the camera's entity. Without them, or for a frame they do not name, a stream is drawn at
 the camera's origin. Everything is drawn in camera axes (x right, y down, z forward: the scene's up is -y), unless a
@@ -70,9 +88,9 @@ e.g. xblick-vslam's ``test/camera/vslam/tf``, or ``<camera>/tf`` to compare with
 ``trajectories/<key>``, outside the moving camera: its path so far as a line, and ``pose`` with axes at the newest pose.
 
 The viewer has no way to tell the bridge which streams it shows: the bridge subscribes to every stream it bridges for
-as long as it runs, and their publishers render and encode for it all the time (a publisher that renders only while
-somebody subscribes, like the teleoperation server's head camera, renders while the bridge runs). Needs the extra
-``rerun`` (``pip install 'xblick[rerun]'``).
+as long as it is in the selection, and their publishers render and encode for it all that time (a publisher that
+renders only while somebody subscribes, like the teleoperation server's head camera, renders while the bridge shows
+it). Needs the extra ``rerun`` (``pip install 'xblick[rerun]'``).
 """
 
 from __future__ import annotations
@@ -216,23 +234,115 @@ TRAIL_RADIUS_M = 0.005
 TRAIL_AXES_M = 0.2
 
 
+KINDS = ("bases", "clouds", "detections", "segmentations", "trajectories", "bodies", "imu", "diagnostics")
+PLACED_KINDS = ("bases", "clouds", "detections", "segmentations", "bodies")  # what a camera's transforms place
+
+
+def camera_of_entry(kind: str, key: str) -> str | None:
+    """The camera an entry of the selection belongs to (None: a trajectory, which is in the world)."""
+    if kind == "bases":
+        return camera_of(key)
+    if kind in ("clouds", "bodies"):  # the camera's own (<camera>/bodies) or a node's (<camera>/<node>/bodies)
+        return cloud_camera(key)
+    if kind in ("detections", "segmentations"):
+        return camera_of(camera_of(key))
+    if kind in ("imu", "diagnostics"):
+        return camera_of(key)
+    return None
+
+
+def check_entry(kind: str, key: str) -> str:
+    """A key of the selection checked for its kind (ValueError saying what is expected); the key."""
+    if kind not in KINDS:
+        raise ValueError(f"{kind!r}: one of {', '.join(KINDS)}")
+    key = topics.check_name(key)
+    last = {"bodies": BODIES, "imu": topics.IMU, "diagnostics": topics.DIAGNOSTICS}.get(kind)
+    if last is not None and (not key.endswith("/" + last) or key.count("/") < 2):
+        expected = "<camera>/bodies or <camera>/<node>/bodies" if kind == "bodies" else f"<camera>/{last}"
+        raise ValueError(f"{kind} {key!r}: {expected} expected, a camera being <namespace>/<camera>")
+    if kind in ("detections", "segmentations") and key.count("/") < 2:
+        raise ValueError(f"detections or segmentation {key!r}: <camera>/<node>/<name> expected")
+    if kind in ("bases", "clouds") and key.count("/") < 1:
+        raise ValueError(f"stream {key!r} has no camera part")
+    return key
+
+
+# xblick rerun's options that name what it shows (their dest) -> the bridge's kind of the selection
+SELECTION_OPTIONS = {"streams": "bases", "points": "clouds", "detections": "detections",
+                     "segmentation": "segmentations", "trajectory": "trajectories", "bodies": "bodies", "imu": "imu",
+                     "diagnostics": "diagnostics", "no_transforms": "no_transforms"}
+DRAWN_OVER = "drawn_over"
+
+
+def declare_selection(params, bridge: RerunBridge, live: bool, said=None):
+    """The bridge's selection as parameters of its node, named as the options (SELECTION_OPTIONS), string arrays.
+    ``live``: a set makes that kind exactly the given keys at once (``RerunBridge.select``; refused with the reason
+    when a key does not fit), ``said(line)`` told what changed; else read-only (a bridge started without a selection
+    shows everything found). And ``drawn_over``, read-only: ``<result>: <stream>, ...`` per result drawn over images."""
+    def read(kind):
+        return bridge.selection()[kind]
+
+    def write(kind, value):
+        try:
+            added, removed = bridge.select(**{kind: list(value)})
+        except ValueError as error:
+            return str(error)
+        if said is not None and (added or removed):
+            said(", ".join(filter(None, [f"now also {', '.join(added)}" if added else "",
+                                         f"no longer {', '.join(removed)}" if removed else ""])))
+        if said is not None and kind == "no_transforms":
+            said(f"transforms (tf_static, tf) of {', '.join(bridge.cameras) or 'no camera'}")
+        return None
+
+    for name, kind in SELECTION_OPTIONS.items():
+        what = ("cameras whose transforms are left out" if kind == "no_transforms"
+                else f"the {name} shown ({'the arguments' if name == 'streams' else '--' + name.replace('_', '-')})")
+        params.declare(name, [], description=what + ("; a set changes what is bridged at once" if live else
+                                                     "; started without a selection: it shows everything found"),
+                       read_only=not live, read=partial(read, kind), write=partial(write, kind) if live else None)
+    params.declare(DRAWN_OVER, [], read_only=True, read=lambda: [f"{key}: {', '.join(images)}" for key, images
+                                                                in bridge.drawn_over().items()],
+                   description="each result drawn over images, and over which: <result>: <stream>, ...")
+
+
 class RerunBridge:
     """Logs the frames and calibrations of camera streams, the point clouds of point cloud streams (``clouds``), and the
-    body tracking results of their cameras, to a Rerun recording. ``rr``: the rerun module, initialised and connected
-    to a viewer or file by the caller. ``frames`` counts what was logged per stream base and per bodies topic. Errors
-    in Zenoh's callbacks are kept and raised by :meth:`check`. :meth:`add` bridges more of them later (a node that
-    started after the bridge)."""
+    results of nodes, to a Rerun recording. ``rr``: the rerun module, initialised and connected to a viewer or file by
+    the caller. ``frames`` counts what was logged per stream base and per topic. Errors in Zenoh's callbacks are kept
+    and raised by :meth:`check`. :meth:`add` bridges more later (a node that started after the bridge),
+    :meth:`remove` stops bridging some, :meth:`select` makes the selection what it is given.
+
+    ``camera_extras`` (as before 0.5.10, and ``xblick rerun`` without a selection): each camera of what is bridged
+    brings its bodies (``<camera>/bodies``, ``<camera>/*/bodies``), IMU and diagnostics. Without it only what is named
+    is bridged (``bodies``, ``imu``, ``diagnostics``). Either way a camera's transforms (``tf_static``, ``tf``) come
+    with what they place (``PLACED_KINDS``), unless the camera is in ``no_transforms``.
+
+    ``layout_after`` None: the layout (blueprint) is sent at the start and again when what it is made from changes. A
+    number: sent once, that many seconds after the start, from what has arrived by then (the frames of the streams
+    tell where results are drawn); what is added or arrives later goes only into the viewer's data, so that nothing the
+    user arranged is rearranged."""
 
     def __init__(self, session: zenoh.Session, rr, bases: list[str], clouds: list[str] = (), cloud_rate: float = 5.0,
                  detections: list[str] = (), segmentations: list[str] = (), stale_after: float = 0.0,
-                 ages: bool = True, trajectories: list[str] = ()):
-        if not bases and not clouds:
-            raise ValueError("no streams to bridge")
+                 ages: bool = True, trajectories: list[str] = (), bodies: list[str] = (), imu: list[str] = (),
+                 diagnostics: list[str] = (), no_transforms: list[str] = (), camera_extras: bool = True,
+                 layout_after: float | None = None):
+        if not any((bases, clouds, detections, segmentations, trajectories, bodies, imu, diagnostics)):
+            raise ValueError("nothing to bridge")
         self.rr = rr
         self._session = session
         self._cloud_rate = cloud_rate
+        self.camera_extras = camera_extras
         self.bases, self.clouds, self.detections, self.segmentations, self.cameras = [], [], [], [], []
-        self.trajectories = []
+        self.trajectories, self.bodies, self.imu, self.diagnostics = [], [], [], []
+        self.no_transforms = [topics.check_name(c) for c in no_transforms]
+        self._entry_subs: dict[tuple[str, str], list] = {}  # (kind, key) -> what subscribes to it
+        self._camera_subs: dict[str, list] = {}  # camera -> its transforms' subscribers
+        self._select_lock = threading.RLock()  # add, remove, select: one at a time
+        self._drawn_at: dict[str, set] = {}  # 2D result key -> the images it was drawn over
+        self._layout_once = layout_after is not None
+        self._layout_due = not self._layout_once  # the layout may be sent now (once-mode: only by the layout thread)
+        self.layout_sent = False
         self._trails: dict[str, collections.deque] = {}  # trajectory key -> the points of its path
         self._trail_logged_at: dict[str, float] = {}  # trajectory key -> when its line went to the viewer (monotonic s)
         self._detections_frame: dict[str, str] = {}  # 3D detections key -> frame of its boxes
@@ -260,7 +370,6 @@ class RerunBridge:
         self._results: dict[str, tuple[float, int]] = {}  # entity of a result on screen -> when it came, its stamp
         self._lock = threading.Lock()
         self._error: BaseException | None = None
-        self._subscribers = []
         self._transforms = []
         self._detection_readers = []
         self._world_readers = []
@@ -269,12 +378,29 @@ class RerunBridge:
         self._closed = threading.Event()
         # every stream is drawn in its camera's axes; without this, 3D views put +y up and show the cameras upside down
         rr.log("/", rr.ViewCoordinates.RDF, static=True)
-        self.add(bases, clouds, detections, segmentations, trajectories)
+        self.add(bases, clouds, detections, segmentations, trajectories, bodies, imu, diagnostics)
         self._stale_thread = None
         if stale_after > 0:
             self._stale_thread = threading.Thread(target=self._clear_stale, args=(stale_after,),
                                                   name="stale results", daemon=True)
             self._stale_thread.start()
+        self._layout_thread = None
+        if layout_after is not None:
+            self._layout_thread = threading.Thread(target=self._send_layout_once, args=(layout_after,),
+                                                   name="xblick-rerun layout", daemon=True)
+            self._layout_thread.start()
+
+    def _send_layout_once(self, after: float):
+        if self._closed.wait(after):
+            return
+        with self._lock:
+            self._layout_due = True
+            try:
+                self._update_blueprint()
+            except BaseException as error:  # noqa: BLE001 - raised in the caller's thread by check()
+                self._error = error
+            finally:
+                self._layout_due = False
 
     def _clear_stale(self, stale_after: float):
         """Bodies, boxes and masks stay in the viewer until something clears them, and a node that ended or waits (for
@@ -299,61 +425,170 @@ class RerunBridge:
         except BaseException as error:  # noqa: BLE001 - raised in the caller's thread by check()
             self._error = error
 
+    def selection(self) -> dict[str, list[str]]:
+        """What it bridges now, by kind (KINDS), and ``no_transforms``."""
+        with self._select_lock:
+            return {**{kind: list(getattr(self, kind)) for kind in KINDS}, "no_transforms": list(self.no_transforms)}
+
     def add(self, bases: list[str] = (), clouds: list[str] = (), detections: list[str] = (),
-            segmentations: list[str] = (), trajectories: list[str] = ()) -> list[str]:
-        """Bridge these as well; those already bridged are skipped. Returns the new ones."""
-        bases = [b for b in map(topics.check_name, bases) if b not in self.bases]
-        clouds = [c for c in map(topics.check_name, clouds) if c not in self.clouds]
-        detections = [d for d in map(topics.check_name, detections) if d not in self.detections]
-        segmentations = [s for s in map(topics.check_name, segmentations) if s not in self.segmentations]
-        trajectories = [t for t in map(topics.check_name, trajectories) if t not in self.trajectories]
-        for key in detections + segmentations:
-            if key.count("/") < 2:
-                raise ValueError(f"detections or segmentation {key!r}: <camera>/<node>/<name> expected")
-        both = (set(segmentations) | set(self.segmentations)) & (set(bases) | set(self.bases))
-        if both:
-            raise ValueError(f"{sorted(both)}: a stream and a segmentation")
-        cameras = [c for c in dict.fromkeys([camera_of(b) for b in bases] + [cloud_camera(c) for c in clouds]
-                                            + [camera_of(camera_of(d)) for d in detections + segmentations])
-                   if c not in self.cameras]
-        session = self._session
+            segmentations: list[str] = (), trajectories: list[str] = (), bodies: list[str] = (), imu: list[str] = (),
+            diagnostics: list[str] = ()) -> list[str]:
+        """Bridge these as well; those already bridged are skipped. Returns the new ones (not a camera's extras)."""
+        given = dict(bases=bases, clouds=clouds, detections=detections, segmentations=segmentations,
+                     trajectories=trajectories, bodies=bodies, imu=imu, diagnostics=diagnostics)
+        with self._select_lock:
+            new = {kind: [k for k in dict.fromkeys(check_entry(kind, k) for k in keys) if k not in getattr(self, kind)]
+                   for kind, keys in given.items()}
+            both = (set(new["segmentations"]) | set(self.segmentations)) & (set(new["bases"]) | set(self.bases))
+            if both:
+                raise ValueError(f"{sorted(both)}: a stream and a segmentation")
+            added = [k for kind in ("bases", "clouds", "detections", "segmentations", "trajectories", "bodies", "imu",
+                                    "diagnostics") for k in new[kind]]
+            if self.camera_extras:
+                # the Azure Kinect tracker's <camera>/bodies, a node's below the camera (xblick-gem-x's
+                # <camera>/gem_x/bodies), each drawn as its own entity; the camera's IMU and diagnostics
+                known = {camera_of_entry(kind, k) for kind in PLACED_KINDS for k in getattr(self, kind)}
+                for camera in dict.fromkeys(camera_of_entry(kind, k) for kind in PLACED_KINDS for k in new[kind]):
+                    if camera in known:
+                        continue
+                    extras = {"bodies": [f"{camera}/{BODIES}", f"{camera}/*/{BODIES}"],
+                              "imu": [topics.imu(camera)], "diagnostics": [topics.diagnostics(camera)]}
+                    for kind, keys in extras.items():
+                        new[kind] += [k for k in keys if k not in getattr(self, kind) and k not in new[kind]]
+            for kind in KINDS:
+                for key in new[kind]:
+                    with self._lock:
+                        getattr(self, kind).append(key)
+                    self._subscribe(kind, key)
+            self._sync_cameras()
+            with self._lock:
+                self._update_blueprint()
+            return added
+
+    def remove(self, bases: list[str] = (), clouds: list[str] = (), detections: list[str] = (),
+               segmentations: list[str] = (), trajectories: list[str] = (), bodies: list[str] = (),
+               imu: list[str] = (), diagnostics: list[str] = ()) -> list[str]:
+        """Stop bridging these (those not bridged are skipped): their subscriptions end; what the viewer has of them
+        stays there. Returns those removed."""
+        given = dict(bases=bases, clouds=clouds, detections=detections, segmentations=segmentations,
+                     trajectories=trajectories, bodies=bodies, imu=imu, diagnostics=diagnostics)
+        removed = []
+        with self._select_lock:
+            for kind, keys in given.items():
+                for key in keys:
+                    if key not in getattr(self, kind):
+                        continue
+                    self._unsubscribe(kind, key)
+                    with self._lock:
+                        getattr(self, kind).remove(key)
+                        for table in (self._age_now, self._arrivals, self._gaps, self._last_seq, self._drawn_at):
+                            table.pop(key, None)
+                    removed.append(key)
+            self._sync_cameras()
+        return removed
+
+    def select(self, no_transforms: list[str] | None = None, **wanted: list[str]) -> tuple[list[str], list[str]]:
+        """Each kind given (KINDS) becomes exactly these keys, and ``no_transforms`` (when given) the cameras whose
+        transforms are left out; checked whole first (ValueError, nothing changed). Returns (added, removed)."""
+        unknown = sorted(set(wanted) - set(KINDS))
+        if unknown:
+            raise ValueError(f"{unknown}: no kinds of the selection ({', '.join(KINDS)})")
+        with self._select_lock:
+            checked = {kind: list(dict.fromkeys(check_entry(kind, k) for k in keys)) for kind, keys in wanted.items()}
+            bases = checked.get("bases", self.bases)
+            both = set(checked.get("segmentations", self.segmentations)) & set(bases)
+            if both:
+                raise ValueError(f"{sorted(both)}: a stream and a segmentation")
+            if no_transforms is not None:
+                self.no_transforms = list(dict.fromkeys(topics.check_name(c) for c in no_transforms))
+            removed = self.remove(**{kind: [k for k in getattr(self, kind) if k not in keys]
+                                     for kind, keys in checked.items()})
+            added = self.add(**{kind: [k for k in keys if k not in getattr(self, kind)]
+                                for kind, keys in checked.items()})
+            self._sync_cameras()
+        return added, removed
+
+    def drawn_over(self) -> dict[str, list[str]]:
+        """Result key -> the bridged image streams it is drawn over now: a 2D result (boxes, label image, a node's
+        cloud with pixels) where it was drawn, a 3D result or bodies where the layout's 2D views show them."""
         with self._lock:
-            self.bases += bases
-            self.clouds += clouds
-            self.detections += detections
-            self.segmentations += segmentations
-            self.trajectories += trajectories
-            self.cameras += cameras
-            self._update_blueprint()
-        for base in bases:
-            self._subscribers.append(session.declare_subscriber(topics.camera_info(base), partial(self._on_info, base)))
-            self._subscribers.append(session.declare_subscriber(topics.compressed(base), partial(self._on_image, base)))
-        for key in segmentations:
-            self._subscribers.append(session.declare_subscriber(topics.compressed(key),
-                                                                partial(self._on_segmentation, key)))
-        for camera in cameras:
-            # the Azure Kinect tracker's <camera>/bodies, and a node's below the camera (xblick-gem-x's
-            # <camera>/gem_x/bodies), each drawn as its own entity
-            for key in (f"{camera}/{BODIES}", f"{camera}/*/{BODIES}"):
-                self._subscribers.append(session.declare_subscriber(key, partial(self._on_bodies, camera)))
-            self._subscribers.append(session.declare_subscriber(topics.imu(camera), partial(self._on_imu, camera)))
-            self._subscribers.append(session.declare_subscriber(topics.diagnostics(camera),
-                                                                partial(self._on_diagnostics, camera)))
-            self._transforms.append(StaticTransformSubscriber(session, camera, partial(self._on_transforms, camera)))
-            self._world_readers.append(TransformSubscriber(session, camera, partial(self._on_world, camera)))
-        for key in trajectories:
+            out = {key: set(images) for key, images in self._drawn_at.items()}
+            for stream, entities in (self._overlays or {}).items():
+                for entity in entities:
+                    out.setdefault(entity, set()).add(stream)
+        return {key: sorted(images) for key, images in sorted(out.items())}
+
+    def _sync_cameras(self):
+        """The cameras whose transforms it takes: those of what they place, but those in no_transforms."""
+        wanted = list(dict.fromkeys(camera_of_entry(kind, k) for kind in PLACED_KINDS for k in getattr(self, kind)))
+        wanted = [c for c in wanted if c not in self.no_transforms]
+        session = self._session
+        for camera in [c for c in self.cameras if c not in wanted]:
+            for reader in self._camera_subs.pop(camera):
+                reader.close()
+                for readers in (self._transforms, self._world_readers):
+                    if reader in readers:
+                        readers.remove(reader)
+            with self._lock:
+                self.cameras.remove(camera)
+        for camera in [c for c in wanted if c not in self.cameras]:
+            with self._lock:
+                self.cameras.append(camera)
+            static = StaticTransformSubscriber(session, camera, partial(self._on_transforms, camera))
+            world = TransformSubscriber(session, camera, partial(self._on_world, camera))
+            self._transforms.append(static)
+            self._world_readers.append(world)
+            self._camera_subs[camera] = [static, world]
+
+    def _subscribe(self, kind: str, key: str):
+        """The subscriptions of one entry (``_entry_subs``)."""
+        session = self._session
+        subs = []
+        if kind == "bases":
+            subs += [session.declare_subscriber(topics.camera_info(key), partial(self._on_info, key)),
+                     session.declare_subscriber(topics.compressed(key), partial(self._on_image, key))]
+        elif kind == "segmentations":
+            subs.append(session.declare_subscriber(topics.compressed(key), partial(self._on_segmentation, key)))
+        elif kind == "bodies":
+            subs.append(session.declare_subscriber(key, partial(self._on_bodies, camera_of_entry(kind, key))))
+        elif kind == "imu":
+            subs.append(session.declare_subscriber(key, partial(self._on_imu, camera_of(key))))
+        elif kind == "diagnostics":
+            subs.append(session.declare_subscriber(key, partial(self._on_diagnostics, camera_of(key))))
+        elif kind == "trajectories":
             self._trails[key] = collections.deque(maxlen=TRAIL_POINTS)
-            self._world_readers.append(_TfSubscriber(session, key, partial(self._on_trajectory, key)))
-        for key in detections:
+            reader = _TfSubscriber(session, key, partial(self._on_trajectory, key))
+            self._world_readers.append(reader)
+            subs.append(reader)
+        elif kind == "detections":
             reader = DetectionSubscriber(session, key, partial(self._on_detections, key))
             self._detection_by_key[key] = reader
             self._detection_readers.append(reader)
-        for cloud in clouds:
-            thread = threading.Thread(target=self._bridge_cloud, args=(session, cloud, self._cloud_rate),
-                                      name=f"xblick-rerun {cloud}", daemon=True)
-            self._cloud_threads.append(thread)
+            subs.append(reader)
+        elif kind == "clouds":
+            stop = threading.Event()
+            thread = threading.Thread(target=self._bridge_cloud, args=(session, key, self._cloud_rate, stop),
+                                      name=f"xblick-rerun {key}", daemon=True)
+            self._cloud_threads.append((thread, stop))
             thread.start()
-        return bases + clouds + detections + segmentations
+            subs.append((thread, stop))
+        self._entry_subs[(kind, key)] = subs
+
+    def _unsubscribe(self, kind: str, key: str):
+        for sub in self._entry_subs.pop((kind, key), []):
+            if isinstance(sub, tuple):  # a cloud's thread
+                thread, stop = sub
+                stop.set()
+                thread.join()
+                self._cloud_threads.remove(sub)
+            elif hasattr(sub, "undeclare"):
+                sub.undeclare()
+            else:
+                sub.close()
+                for readers in (self._detection_readers, self._world_readers):
+                    if sub in readers:
+                        readers.remove(sub)
+        self._detection_by_key.pop(key, None)
 
     def _log_age(self, topic: str, age_ns: int | None, stamp_ns: int | None = None, seq: int | None = None):
         """A sample of ``topic`` arrived (the time set by the caller: its stamp): its rate, age at send (``age_ns``)
@@ -394,17 +629,18 @@ class RerunBridge:
         if first:
             self._update_blueprint()  # the ages' views
 
-    def _bridge_cloud(self, session: zenoh.Session, base: str, rate: float):
-        """Thread of one point cloud stream: the newest cloud, at most ``rate`` a second."""
+    def _bridge_cloud(self, session: zenoh.Session, base: str, rate: float, stop: threading.Event):
+        """Thread of one point cloud stream: the newest cloud, at most ``rate`` a second, until ``stop`` (set by
+        remove and close)."""
         try:
             subscriber = PointCloudSubscriber(session, base)
             try:
-                while not self._closed.is_set():
+                while not stop.is_set():
                     started = time.monotonic()
                     got = subscriber.latest(timeout=0.5)
-                    if got is not None:
+                    if got is not None and not stop.is_set():
                         self._log_cloud(base, got)
-                        self._closed.wait(max(0.0, 1.0 / rate - (time.monotonic() - started)))
+                        stop.wait(max(0.0, 1.0 / rate - (time.monotonic() - started)))
             finally:
                 subscriber.close()
         except BaseException as error:  # noqa: BLE001 - raised in the caller's thread by check()
@@ -457,6 +693,7 @@ class RerunBridge:
         if "visible" in {f.name for f in cloud.fields}:
             shown &= points["visible"].reshape(-1) == 1
         camera = cloud_camera(base)
+        self._drawn_at.setdefault(base, set()).add(image)
         self.rr.log(f"{image}/{base[len(camera) + 1:]}",
                     self.rr.Points2D(uv[shown], colors=None if colors is None else colors[shown], radii=3.0))
 
@@ -581,6 +818,7 @@ class RerunBridge:
                 self.frames[f"{key} (no image of frame {message.header.frame_id!r} yet)"] += 1
                 return
             entity = f"{image}/{key[len(camera) + 1:]}"
+            self._drawn_at.setdefault(key, set()).add(image)
             rr.set_time(TIMELINE, timestamp=np.datetime64(message.header.stamp.to_ns(), "ns"))
             self._results[entity] = (time.monotonic(), message.header.stamp.to_ns())
             if not message.detections:
@@ -625,6 +863,7 @@ class RerunBridge:
                 return
             camera = camera_of(camera_of(key))
             entity = f"{image}/{key[len(camera) + 1:]}"
+            self._drawn_at.setdefault(key, set()).add(image)
             if entity not in self._segmentation_at:
                 # id 0 is "none": transparent (Rerun colours every id, 0 too, which tinted the whole image)
                 rr.log(entity, rr.AnnotationContext([rr.ClassDescription(info=(0, "none", (0, 0, 0, 0)))]),
@@ -823,13 +1062,19 @@ class RerunBridge:
     def _update_blueprint(self):
         """The layout: one 3D view, one 2D view per stream (time series beneath); a stream in the frame tree of a
         camera's bodies or 3D boxes shows them projected into its image (Rerun draws no 3D content below a pinhole, so
-        they sit beside the streams and the view names them). Sent again when that changes; called with the lock
-        held."""
+        they sit beside the streams and the view names them). Sent again when that changes (once-mode: only while
+        ``_layout_due``); called with the lock held."""
+        if not self._layout_due:
+            return
+
         def root(frame: str, camera: str) -> str:
             return self._pose(camera, frame)[0]
 
-        drawn_in_3d = dict(self._bodies_frame)  # entity -> (camera, frame)
-        drawn_in_3d.update({k: (camera_of(camera_of(k)), f) for k, f in self._detections_frame.items()})
+        # entity -> (camera, frame), of what is bridged now
+        drawn_in_3d = {e: cf for e, cf in self._bodies_frame.items()
+                       if any(zenoh.KeyExpr(k).intersects(zenoh.KeyExpr(e)) for k in self.bodies)}
+        drawn_in_3d.update({k: (camera_of(camera_of(k)), f) for k, f in self._detections_frame.items()
+                            if k in self.detections})
         overlays = {b: [e for e, (c, f) in sorted(drawn_in_3d.items())
                         if c == camera_of(b) and root(self._frame_id[b], c) == root(f, c)]
                     for b in self.bases if self._frame_id.get(b) is not None}
@@ -837,7 +1082,7 @@ class RerunBridge:
         # the images: colour before depth and IR, those with a node's results in them first
         order = sorted(self.bases, key=lambda b: (b in self._sixteen_bit, b not in overlays, b))
         layout = (tuple(order), sorted((b, tuple(es)) for b, es in overlays.items()), sorted(self._with_imu),
-                  sorted(self._with_diagnostics), sorted(self._classifications), bool(self._age_now))
+                  sorted(self._with_diagnostics), sorted(self._classifications), self._with_ages())
         if layout == self._layout:
             return
         self._layout = layout
@@ -853,7 +1098,7 @@ class RerunBridge:
         for camera in sorted(self._with_diagnostics):
             series += [rrb.TextLogView(origin=f"{camera}/diagnostics", name=f"{camera}/diagnostics"),
                        rrb.TimeSeriesView(origin=f"{camera}/diagnostics", name=f"{camera}/diagnostics values")]
-        if self._age_now:
+        if self._with_ages():
             series += [rrb.TextDocumentView(origin="ages_now", name="rates and ages now"),
                        rrb.TimeSeriesView(origin="rates", name="rate Hz"),
                        rrb.TimeSeriesView(origin="ages", name="age at send ms"),
@@ -862,6 +1107,11 @@ class RerunBridge:
         if len(side) == 2:
             side = [rrb.Vertical(*side, row_shares=[3, 1])]
         self.rr.send_blueprint(rrb.Blueprint(rrb.Horizontal(rrb.Spatial3DView(origin="/", name="3D"), *side)))
+        self.layout_sent = True
+
+    def _with_ages(self) -> bool:
+        """The layout has the rates' and ages' views: once an age came, or in once-mode whenever ages are on."""
+        return bool(self._age_now) or (self._ages and self._layout_once)
 
     def check(self):
         """Raise the error a callback met, if any."""
@@ -874,19 +1124,18 @@ class RerunBridge:
 
     def close(self):
         self._closed.set()
-        if self._stale_thread is not None:
-            self._stale_thread.join()
-            self._stale_thread = None
-        for thread in self._cloud_threads:
-            thread.join()
-        self._cloud_threads = []
-        for subscriber in self._subscribers:
-            subscriber.undeclare()
-        self._subscribers = []
-        for transforms in self._transforms:
-            transforms.close()
+        for thread in (self._stale_thread, self._layout_thread):
+            if thread is not None:
+                thread.join()
+        self._stale_thread = self._layout_thread = None
+        for _, stop in self._cloud_threads:
+            stop.set()
+        with self._select_lock:
+            for kind, key in list(self._entry_subs):
+                self._unsubscribe(kind, key)
+            for camera in list(self._camera_subs):
+                for reader in self._camera_subs.pop(camera):
+                    reader.close()
         self._transforms = []
-        for reader in self._detection_readers + self._world_readers:
-            reader.close()
         self._detection_readers = []
         self._world_readers = []

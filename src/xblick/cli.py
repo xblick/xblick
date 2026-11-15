@@ -332,10 +332,29 @@ def _bridged(found: list[tuple[str, dict]]) -> dict[str, list[str]]:
             "segmentations": of("image", labels=True)}
 
 
-def _rerun(args) -> int:
+def _rerun_selection(args) -> dict[str, list[str]]:
+    """What ``xblick rerun``'s command line names, as RerunBridge's selection (empty lists: nothing named)."""
+    return {"bases": list(args.streams or []), "clouds": list(args.points or []),
+            "detections": list(args.detections or []), "segmentations": list(args.segmentation or []),
+            "trajectories": list(args.trajectory or []), "bodies": list(args.bodies or []),
+            "imu": list(args.imu or []), "diagnostics": list(args.diagnostics or [])}
+
+
+def _rerun(args, parser) -> int:
+    from .parameters import ParameterError, Parameters
+
     rr = rerun_bridge.import_rerun()
+    named = _rerun_selection(args)
+    discover = not any(named.values())  # nothing named: everything found, looked for again every --report
+    if discover and args.no_transforms:
+        raise SystemExit("xblick rerun: --no-transforms is for a selection; without one it shows everything found")
+    try:
+        for kind, keys in named.items():
+            for key in keys:
+                rerun_bridge.check_entry(kind, key)
+    except ValueError as error:
+        raise SystemExit(f"xblick rerun: {error}") from None
     with zsession.open_from_args(args, prog=f"xblick {args.command}") as z:
-        discover = not (args.streams or args.points)
         if discover:
             found = _bridged(find_streams(z, args.prefix, args.seconds))
             if not found["bases"] + found["clouds"]:
@@ -343,10 +362,7 @@ def _rerun(args) -> int:
                 print(f"no stream answered within {args.seconds:g} s" + (f"; {why}" if why else ""), file=sys.stderr)
                 return 1
         else:
-            found = {"bases": args.streams, "clouds": args.points or [], "detections": [], "segmentations": []}
-        found["detections"] += args.detections or []
-        found["segmentations"] += args.segmentation or []
-        found["trajectories"] = args.trajectory or []
+            found = {kind: keys for kind, keys in named.items()}
         found["bases"] = [b for b in found["bases"] if b not in found["segmentations"]]
         rr.init("xblick", strict=True)
         if args.connect_viewer:
@@ -361,10 +377,32 @@ def _rerun(args) -> int:
                 print(f"web viewer on port {args.web}", flush=True)
         else:
             rr.spawn(executable_path=rerun_bridge.viewer_executable())
-        bridge = rerun_bridge.RerunBridge(z, rr, cloud_rate=args.cloud_rate, stale_after=args.stale_after,
-                                          ages=not args.no_ages, **found)
-        print(f"bridging {', '.join(bridge.bases + bridge.clouds + bridge.detections + bridge.segmentations)} to Rerun "
+        try:
+            bridge = rerun_bridge.RerunBridge(z, rr, cloud_rate=args.cloud_rate, stale_after=args.stale_after,
+                                              ages=not args.no_ages, no_transforms=args.no_transforms or [],
+                                              camera_extras=discover, layout_after=args.layout_after, **found)
+        except ValueError as error:
+            raise SystemExit(f"xblick rerun: {error}") from None
+        params = Parameters(z, args.name, "xblick")
+        try:
+            rerun_bridge.declare_selection(params, bridge, live=not discover,
+                                           said=lambda line: print(f"xblick rerun: {line}", flush=True))
+            params.declare_options(parser, args)
+            params.check_overrides()
+        except ParameterError as error:
+            bridge.close()
+            params.close()
+            raise SystemExit(f"xblick rerun: {error}") from None
+        selection = bridge.selection()
+        print(f"bridging {', '.join(k for kind in rerun_bridge.KINDS for k in selection[kind])} to Rerun "
               "(Ctrl-C to stop)", flush=True)
+        if bridge.cameras:
+            print(f"with the transforms (tf_static, tf) of {', '.join(bridge.cameras)}"
+                  + ("" if discover else ": --no-transforms CAMERA leaves them out"), flush=True)
+        print(f"selection: parameters of {params.key}, " + ("changeable while it runs (xblick param --node "
+              f"{params.key} --set ...)" if not discover else "fixed: started without one, it shows everything found"),
+              flush=True)
+        said_layout = False
         try:
             while True:
                 if discover:  # a node started later; the lookup takes the frame-rate line's time
@@ -376,6 +414,11 @@ def _rerun(args) -> int:
                 else:
                     time.sleep(args.report)
                 bridge.check()
+                params.refresh()  # the selection and where results are drawn, changed by themselves
+                if bridge.layout_sent and not said_layout:
+                    said_layout = True
+                    print("layout sent to the viewer, once: what is added later appears in its data, not in the "
+                          "layout", flush=True)
                 streams = bridge.bases + bridge.clouds
                 keys = streams + sorted(k for k in bridge.frames if k not in streams)  # + bodies, imu, diagnostics
                 print("  ".join(f"{k} {bridge.frames[k] / args.report:.1f} Hz" for k in keys), flush=True)
@@ -383,6 +426,7 @@ def _rerun(args) -> int:
         except KeyboardInterrupt:
             pass
         finally:
+            params.close()
             bridge.close()
             # what Rerun still buffers goes to the viewer or the file (--save) before the process ends
             rr.disconnect()
@@ -698,8 +742,9 @@ def build_parser(prog: str = "xblick") -> argparse.ArgumentParser:
                             description=rerun_bridge.__doc__,
                             formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("streams", nargs="*",
-                   help="stream bases (default: every stream, label image and detections that answer, below --prefix, "
-                        "looked for again every --report seconds)")
+                   help="stream bases to show (nothing named, neither streams nor any option below that names a "
+                        "topic: every stream, label image, detections, bodies, IMU and diagnostics that answer, below "
+                        "--prefix, looked for again every --report seconds)")
     p.add_argument("--points", action="append", metavar="BASE",
                    help="a point cloud stream to show as well, e.g. test/camera/points (repeat for more)")
     p.add_argument("--cloud-rate", type=float, default=5.0, help="point clouds per second sent to the viewer")
@@ -715,11 +760,26 @@ def build_parser(prog: str = "xblick") -> argparse.ArgumentParser:
     p.add_argument("--trajectory", action="append", metavar="KEY",
                    help="poses in the world (tf2_msgs/TFMessage) to draw as a path with axes at the newest, e.g. "
                         "test/camera/vslam/tf, and test/camera/tf to compare (repeat for more)")
+    p.add_argument("--bodies", action="append", metavar="KEY",
+                   help="body tracking results to draw as skeletons, <camera>/bodies (xblick-k4abt) or "
+                        "<camera>/<node>/bodies (xblick-gem-x), e.g. test/camera/bodies (repeat for more)")
+    p.add_argument("--imu", action="append", metavar="KEY",
+                   help="a camera's IMU as time series, <camera>/imu, e.g. test/camera/imu (repeat for more)")
+    p.add_argument("--diagnostics", action="append", metavar="KEY",
+                   help="a camera's diagnostics as a text log and time series, <camera>/diagnostics (repeat for more)")
+    p.add_argument("--no-transforms", action="append", metavar="CAMERA",
+                   help="leave out this camera's tf_static and tf, which otherwise come with its streams and results "
+                        "and place them in 3D, e.g. test/camera (repeat for more)")
+    p.add_argument("--layout-after", type=float, default=2.0, metavar="SECONDS",
+                   help="send the viewer its layout once, this long after the start, from what arrived by then; what "
+                        "is added later appears in the viewer's data, not in the layout")
+    p.add_argument("--name", default="rerun",
+                   help="its name as a node: its parameters (the selection, live) are at xblick/<name>")
     p.add_argument("--no-ages", action="store_true",
                    help="leave out the rates and ages (rates/<topic> Hz, ages/<topic> and ages_received/<topic> ms, "
                         "the table ages_now)")
-    p.add_argument("--prefix", default="", help="without streams: only streams below this prefix, e.g. test")
-    p.add_argument("--seconds", type=float, default=2.0, help="without streams: how long to look for them")
+    p.add_argument("--prefix", default="", help="without a selection: only streams below this prefix, e.g. test")
+    p.add_argument("--seconds", type=float, default=2.0, help="without a selection: how long to look for them")
     p.add_argument("--report", type=float, default=5.0, help="seconds between the frame-rate lines")
     viewer = p.add_mutually_exclusive_group()
     viewer.add_argument("--spawn", action="store_true", help="start a viewer on this machine (the default)")
@@ -731,7 +791,7 @@ def build_parser(prog: str = "xblick") -> argparse.ArgumentParser:
     p.add_argument("--web", type=int, metavar="PORT", nargs="?", const=9090,
                    help="with --serve: also serve the web viewer (default port 9090)")
     zsession.add_arguments(p)
-    p.set_defaults(run=_rerun)
+    p.set_defaults(run=lambda a, parser=p: _rerun(a, parser))
 
     p = commands.add_parser("param", help="a node's parameters (ROS 2's services): list, describe, get, set, dump")
     p.add_argument("--node", default=None, metavar="NAMESPACE/NAME", help="the node, e.g. test/camera")
