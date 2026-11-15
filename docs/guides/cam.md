@@ -300,6 +300,21 @@ the input format (`--format`, or the URL's scheme such as `rtsp`) and in the opt
 `http`). For an HTTP URL, FFmpeg detects the format from the data, so an option of that format needs `--format`.
 The options `video_size`, `framerate` and `input_format` are given with `--size`, `--fps` and `--pixel-format`.
 
+## Frames on the GPU
+
+`--cuda-device N` offers the frames in a CUDA ring on GPU `N` as well as in the host ring. A node on that GPU then
+reads them without a copy from host memory ([frames on the GPU](../concepts/gpu-frames.md)). The publisher uploads
+each frame once, and only while a reader takes the CUDA ring.
+
+```bash
+xblick cam /dev/video0 --cuda-device 0
+```
+
+A start line names the rings, for example `rings: shm (host memory) and cuda (GPU 0, 2731a12a)`, and
+`xblick list` shows the transport `cuda`. Without the option the command offers the host ring only and loads no
+CUDA library, so it runs on a PC without a GPU. A GPU that cannot be used ends the command with one line and exit
+code 1. `xblick test-camera --cuda-device N` does the same with the test pattern.
+
 ## Parameters and diagnostics
 
 The options of `xblick cam` are read-only [parameters](../reference/parameters.md) of the node `<camera>`, for

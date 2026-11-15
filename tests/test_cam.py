@@ -619,3 +619,85 @@ def test_no_hint_when_the_session_reaches_another(sessions):  # noqa: F811
         router.close()
     assert code == 0 and "xblick test-camera: publishing the stream test/camera/color" in lines, lines
     assert not any("nobody can receive" in line for line in lines), lines
+
+
+def _start(argv: list[str], env=None) -> subprocess.Popen:
+    return subprocess.Popen([sys.executable, "-m", "xblick.cli", *argv], stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, env={**os.environ, "PYTHONUNBUFFERED": "1",
+                                                                      **(env or {})})
+
+
+def _lines_until(process: subprocess.Popen, text: str) -> list[str]:
+    lines = []
+    while not any(text in line for line in lines):
+        line = process.stdout.readline()
+        assert line, "".join(lines)
+        lines.append(line)
+    return lines
+
+
+@pytest.mark.skipif(_core.cuda_device_count() == 0, reason="no CUDA device")
+def test_cuda_device_offers_a_gpu_ring_with_the_host_rings_pixels():
+    """--cuda-device 0: the start line names both rings, the info record and xblick list the cuda transport, and a
+    reader on the GPU gets the frames from the CUDA ring, pixel-equal to the host ring's frame of the same stamp."""
+    from xblick.gpu import CudaImage
+    from xblick.session import open_session
+
+    port = free_port()
+    base = "t/gpu/color"
+    process = _start(["cam", source(), "--format", "lavfi", "--stream", base, "--cuda-device", "0", "--listen",
+                      f"tcp/127.0.0.1:{port}"])
+    session = open_session(connect=[f"tcp/127.0.0.1:{port}"])
+    try:
+        lines = _lines_until(process, "rings:")
+        assert f"rings: shm (host memory) and cuda (GPU 0, {_core.cuda_device_uuid(0)[:8]})" in lines[-1], lines
+        wait_until(lambda: query_info(session, base, timeout=0.5), timeout=10.0)
+        (record,) = query_info(session, base, timeout=1.0)
+        assert "cuda" in record["transports"] and record["cuda_device_uuid"] == _core.cuda_device_uuid(0)
+        listed = subprocess.run([sys.executable, "-m", "xblick.cli", "list", "--connect", f"tcp/127.0.0.1:{port}"],
+                                capture_output=True, text=True, timeout=60)
+        assert any(base in line and "cuda" in line for line in listed.stdout.splitlines()), listed.stdout
+        host = FrameHistory(ImageSubscriber(session, base, transport="auto", local="shm"), 60)
+        gpu = ImageSubscriber(session, base, transport="auto", local="cuda")
+        matched = 0
+        end = time.monotonic() + 30
+        while matched < 3 and time.monotonic() < end:
+            frame = gpu.latest(timeout=0.5)
+            if frame is None:
+                continue
+            assert gpu.transport == "cuda" and isinstance(frame.image, CudaImage)
+            time.sleep(0.1)
+            if frame.stamp_ns in host.stamps():
+                np.testing.assert_array_equal(frame.image.numpy(), host.at(frame.stamp_ns).image)
+                matched += 1
+        assert matched == 3
+        gpu.close()
+        host.close()
+    finally:
+        process.send_signal(signal.SIGINT)
+        process.communicate(timeout=10)
+        session.close()
+
+
+@pytest.mark.parametrize("command", [["cam", source(), "--format", "lavfi"], ["test-camera"]])
+def test_cuda_device_that_cannot_be_used_ends_the_command(command):
+    """A GPU that cannot be used (none visible): one line and exit code 1, never a start with the host ring only."""
+    out = subprocess.run([sys.executable, "-m", "xblick.cli", *command, "--cuda-device", "0", "--listen",
+                          f"tcp/127.0.0.1:{free_port()}"], capture_output=True, text=True, timeout=60,
+                         env={**os.environ, "CUDA_VISIBLE_DEVICES": ""})
+    assert out.returncode == 1 and "rings:" not in out.stdout, out
+    assert out.stderr.strip().count("\n") == 0 and "--cuda-device 0: no CUDA driver or no CUDA device" in out.stderr
+
+
+@pytest.mark.parametrize("command", [["cam", source(), "--format", "lavfi"], ["test-camera"]])
+def test_without_cuda_device_no_cuda_library_is_loaded(command):
+    """The default: the host ring only, said in the start lines, and no CUDA library in the process."""
+    process = _start([*command, "--listen", f"tcp/127.0.0.1:{free_port()}"])
+    try:
+        lines = _lines_until(process, "rings:")
+        assert lines[-1].rstrip().endswith("rings: shm (host memory) only"), lines
+        maps = Path(f"/proc/{process.pid}/maps").read_text()
+        assert "libcuda" not in maps and "libcudart" not in maps
+    finally:
+        process.send_signal(signal.SIGINT)
+        process.communicate(timeout=10)

@@ -33,6 +33,7 @@ import zenoh
 from .camera import CameraPublisher
 from . import ffopts, mjpeg, pick, topics, v4l2
 from .codecs import JPEG, RVL
+from .gpu import device_uuid, rings_text
 from .diagnostics import DiagnosticsPublisher
 from .msg import CompressedImage, Header, Time
 from .node import Reporter, state
@@ -173,8 +174,10 @@ class LiveCamera:
                  size: tuple[int, int] | None = None, fps: float | None = None, pixel_format: str | None = None,
                  camera_info: str | None = None, hfov: float | None = None, vfov: float | None = None,
                  frame_id: str | None = None, timeout: float = 5.0, reconnect: float | None = None,
-                 options: dict | None = None, mjpeg: str = "reencode", prog: str = "xblick cam"):
+                 options: dict | None = None, mjpeg: str = "reencode", prog: str = "xblick cam",
+                 cuda_device: int | None = None):
         self.av = import_av()
+        self.cuda_device = cuda_device  # frames also in a CUDA ring on this GPU (checked by the caller)
         self.session, self.source, self.base, self.prog = session, source, base, prog
         self.fmt = input_format(source, fmt)
         self.camera = camera_for(source, self.fmt, base)
@@ -317,7 +320,7 @@ class LiveCamera:
                 return
             self.publisher = CameraPublisher(self.session, self.base, encoding=encoding, frame_id=self.frame_id,
                                              camera_info=info, source=SOURCE,
-                                             codec=RVL if encoding == "16UC1" else JPEG)
+                                             codec=RVL if encoding == "16UC1" else JPEG, cuda_device=self.cuda_device)
         self.encoding = encoding
         jpeg = "; JPEG: the camera's own" if self.passthrough else ""
         print(f"{self.prog}: {self.source} -> {self.base}: {self.delivered.text()}, published as {encoding}{jpeg}; "
@@ -325,6 +328,9 @@ class LiveCamera:
         # on lines of their own, one after the other: the stream, and the camera to copy into a node's start
         # (nodes take the camera explicitly; a node given the stream ends with camera.StreamGivenAsCamera)
         print(f"{self.prog}: publishing the stream {self.base}", flush=True)
+        uuid = device_uuid(self.cuda_device) if self.cuda_device is not None else None
+        print(f"{self.prog}: {rings_text(uuid, self.cuda_device)}",
+              flush=True)
         print(f"{self.prog}: start a node with --camera {self.camera} (the camera, not the stream)", flush=True)
         self._ready.set()
 
@@ -588,6 +594,10 @@ def add_arguments(parser: argparse.ArgumentParser):
                         help="an MJPEG camera's frames for the compressed transport: reencode (default) the decoded "
                              "frame, or passthrough the camera's JPEG as it came (standard Huffman tables inserted "
                              "where a frame has none; not tested on a real camera)")
+    parser.add_argument("--cuda-device", type=int, default=None, metavar="ORDINAL",
+                        help="frames also in a CUDA ring on this GPU, uploaded once while a GPU node reads them, "
+                             "besides the host ring (default: host ring only; a GPU that cannot be used ends the "
+                             "command)")
     parser.add_argument("--option", action="append", default=None, metavar="KEY=VALUE",
                         help="an FFmpeg input option, e.g. rtsp_transport=tcp (repeat for more); one FFmpeg does not "
                              "have for this source is refused")

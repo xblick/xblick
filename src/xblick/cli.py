@@ -175,16 +175,40 @@ def _say_if_alone(z, prog: str):
         print(f"{prog}: nobody can receive this stream yet: {alone}", flush=True)
 
 
+def add_cuda_device(parser):
+    """``--cuda-device``: image streams also in a CUDA ring (``xblick play``, ``cam``, ``test-camera``)."""
+    parser.add_argument("--cuda-device", type=int, default=None, metavar="ORDINAL",
+                        help="image streams also in a CUDA ring on this device, as a camera with a GPU offers them "
+                             "(default: shared memory only)")
+
+
+def cuda_device_checked(args, prog: str) -> str | None:
+    """The UUID of ``--cuda-device``'s GPU (None without the option); a GPU that cannot be used ends the command
+    with one line and exit code 1, before anything starts."""
+    if args.cuda_device is None:
+        return None
+    from .gpu import usable_device
+
+    try:
+        return usable_device(args.cuda_device)
+    except RuntimeError as error:
+        raise SystemExit(f"{prog}: --cuda-device {args.cuda_device}: {error}") from None
+
+
 def _test_camera(args) -> int:
+    from .gpu import rings_text
+
     base = topics.stream_base(args.namespace, args.camera, args.stream)
+    uuid = cuda_device_checked(args, "xblick test-camera")
     w, h = args.size
     f = 0.5 * h / np.tan(np.radians(args.vfov) / 2)
     info = CameraInfo.pinhole(w, h, f, f, (w - 1) / 2, (h - 1) / 2, frame_id=args.frame_id)
     with zsession.open_from_args(args, prog=f"xblick {args.command}") as z:
         _say_if_alone(z, "xblick test-camera")
         publisher = CameraPublisher(z, base, encoding="rgb8", frame_id=args.frame_id, camera_info=info,
-                                    source="test")
+                                    source="test", cuda_device=args.cuda_device)
         print(f"xblick test-camera: {w}x{h} rgb8 at {args.fps:g} Hz (Ctrl-C to stop)", flush=True)
+        print(f"xblick test-camera: {rings_text(uuid, args.cuda_device)}", flush=True)
         print(f"xblick test-camera: publishing the stream {base}", flush=True)
         print(f"xblick test-camera: start a node with --camera {base.rpartition('/')[0]} (the camera, not the stream)",
               flush=True)
@@ -215,6 +239,7 @@ def _cam(args, parser) -> int:
         namespace, _, name = camera.rpartition("/")
     except (ImportError, VideoError, cam.CamError) as error:
         raise SystemExit(f"xblick cam: {error}") from None
+    cuda_device_checked(args, "xblick cam")
     with zsession.open_from_args(args, prog=f"xblick {args.command}") as z:
         _say_if_alone(z, "xblick cam")
         params = Parameters(z, name, namespace)
@@ -226,7 +251,7 @@ def _cam(args, parser) -> int:
                                     pixel_format=args.pixel_format, camera_info=args.camera_info, hfov=args.hfov,
                                     vfov=args.vfov, frame_id=args.frame_id, timeout=args.timeout,
                                     reconnect=args.reconnect, options=cam.parse_options(args.option),
-                                    mjpeg=args.mjpeg)
+                                    mjpeg=args.mjpeg, cuda_device=args.cuda_device)
             camera.run()
         except (cam.CamError, VideoError, ParameterError, cam.ffopts.OptionError) as error:
             raise SystemExit(f"xblick cam: {error}") from None
@@ -621,6 +646,7 @@ def build_parser(prog: str = "xblick") -> argparse.ArgumentParser:
     p.add_argument("--size", type=int, nargs=2, default=(640, 480), metavar=("W", "H"))
     p.add_argument("--vfov", type=float, default=60.0, help="vertical field of view in degrees")
     p.add_argument("--fps", type=float, default=15.0)
+    add_cuda_device(p)
     zsession.add_arguments(p)
     p.set_defaults(run=_test_camera)
 
@@ -809,9 +835,7 @@ def build_parser(prog: str = "xblick") -> argparse.ArgumentParser:
     p.add_argument("--loop", action="store_true")
     p.add_argument("--key", action="append", metavar="KEY_EXPR",
                    help="only topics that match this key expression, e.g. 'test/camera/*' (repeat for more)")
-    p.add_argument("--cuda-device", type=int, default=None, metavar="ORDINAL",
-                   help="image streams also in a CUDA ring on this device, as a camera with a GPU offers them "
-                        "(default: shared memory only)")
+    add_cuda_device(p)
     p.add_argument("--name", default="recorder", help="the node's name: its control topics "
                                                       "(xblick/<name>/control, xblick/<name>/status)")
     p.add_argument("--report", type=float, default=10.0, help="seconds between the status lines")

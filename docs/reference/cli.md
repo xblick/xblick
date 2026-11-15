@@ -146,6 +146,7 @@ extra `xblick[cam]`. See the [guide](../guides/cam.md).
 | `--reconnect [SECONDS]` | open a camera that stops or cannot be opened again every SECONDS (default 2), also at the start. It must come back with its first mode. |
 | `--mjpeg reencode\|passthrough` | an MJPEG camera's frames on the transport `compressed`: the decoded frame encoded again (default), or the camera's own JPEG with the standard Huffman tables inserted where a frame has none |
 | `--option KEY=VALUE` | an FFmpeg input option, for example `rtsp_transport=tcp` (repeat for more). An option FFmpeg does not have for this source is refused. |
+| `--cuda-device N` | the frames also in a CUDA ring on GPU `N`, besides the host ring. Without it: the host ring only, and no CUDA library is loaded. A GPU that cannot be used ends the command with one line and exit code 1. |
 | `--param`, `--params-file`, `--dump-params`, `--params-read-only` | the options as parameters of the node `<camera>` |
 
 ## Test
@@ -161,6 +162,7 @@ Publishes a moving test pattern on `test/camera/color`.
 | `--fps` | 15 |
 | `--vfov` | the vertical field of view in degrees for the camera info |
 | `--frame-id` | the frame id of the images |
+| `--cuda-device N` | none: the frames also in a CUDA ring on GPU `N`, as `xblick cam --cuda-device` |
 
 ### `xblick-cpp-camera`, `xblick-cpp-probe`
 

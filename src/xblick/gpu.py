@@ -133,6 +133,27 @@ def device_ordinal(device) -> int | None:
     raise ValueError(f"device {device!r}: an ordinal, 'cuda', 'cuda:N' or 'cpu'")
 
 
+def usable_device(ordinal: int) -> str:
+    """The UUID of the CUDA device ``ordinal`` once a small CUDA ring could be made on it, as a publisher's CUDA ring
+    will be; RuntimeError with the reason in one line when it cannot (no driver, no such device, no memory)."""
+    try:
+        uuid = _core.cuda_device_uuid(ordinal)
+        if not uuid:
+            raise RuntimeError("no CUDA driver or no CUDA device on this PC (CUDA_VISIBLE_DEVICES?)")
+        _core.CudaRingWriter(ordinal, 2, 16)  # dropped at once
+    except _core.RingError as error:
+        raise RuntimeError(f"CUDA device {ordinal} cannot be used: {error}") from None
+    return uuid
+
+
+def rings_text(uuid: str | None, ordinal: int | None) -> str:
+    """Which rings a publisher offers, for a start line."""
+    if uuid is None:
+        return "rings: shm (host memory) only"
+    return (f"rings: shm (host memory) and cuda (GPU {ordinal}, {uuid[:8]}): each frame uploaded once while a GPU "
+            "reader wants it")
+
+
 def device_uuid(ordinal: int | None) -> str:
     """The UUID of the CUDA device of ``ordinal`` (32 hex digits, as the info records' cuda_device_uuid); empty for
     None or without a CUDA driver."""
