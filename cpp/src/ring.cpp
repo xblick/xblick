@@ -1,14 +1,18 @@
 #include "xblick/ring.hpp"
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <random>
+#include <sstream>
+#include <thread>
 #include <utility>
 
 namespace xblick
@@ -35,6 +39,30 @@ namespace xblick
         {
             throw RingError(errno_text("shm_open(" + name + ") for writing"));
         }
+        // the creator lock (ring.hpp), held through fd for the mapping's life; glibc opens close-on-exec, made sure
+        // here because an inherited descriptor would keep the lock after the creator ended
+        ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+        // xblick clean takes the lock for a moment while it judges a ring; on a fresh name only in this instant
+        int locked = -1;
+        for (int attempt = 0; attempt < 100 and locked != 0; ++attempt)
+        {
+            locked = ::flock(fd, LOCK_EX | LOCK_NB);
+            if (locked != 0 and errno != EWOULDBLOCK)
+            {
+                break;
+            }
+            if (locked != 0)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
+        if (locked != 0)
+        {
+            const std::string message = errno_text("flock(" + name + ") for the creator lock");
+            ::close(fd);
+            ::shm_unlink(name.c_str());
+            throw RingError(message);
+        }
         if (::ftruncate(fd, static_cast<off_t>(size)) != 0)
         {
             const std::string message = errno_text("ftruncate(" + name + ", " + std::to_string(size) + ")");
@@ -43,10 +71,10 @@ namespace xblick
             throw RingError(message);
         }
         void* data = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        ::close(fd);
         if (data == MAP_FAILED)
         {
             const std::string message = errno_text("mmap(" + name + ")");
+            ::close(fd);
             ::shm_unlink(name.c_str());
             throw RingError(message);
         }
@@ -55,6 +83,7 @@ namespace xblick
         m.data_ = static_cast<std::uint8_t*>(data);
         m.size_ = size;
         m.owner_ = true;
+        m.fd_ = fd;
         return m;
     }
 
@@ -96,7 +125,8 @@ namespace xblick
         : name_(std::move(other.name_)),
           data_(std::exchange(other.data_, nullptr)),
           size_(std::exchange(other.size_, 0)),
-          owner_(std::exchange(other.owner_, false))
+          owner_(std::exchange(other.owner_, false)),
+          fd_(std::exchange(other.fd_, -1))
     {
     }
 
@@ -119,6 +149,10 @@ namespace xblick
         if (owner_)
         {
             ::shm_unlink(name_.c_str());
+        }
+        if (fd_ >= 0)
+        {
+            ::close(fd_);  // releases the creator lock, after the name is gone
         }
     }
 
@@ -146,6 +180,33 @@ namespace xblick
         return id;
     }
 
+    std::uint64_t process_start_time(int pid)
+    {
+        const std::string path = "/proc/" + std::to_string(pid) + "/stat";
+        std::ifstream file(path);
+        std::string line;
+        if (not std::getline(file, line))
+        {
+            throw RingError("cannot read " + path);
+        }
+        // field 2, the command, is in parentheses and may hold spaces and parentheses: count from the last ')'
+        const auto close = line.rfind(')');
+        if (close == std::string::npos)
+        {
+            throw RingError(path + ": no command field");
+        }
+        std::istringstream rest(line.substr(close + 1));
+        std::string field;
+        for (int i = 3; i <= 22; ++i)  // fields 3 (state) to 22 (starttime)
+        {
+            if (not(rest >> field))
+            {
+                throw RingError(path + ": fewer than 22 fields");
+            }
+        }
+        return std::stoull(field);
+    }
+
     // ----------------------------------------------------------------------------------------- ControlWriter
 
     ControlWriter::ControlWriter(RingKind kind, std::uint32_t slot_count, std::uint64_t slot_size,
@@ -163,6 +224,10 @@ namespace xblick
         h->slot_size = slot_size;
         h->data_offset = kind == RingKind::Host ? kControlSize : 0;
         h->kind = static_cast<std::uint32_t>(kind);
+        const int pid = static_cast<int>(::getpid());
+        h->creator_pid = static_cast<std::uint32_t>(pid);
+        h->creator_start = process_start_time(pid);
+        h->last_update_ns.store(0, std::memory_order_relaxed);
         for (std::uint32_t i = 0; i < slot_count; ++i)
         {
             new (slot(i)) SlotHeader{};
@@ -209,6 +274,10 @@ namespace xblick
         s->nbytes.store(nbytes, std::memory_order_relaxed);
         const std::uint64_t seq = s->seq.load(std::memory_order_relaxed) + 1;
         s->seq.store(seq, std::memory_order_release);  // the bytes before it are visible to an acquiring reader
+        const auto now = std::chrono::system_clock::now().time_since_epoch();
+        header()->last_update_ns.store(
+            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count()),
+            std::memory_order_relaxed);  // for xblick clean only, no reader orders by it
         open_ = -1;
         return seq;
     }

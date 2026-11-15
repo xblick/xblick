@@ -12,8 +12,18 @@
 //       16     8  slot_size: bytes per slot (host ring: multiple of 4096; CUDA ring: the slot stride)
 //       24     8  data_offset: offset of slot 0 in this object (host ring: 4096; CUDA ring: 0, no data here)
 //       32     4  kind: 0 = host ring (pixels follow the control block), 1 = CUDA ring (pixels in device memory)
-//       36    28  reserved, zero
+//       36     4  creator_pid: the creating process's id; 0 in a ring of 0.5.0 to 0.5.11 (no creator record)
+//       40     8  creator_start: the creator's start time, field 22 of /proc/<pid>/stat (clock ticks after boot)
+//       48     8  last_update_ns: wall clock (CLOCK_REALTIME) of the last commit in ns, 0 before the first (atomic)
+//       56     8  reserved, zero
 //   64 + 64 i    slot i: uint64 seq (atomic), uint64 nbytes, 48 bytes padding (one cache line per slot)
+//
+// The creator record (offsets 36 to 63) was reserved and zero up to 0.5.11, and readers never look at it, so readers
+// of every 0.5 version read every 0.5 ring. Creator lock: the creator holds an exclusive flock(2) on the object for
+// its lifetime (the descriptor stays open, close-on-exec), so the kernel releases it however the creator ends.
+// Readers never ask for it, and flock is advisory: it keeps nobody from opening or mapping the ring. A ring whose
+// lock can be taken therefore has no living creator (`xblick clean`). A process that forks without exec inherits the
+// descriptor and keeps the lock, so the ring counts as alive while that child lives.
 //
 // Sequence lock per slot: seq is even when the slot holds a complete frame and odd while the writer fills it; every
 // write adds 2. A descriptor names (slot, seq). A reader that finds seq unchanged after it has read (or copied) the
@@ -66,12 +76,18 @@ namespace xblick
         std::uint64_t slot_size;
         std::uint64_t data_offset;
         std::uint32_t kind;
-        std::uint8_t reserved[28];
+        std::uint32_t creator_pid;
+        std::uint64_t creator_start;
+        std::atomic<std::uint64_t> last_update_ns;
+        std::uint8_t reserved[8];
     };
     static_assert(sizeof(ControlHeader) == kSlotHeaderOffset);
+    static_assert(offsetof(ControlHeader, creator_pid) == 36 and offsetof(ControlHeader, creator_start) == 40 and
+                  offsetof(ControlHeader, last_update_ns) == 48);
 
-    // A mapped shared memory object (shm_open + mmap). The creator unlinks the name when it is destroyed; mappings of
-    // readers stay valid until they unmap.
+    // A mapped shared memory object (shm_open + mmap). The creator keeps the object's descriptor open with the creator
+    // lock on it (flock, see above) and unlinks the name when it is destroyed; mappings of readers stay valid until
+    // they unmap.
     class Mapping
     {
     public:
@@ -93,6 +109,7 @@ namespace xblick
         std::uint8_t* data_ = nullptr;
         std::size_t size_ = 0;
         bool owner_ = false;
+        int fd_ = -1;  // the creator's descriptor, holding the creator lock; -1 for a reader
     };
 
     // A fresh name "/xblick-<16 hex digits>" for a shared memory object or socket.
@@ -206,4 +223,8 @@ namespace xblick
     // The boot id of this host (/proc/sys/kernel/random/boot_id): descriptors carry it, readers compare it, so a ring
     // is never looked up on another machine.
     std::string host_id();
+
+    // The start time of process pid (field 22 of /proc/<pid>/stat, clock ticks after boot): with the pid it tells a
+    // process from a later one that got the same pid. Throws RingError if the process does not exist.
+    std::uint64_t process_start_time(int pid);
 }  // namespace xblick

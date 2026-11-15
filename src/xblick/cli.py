@@ -21,6 +21,7 @@
     xblick param --nodes                          # the nodes with parameters (parameters.py)
     xblick param --node test/camera --get  # their values; --describe, --set NAME:=VALUE [--atomically]
     xblick relay --stream test/camera/color      # xblick-relay with these arguments (needs xblick[relay])
+    xblick clean                                  # the rings in /dev/shm, which a killed publisher left (clean.py)
     xblick                                             # without a command: the terminal interface (tui.py)
 """
 
@@ -38,7 +39,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import cam, diagnostics, mps, poses, recording, rerun_bridge, router, survey, topics, view
+from . import cam, clean, diagnostics, mps, poses, recording, rerun_bridge, router, survey, topics, view
 from . import session as zsession
 from .camera import CameraPublisher, ImageSubscriber, StaticTransformPublisher, find_streams, wait_for_info
 from .msg import CameraInfo
@@ -919,6 +920,20 @@ def build_parser(prog: str = "xblick") -> argparse.ArgumentParser:
     _add_video_arguments(p)
     zsession.add_arguments(p)
     p.set_defaults(run=_play)
+
+    p = commands.add_parser("clean", help="the rings on this PC (/dev/shm/xblick-*) with their creators; which ones a "
+                                          "killed publisher left behind, and with --remove remove those",
+                            description=clean.__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("rings", nargs="*", metavar="RING",
+                   help="only these rings, e.g. xblick-0123456789abcdef (default: every ring in /dev/shm)")
+    p.add_argument("--remove", action="store_true",
+                   help="remove the rings whose creator is gone and that no process maps (default: list only, with "
+                        "what this would remove)")
+    p.add_argument("--force", action="store_true",
+                   help="with --remove and the rings named: also remove those named that have no creator record "
+                        "(xblick 0.5.11 or older) and that no process maps, and those whose creator is gone but "
+                        "that a reader still maps; never one whose creator lives or of another user")
+    p.set_defaults(run=lambda a: clean.run(a.rings, a.remove, a.force))
 
     # main() hands `xblick relay ...` to the relay before this parser: argparse cannot pass options such as --help or
     # --stream through. The entry here lists the command in `xblick --help`.

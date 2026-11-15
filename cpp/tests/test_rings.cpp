@@ -1,8 +1,13 @@
 // Tests of the C++ core with writer and reader in separate processes, as they are used (CUDA's interprocess events
 // cannot be opened in the process that created them). ctest runs "test_rings host" and "test_rings cuda"; the CUDA
 // test needs a GPU with virtual memory management and is skipped (exit code 77) without one.
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#include <cerrno>
 
 #include <cstdio>
 #include <cstdlib>
@@ -84,6 +89,17 @@ namespace
         const auto a = writer.write(frame(n, 7).data(), n);
         const auto b = writer.write(frame(n, 8).data(), n);
         expect(a.slot != b.slot and a.seq == 2 and b.seq == 2, "slots and sequence numbers");
+        {
+            // the creator record and the creator lock (ring.hpp); the reader child reads with the lock held
+            const int fd = ::shm_open(writer.name().c_str(), O_RDONLY, 0);
+            xblick::ControlHeader h{};
+            expect(fd >= 0 and ::pread(fd, &h, sizeof(h), 0) == sizeof(h), "read the control header");
+            expect(h.creator_pid == static_cast<std::uint32_t>(::getpid()), "creator pid");
+            expect(h.creator_start == xblick::process_start_time(::getpid()), "creator start time");
+            expect(h.last_update_ns.load() > 0, "last update");
+            expect(::flock(fd, LOCK_EX | LOCK_NB) != 0 and errno == EWOULDBLOCK, "the creator holds the lock");
+            ::close(fd);
+        }
         to_reader.send(writer.name() + " " + std::to_string(a.slot) + " " + std::to_string(a.seq) + " " +
                        std::to_string(b.slot) + " " + std::to_string(b.seq));
         to_writer.receive();

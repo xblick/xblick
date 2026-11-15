@@ -289,6 +289,33 @@ The command looks for the program in this order and nowhere else.
 If neither exists, the command fails and names both ways to install the relay. If the package is installed without
 its program, the command fails as well. It does not try `PATH` then.
 
+## Rings
+
+### `xblick clean [rings ...]`
+
+Lists the rings on this PC (`/dev/shm/xblick-*`) and tells which ones a killed publisher left behind. It removes
+nothing unless you give `--remove`. See [rings left behind](../concepts/rings.md#rings-left-behind).
+
+| Option | Meaning |
+| --- | --- |
+| `rings` | only these rings, for example `xblick-0123456789abcdef`. The default is every ring in `/dev/shm`. |
+| `--remove` | remove the rings whose creator is gone and that no process maps |
+| `--force` | with `--remove` and named rings: also remove a named ring without a creator record that no process maps, and a named ring whose creator is gone but that a reader still maps |
+
+The listing has one line per ring with these columns.
+
+| Column | Content |
+| --- | --- |
+| `RING` | the name in `/dev/shm` |
+| `KIND` | `host` for a host ring, `cuda` for the control block of a CUDA ring |
+| `SIZE` | the size of the file |
+| `CREATOR` | the process id of the creator and its program name, or `(ended)` |
+| `LAST FRAME` | how long ago the creator wrote its last frame |
+| `ACTION` | `would remove`, `removed` or `keep` |
+| `STATE` | `creator living`, `creator gone`, `unknown`, `lock held`, `another user's` or `cannot judge`, with the processes that map the ring |
+
+The command never removes a ring of another user, a ring whose creator lives, or a ring it cannot judge.
+
 ## Point clouds
 
 ### `xblick-points`
