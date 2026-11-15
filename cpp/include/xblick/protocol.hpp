@@ -207,11 +207,22 @@ namespace xblick::protocol
     inline constexpr std::string_view kSetParametersAtomically = "set_parameters_atomically";
     inline constexpr std::string_view kParameterEvents = "parameter_events";
     inline constexpr std::string_view kParametersToken = "parameters";  // below the node
+    // Every program's declaration (since 0.5.9, an addition older programs neither send nor need): below
+    // kSessions/<the session's Zenoh id> the liveliness token kProgram while the session is open, and a queryable on
+    // the same key that answers the program record at once, compact JSON {"v":1,"kind":"program","zid":"<id>",
+    // "program":"<name>","version":"<the program's version>"|null,"xblick":"<package version>","language":
+    // "python"|"c++","names":["<camera or node name>",...],"host":"<hostname>","command":["<argv>",...],"pid":<n>,
+    // "started_ns":<the process's start, ns since the epoch>}. Readers take the fields they know. A router started as
+    // xblick router carries the same record, without "zid", as its Zenoh metadata (its admin space record's
+    // "metadata").
+    inline constexpr std::string_view kSessions = "xblick/sessions";
+    inline constexpr std::string_view kProgram = "program";
 
     inline constexpr std::uint32_t kAttachmentVersion = 1;
     // 3 (0.3.59): the rings' keys name host and GPU; 4 (0.5.0): the field "durchblick" is "xblick"
     inline constexpr std::uint32_t kInfoVersion = 4;
     inline constexpr std::uint32_t kSentVersion = 1;  // the reply of <key>/sent
+    inline constexpr std::uint32_t kProgramVersion = 1;  // the program record
 
     struct MessageType
     {

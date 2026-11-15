@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import zenoh
 
-from . import _core, topics
+from . import _core, declaration, topics
 from .camera import AUTO, INFO_VERSION, FrameAttachment, ProtocolError, Subscription, cdr_encoding, ring_gpu
 from .codecs import JPEG, RVL, compress, decompress
 from .gpu import CudaArray, CudaImage, cuda_array, is_cuda_array, write_ring
@@ -162,6 +162,7 @@ class PointCloudPublisher:
                  source: str = "", slots: int = DEFAULT_SLOTS, cuda_device: int | None = None, rays=None,
                  range_step: float = 0.001, color_codec: str = JPEG, jpeg_quality: int = 95):
         self.base = topics.check_name(base)
+        declaration.add_name(session, self.base.rpartition("/")[0])  # the camera (a node's: the node) it publishes
         self.fields = list(fields)
         self.point_step = point_step
         self.dtype = points_dtype(self.fields, point_step)

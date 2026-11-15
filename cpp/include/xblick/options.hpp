@@ -69,6 +69,12 @@ namespace xblick
         Options& add_parameter_options();
         // Another name of an option defined already (e.g. a program's older --mode for --zenoh-mode).
         Options& alias(const std::string& name, const std::string& alias);
+        // The program's version, for its declaration on the network (session_options; SessionOptions::version).
+        Options& version(std::string version)
+        {
+            version_ = std::move(version);
+            return *this;
+        }
 
         // Reads the command line. --help prints help() and ends the program (0); a wrong command line prints why
         // and the usage and ends it (2). parse_or_throw: OptionsError instead (tests, programs with their own exit).
@@ -123,7 +129,7 @@ namespace xblick
         ParameterValue convert(const Option& option, const std::string& text) const;
         void check_value(const Option& option, const ParameterValue& value) const;
 
-        std::string program_, summary_;
+        std::string program_, summary_, version_;
         std::vector<Option> options_;
         std::map<std::string, std::size_t> by_name_;  // names and aliases -> index
     };

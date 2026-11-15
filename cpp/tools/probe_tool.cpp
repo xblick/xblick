@@ -15,6 +15,7 @@
 #include <map>
 
 #include "xblick/camera.hpp"
+#include "xblick/version.hpp"
 #include "xblick/parameters.hpp"
 #include "xblick/points.hpp"
 #include "tools.hpp"
@@ -134,7 +135,8 @@ int main(int argc, char** argv)
     try
     {
         zenoh::Session session = open_session({.connect = args.list("connect"), .listen = args.list("listen"),
-                                                   .mode = args.get("zenoh-mode", "peer"), .program = "xblick-cpp-probe"});
+                                                   .mode = args.get("zenoh-mode", "peer"), .program = "xblick-cpp-probe",
+                                                   .version = XBLICK_VERSION});
         const std::string name = args.get("transport", "auto");
         const std::map<std::string, Transport> transports = {{"auto", Transport::Auto}, {"raw", Transport::Raw},
                                                              {"compressed", Transport::Compressed},

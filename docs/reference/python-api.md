@@ -24,6 +24,18 @@ session = db_session.open_from_args(args)
 
 [Sessions and routers](../concepts/sessions.md) explains the options.
 
+Each session declares its program on the network: its name, version, host, command line, process id and start time
+([protocol](../concepts/protocol.md#every-program-declares-itself)). The name is the one the program was started by,
+or `program=` of `open_session` (`prog=` of `open_from_args`). A camera publisher and `node.Reporter` add their
+camera or node name to it. Other names, and what the network declares:
+
+```python
+from xblick import declaration
+declaration.add_name(session, "test/camera/mynode")      # one more name of this program
+programs, problems = declaration.query(session)          # zid -> Program of every program that declares itself
+session = db.open_session(declare=False)                 # a session that declares nothing
+```
+
 ## Publish a camera stream
 
 ```python

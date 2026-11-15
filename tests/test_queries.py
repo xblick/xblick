@@ -52,7 +52,9 @@ class Network:
         return self._sessions[-1]
 
     def new_session(self):
-        return open_session(connect=self.endpoint, listen=["127.0.0.1:0"])
+        # no declaration: the queries right after the start below are those of a bare session (a declaration's
+        # own exchange with the router delays the first query a little)
+        return open_session(connect=self.endpoint, listen=["127.0.0.1:0"], declare=False)
 
     def close(self):
         for q in self._queryables:

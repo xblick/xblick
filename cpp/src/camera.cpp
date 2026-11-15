@@ -26,6 +26,12 @@ namespace xblick
 {
     namespace p = protocol;
 
+    namespace detail
+    {
+        // declaration.cpp
+        void declare_program(zenoh::Session& session, std::string program, const std::string& version);
+    }
+
     using detail::declare;
     using detail::key;
     using detail::matching;
@@ -182,7 +188,12 @@ namespace xblick
             {
                 throw std::invalid_argument("give either a Zenoh config file or connect/listen endpoints, not both");
             }
-            return open_or_say_why(zenoh::Config::from_file(o.config_file), "", {});
+            zenoh::Session session = open_or_say_why(zenoh::Config::from_file(o.config_file), "", {});
+            if (o.declare)
+            {
+                detail::declare_program(session, o.program, o.version);
+            }
+            return session;
         }
         if (o.mode != "peer" and o.mode != "client")
         {
@@ -232,7 +243,12 @@ namespace xblick
         {
             config.insert_json5("listen/endpoints", endpoints(listen));
         }
-        return open_or_say_why(std::move(config), o.mode, connect);
+        zenoh::Session session = open_or_say_why(std::move(config), o.mode, connect);
+        if (o.declare)
+        {
+            detail::declare_program(session, o.program, o.version);
+        }
+        return session;
     }
 
     bool this_pc(const std::string& host)
@@ -530,6 +546,7 @@ namespace xblick
     CameraPublisher::CameraPublisher(zenoh::Session& session, const std::string& base, PublisherOptions options)
         : base_(check_name(base)), impl_(std::make_unique<Impl>())
     {
+        add_name(session, base_.substr(0, base_.rfind('/') == std::string::npos ? 0 : base_.rfind('/')));  // its camera
         Impl& m = *impl_;
         m.o = std::move(options);
         m.enc = encoding_info(m.o.encoding);

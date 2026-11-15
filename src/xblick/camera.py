@@ -38,7 +38,7 @@ from dataclasses import dataclass, field, replace
 import numpy as np
 import zenoh
 
-from . import _core, topics
+from . import _core, declaration, topics
 from .codecs import JPEG, check_codec, compress, decompress
 from .encodings import check_array, image_to_numpy, info, numpy_to_image
 from .gpu import (CudaArray, CudaImage, check_cuda_array, cuda_array, device_ordinal, device_uuid, is_cuda_array,
@@ -201,6 +201,7 @@ class CameraPublisher:
                  jpeg_quality: int = 85, slots: int = DEFAULT_SLOTS, cuda_device: int | None = None,
                  labels: bool = False, blocking: bool = False):
         self.base = topics.check_name(base)
+        declaration.add_name(session, self.base.rpartition("/")[0])  # the camera (a node's: the node) it publishes
         self.encoding = encoding
         if labels and encoding not in ("mono8", "mono16"):
             raise ValueError(f"{base}: a label image is mono8 or mono16, not {encoding}")

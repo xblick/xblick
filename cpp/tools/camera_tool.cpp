@@ -30,6 +30,7 @@
 #include <thread>
 
 #include "xblick/camera.hpp"
+#include "xblick/version.hpp"
 #include "xblick/parameters.hpp"
 #include "xblick/points.hpp"
 #include "tools.hpp"
@@ -48,7 +49,8 @@ int main(int argc, char** argv)
     try
     {
         zenoh::Session session = open_session({.connect = args.list("connect"), .listen = args.list("listen"),
-                                                   .mode = args.get("zenoh-mode", "peer"), .program = "xblick-cpp-camera"});
+                                                   .mode = args.get("zenoh-mode", "peer"), .program = "xblick-cpp-camera",
+                                                   .version = XBLICK_VERSION});
         const std::string encoding = args.get("encoding", "rgb8");
         const auto size = args.list("size");
         const std::uint32_t width = size.size() == 2 ? std::stoul(size[0]) : 640;

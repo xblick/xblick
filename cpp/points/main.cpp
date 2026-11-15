@@ -18,6 +18,7 @@
 
 #include "../tools/tools.hpp"
 #include "xblick/camera.hpp"
+#include "xblick/version.hpp"
 #include "xblick/point_cloud_node.hpp"
 
 namespace
@@ -62,7 +63,8 @@ int main(int argc, char** argv)
             throw std::invalid_argument("--depth <base of the depth stream> is needed");
         }
         zenoh::Session session = open_session({.connect = args.list("connect"), .listen = args.list("listen"),
-                                                   .mode = args.get("zenoh-mode", "peer"), .program = "xblick-points"});
+                                                   .mode = args.get("zenoh-mode", "peer"), .program = "xblick-points",
+                                                   .version = XBLICK_VERSION});
         PointCloudNode node(session, options);
         std::cerr << "xblick-points: " << options.depth << (options.color.empty() ? "" : " + " + options.color)
                   << " -> " << node.output() << " on CUDA device " << options.cuda_device << ", "

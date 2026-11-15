@@ -219,9 +219,12 @@ NB_MODULE(_core, m)
     protocol.attr("SET_PARAMETERS_ATOMICALLY") = std::string(p::kSetParametersAtomically);
     protocol.attr("PARAMETER_EVENTS") = std::string(p::kParameterEvents);
     protocol.attr("PARAMETERS_TOKEN") = std::string(p::kParametersToken);
+    protocol.attr("SESSIONS") = std::string(p::kSessions);
+    protocol.attr("PROGRAM") = std::string(p::kProgram);
     protocol.attr("ATTACHMENT_VERSION") = p::kAttachmentVersion;
     protocol.attr("INFO_VERSION") = p::kInfoVersion;
     protocol.attr("SENT_VERSION") = p::kSentVersion;
+    protocol.attr("PROGRAM_VERSION") = p::kProgramVersion;
     protocol.attr("RING_VERSION") = xblick::kVersion;
     protocol.attr("DEFAULT_PORT") = p::kDefaultPort;
     nb::dict types;  // type name -> (schema, Zenoh encoding)

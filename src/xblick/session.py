@@ -88,15 +88,29 @@ def make_config(connect: Sequence[str] = (), listen: Sequence[str] = (), mode: s
 
 def open_session(connect: Sequence[str] = (), listen: Sequence[str] = (), mode: str = "peer",
                  multicast_scouting: bool = False, config_file: str | None = None,
-                 local_router: bool = True) -> Session:
+                 local_router: bool = True, program: str | None = None, declare: bool = True) -> Session:
     """A session (``make_config``). It keeps the endpoints of ``across_pcs`` for ``why_nothing``. OpenError (a
-    zenoh.ZError) when Zenoh cannot open it, with a message that says why in one line."""
+    zenoh.ZError) when Zenoh cannot open it, with a message that says why in one line.
+
+    With ``declare`` (the default) the session declares its program on the network (declaration.py): ``program``
+    (default ``program_name()``), its version (``declaration.program_version``), host, command line, process id and
+    start time. ``declare=False``: a session that does not (a test standing in for an older program)."""
+    from . import declaration
+
     config = make_config(connect, listen, mode, multicast_scouting, config_file, local_router)
     try:
         opened = zenoh.open(config)
     except zenoh.ZError as error:
         raise OpenError(open_error_text(str(error), connect, mode)) from error
-    return Session(opened, across_pcs(connect, listen, mode, config_file))
+    declared = None
+    if declare:
+        program = program or program_name()
+        try:
+            declared = declaration.Declaration(opened, program, declaration.program_version(program))
+        except BaseException:
+            close(opened)
+            raise
+    return Session(opened, across_pcs(connect, listen, mode, config_file), declared)
 
 
 class OpenError(zenoh.ZError):
@@ -226,9 +240,10 @@ def add_arguments(parser, prefix: str = ""):
 
 
 def open_from_args(args, prefix: str = "", prog: str | None = None) -> Session:
-    """The session of a script's options (``add_arguments``). A peer that connects only to other PCs and listens on
-    loopback only (``across_pcs``) is said on stderr first, as ``<prog>: ...`` (default: ``program_name()``). Only a
-    notice: the session opens as given. A session that Zenoh cannot open (OpenError) ends the program with one line,
+    """The session of a script's options (``add_arguments``), declaring the program ``prog`` (default:
+    ``program_name()``, a node's console script) on the network (``open_session``). A peer that connects only to other
+    PCs and listens on loopback only (``across_pcs``) is said on stderr first, as ``<prog>: ...``. Only a notice: the
+    session opens as given. A session that Zenoh cannot open (OpenError) ends the program with one line,
     ``<prog>: ...``, and exit code 1."""
     key = prefix.replace("-", "_")
     mode = getattr(args, f"{key}zenoh_mode")
@@ -239,7 +254,7 @@ def open_from_args(args, prefix: str = "", prog: str | None = None) -> Session:
     prog = prog or program_name()
     say_across_pcs(connect, listen, mode, config_file, prog, prefix)
     try:
-        return open_session(connect=connect, listen=listen, mode=mode, config_file=config_file)
+        return open_session(connect=connect, listen=listen, mode=mode, config_file=config_file, program=prog)
     except OpenError as error:
         raise SystemExit(f"{prog}: {error}") from None
 
@@ -469,7 +484,20 @@ def close(session, timeout: float = CLOSE_TIMEOUT_S) -> bool:
     good after a query it did not finalize (seen in the tests, also with that query cancelled), and a program must
     still end. True when closed; False: it is left closing in a daemon thread, logged."""
     raw = session._session if isinstance(session, Session) else session
-    closer = threading.Thread(target=raw.close, name="zenoh close", daemon=True)
+    declared = None
+    if isinstance(session, Session):
+        declared = session.declaration
+        object.__setattr__(session, "declaration", None)
+
+    def end():
+        try:
+            if declared is not None:  # gone with the session too; undeclared first, while the session still sends
+                declared.close()
+        except zenoh.ZError:  # the session was closed already (by zenoh directly): nothing left to undeclare
+            pass
+        raw.close()
+
+    closer = threading.Thread(target=end, name="zenoh close", daemon=True)
     closer.start()
     closer.join(timeout)
     if closer.is_alive():
@@ -483,13 +511,15 @@ class Session:
     """A zenoh.Session (``open_session``, ``open_from_args``) whose close, also at the end of a ``with`` block, waits
     at most CLOSE_TIMEOUT_S (``close``). Everything else is the session's own: attributes go to it, and
     ``isinstance(s, zenoh.Session)`` holds (zenoh.Session cannot be subclassed). ``across_pcs``: the endpoints of
-    ``across_pcs`` for its options, or none."""
+    ``across_pcs`` for its options, or none; ``declaration``: its program's (declaration.py), None when it does not
+    declare."""
 
-    __slots__ = ("_session", "across_pcs")
+    __slots__ = ("_session", "across_pcs", "declaration")
 
-    def __init__(self, session: zenoh.Session, across_pcs: Sequence[str] = ()):
+    def __init__(self, session: zenoh.Session, across_pcs: Sequence[str] = (), declaration=None):
         object.__setattr__(self, "_session", session)
         object.__setattr__(self, "across_pcs", list(across_pcs))
+        object.__setattr__(self, "declaration", declaration)
 
     def __getattr__(self, name):
         return getattr(self._session, name)
@@ -499,7 +529,7 @@ class Session:
         return zenoh.Session
 
     def close(self, timeout: float = CLOSE_TIMEOUT_S) -> bool:
-        return close(self._session, timeout)
+        return close(self, timeout)
 
     def __enter__(self) -> Session:
         return self

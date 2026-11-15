@@ -78,7 +78,7 @@ from pathlib import Path
 
 import zenoh
 
-from . import _core, topics
+from . import _core, declaration, topics
 from .camera import (FIND_PERIOD, SENT_VERSION, CameraPublisher, ProtocolError, _attachment, _check_encoding,
                      congestion, find_streams, parse_attachment)
 from .codecs import parse_format
@@ -247,6 +247,7 @@ class Recorder:
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.name = name
+        declaration.add_name(session, name)  # what the program declares (declaration.py)
         self.patterns = [p.format(ns=namespace) for p in PATTERNS]
         self.prefix = prefix
         self.points = points

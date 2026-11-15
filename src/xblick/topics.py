@@ -93,6 +93,9 @@ COMMAND = _protocol.COMMAND
 CONTROLLER = _protocol.CONTROLLER
 RECORD = _protocol.RECORD
 STATUS = _protocol.STATUS
+SESSIONS = _protocol.SESSIONS  # <SESSIONS>/<zid>/<PROGRAM>: a program's declaration (declaration.py)
+PROGRAM = _protocol.PROGRAM
+PROGRAM_VERSION = _protocol.PROGRAM_VERSION
 WORLD_NAMESPACE = "sim"  # a simulation's world, the namespace of <world>/tf, clock, events (SimPublisher's default)
 
 # ROS 2 name rules for one token: letters, digits, underscores, not starting with a digit

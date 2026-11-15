@@ -59,9 +59,23 @@ namespace xblick
         // free loopback port as well (peers behind a router reach each other only directly).
         bool local_router = true;
         // The program's name. Set (Options::session_options sets it): open_session says on stderr, as
-        // "<program>: ...", when the options make a peer that connects only to other PCs (across_pcs).
+        // "<program>: ...", when the options make a peer that connects only to other PCs (across_pcs). It is also the
+        // program the session declares (empty: the name it was started by).
         std::string program;
+        // The program's version in its declaration (empty: unknown, null in the record).
+        std::string version;
+        // The session declares its program on the network (protocol.hpp kSessions, Python's declaration.py): the
+        // liveliness token xblick/sessions/<zid>/program while it is open and a queryable there that answers the
+        // record (program, version, the core's version, names, host, the whole command line, process id, start time).
+        // The command line is visible to everything that reaches the network. false: a session that does not.
+        bool declare = true;
     };
+
+    // xblick/sessions/<zid>/program: a session's declaration (SessionOptions::declare).
+    std::string declaration_key(const std::string& zid);
+    // Adds a camera or node name (test/camera, test/camera/yolox) to the declaration of `session` once; false when
+    // the session does not declare. CameraPublisher and PointCloudPublisher add their camera's (base's parent).
+    bool add_name(const zenoh::Session& session, std::string name);
 
     // tcp/<host>:<port>; a full locator (containing '/') is returned unchanged.
     std::string endpoint(const std::string& host, std::uint16_t port = 7447);

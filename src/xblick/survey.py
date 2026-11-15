@@ -28,7 +28,7 @@ from collections.abc import Iterable
 import numpy as np
 import zenoh
 
-from . import _core, topics
+from . import _core, declaration, topics
 from .msg import Message
 from .recording import message_types
 from .camera import parse_attachment
@@ -216,7 +216,7 @@ class Node:
         subscribes, ``subscribes <prefix>``; a router is ``router``."""
         if self.whatami == "router":
             return "router"
-        own = self.publishes | self.queryables | self.tokens
+        own = {k for k in self.publishes | self.queryables | self.tokens if not declaration.zid_of(k)}
         named = {k for k in own if not k.endswith("/" + topics.DIAGNOSTICS)} or own
         if named:
             return common_prefix(named) or f"{len(named)} keys"

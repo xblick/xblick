@@ -383,6 +383,7 @@ namespace xblick
                                              CloudPublisherOptions options)
         : base_(check_name(base)), impl_(std::make_unique<Impl>())
     {
+        add_name(session, base_.substr(0, base_.rfind('/') == std::string::npos ? 0 : base_.rfind('/')));  // its camera
         Impl& m = *impl_;
         m.o = std::move(options);
         check_layout(m.o.layout);

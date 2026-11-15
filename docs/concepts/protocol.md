@@ -47,6 +47,44 @@ the sample. The rings and their handshake carry versions in the same way.
 For you this means: all publishers and subscribers of one setup speak the same protocol. The
 [changelog](../../CHANGELOG.md) states which versions do.
 
+## Every program declares itself
+
+A Zenoh router knows which keys a session declares, and it does not know which program the session is. So every
+program on Durchblick's library declares itself when it opens its session. Commands, nodes and the C++ tools do this
+in `open_session` and `open_from_args`, and a node needs no code of its own for it.
+
+| Key | Kind | Content |
+| --- | --- | --- |
+| `xblick/sessions/<zid>/program` | liveliness token | alive while the session is open |
+| `xblick/sessions/<zid>/program` | queryable | the program record, JSON, answered at once |
+
+`<zid>` is the Zenoh id of the session. The token appears and disappears with the session. A process that is killed
+loses its token when its links close, which the kernel does at once for a local process. The record looks like this:
+
+```json
+{"v": 1, "kind": "program", "zid": "5a1c...", "program": "xblick-yolox", "version": "0.3.0",
+ "xblick": "0.5.9", "language": "python", "names": ["test/camera/yolox"], "host": "robot-pc",
+ "command": ["/usr/bin/python3", "/opt/venv/bin/xblick-yolox", "--camera", "test/camera"],
+ "pid": 4711, "started_ns": 1794300000000000000}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `program` | the name the program was started by, or the command, such as `xblick view` |
+| `version` | the program's version: the package's for `xblick` and its commands, the version of the distribution that installs a node's console script, `null` when nothing names it |
+| `xblick` | the version of Durchblick's core in that program |
+| `names` | the camera or node names the program publishes for: a camera publisher adds its camera, `node.Reporter` adds `<camera>/<node>`, a recorder its name |
+| `command` | the whole command line, the interpreter included |
+| `started_ns` | the start of the process, in ns since the epoch |
+
+The command line is visible to every program that reaches the network. It contains the paths and the arguments of
+the program. It never contains the environment. Durchblick's programs take secrets from the environment, so do not
+pass a secret as an argument.
+
+`xblick router` writes the same record into its Zenoh metadata. The admin space of the router shows it under
+`metadata`. A program of Durchblick 0.5.8 or older and any other Zenoh program declare nothing. They keep working,
+and the terminal interface shows `–` as their program.
+
 ## Related pages
 
 - [Durchblick and ROS 2](../integrations/ros2.md): what is compatible with ROS 2 and what is not.

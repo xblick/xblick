@@ -65,6 +65,15 @@ services of ROS 2 below this key. See [parameters](parameters.md).
 | `parameter_events` | `rcl_interfaces/msg/ParameterEvent` of every node. The field `node` is the full name of the node. | at each declaration and each change |
 | `<node>/parameters` | liveliness token | while the node offers parameters |
 
+## Programs
+
+Every program on Durchblick's library declares itself. See [the protocol](../concepts/protocol.md#every-program-declares-itself).
+
+| Topic | Type | Sent |
+| --- | --- | --- |
+| `xblick/sessions/<zid>/program` | liveliness token | while the session is open |
+| `xblick/sessions/<zid>/program` | queryable: the program record, JSON | answered when queried |
+
 ## Robot state
 
 A robot publishes its state below its namespace, for example `robot`. It sends one message per state sample,

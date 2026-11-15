@@ -16,6 +16,7 @@ import time
 
 import zenoh
 
+from . import _core, declaration
 from . import session as zsession
 
 LISTEN = f"tcp/0.0.0.0:{zsession.DEFAULT_PORT}"  # zenohd's address in the documentation
@@ -25,15 +26,17 @@ class RouterError(RuntimeError):
     """The router cannot start: one line for the user."""
 
 
-def config(listen: list[str], connect: list[str] = ()) -> zenoh.Config:
+def config(listen: list[str], connect: list[str] = (), program: str = "xblick router") -> zenoh.Config:
     """A router's configuration: listening on ``listen``, connected to the routers ``connect`` (other PCs), no
-    multicast scouting, the admin space readable."""
+    multicast scouting, the admin space readable, and the program's record (declaration.py) as its Zenoh metadata,
+    which the admin space shows (``@/<zid>/router``: ``metadata``)."""
     c = zenoh.Config()
     c.insert_json5("mode", json.dumps("router"))
     c.insert_json5("listen/endpoints", json.dumps([zsession.endpoint(e) for e in listen]))
     c.insert_json5("connect/endpoints", json.dumps([zsession.endpoint(e) for e in connect]))
     c.insert_json5("scouting/multicast/enabled", "false")
     c.insert_json5("adminspace/enabled", "true")
+    c.insert_json5("metadata", json.dumps(declaration.program_record(program, _core.__version__)))
     return c
 
 

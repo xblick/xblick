@@ -37,6 +37,12 @@ Set `SessionOptions::program` to the program's name (`Options::session_options` 
 one line on stderr, `<program>: ...`, when the options make a peer that connects only to other PCs and listens on
 loopback only, as the Python commands do ([sessions](../concepts/sessions.md#which-mode-when)).
 
+`open_session` declares the program on the network, as Python does
+([protocol](../concepts/protocol.md#every-program-declares-itself)). The record takes `SessionOptions::program`
+(empty: the name the program was started by) and `SessionOptions::version` (`Options::version` sets it; empty: unknown).
+`CameraPublisher` and `PointCloudPublisher` add their camera's name. `xblick::add_name(session, name)` adds another.
+`SessionOptions::declare = false` opens a session that declares nothing.
+
 ## Pass a camera's JPEG through
 
 A camera that delivers JPEG needs no decoding for subscribers that want JPEG.

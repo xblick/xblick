@@ -38,6 +38,7 @@ import logging
 import signal
 import time
 
+from . import declaration
 from .camera import LOCAL
 from .diagnostics import DiagnosticsPublisher
 from .parameters import Parameters  # noqa: F401 - node.Parameters: a node's parameters (parameters.py)
@@ -164,6 +165,7 @@ class Reporter:
         self._skipped = 0  # of the watched subscriptions, at the last report
         self._max_hz = max_hz  # the node's --max-hz (in every report), or the watched subscriptions' rate
         self._diagnostics = DiagnosticsPublisher(session, camera, name)
+        declaration.add_name(session, f"{camera}/{name}")  # what the program declares (declaration.py)
 
     def watch(self, *subscriptions):
         """Subscriptions (or FrameHistory, RGBDInputs) whose frames left out for ``--max-hz`` every report counts:
