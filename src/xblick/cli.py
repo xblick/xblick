@@ -418,7 +418,9 @@ def _rerun(args, parser) -> int:
             while True:
                 if discover:  # a node started later; the lookup takes the frame-rate line's time
                     started = time.monotonic()
-                    added = bridge.add(**_bridged(find_streams(z, args.prefix, min(args.seconds, args.report))))
+                    looked = _bridged(find_streams(z, args.prefix, min(args.seconds, args.report)))
+                    added = bridge.add(**looked)
+                    bridge.mark_ended(looked)  # the ages table's rows of publishers that are gone (#17)
                     if added:
                         print(f"bridging {', '.join(added)} as well", flush=True)
                     time.sleep(max(0.0, args.report - (time.monotonic() - started)))

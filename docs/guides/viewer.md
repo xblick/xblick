@@ -122,6 +122,10 @@ For every topic, the viewer plots three time series on the capture timeline.
 the sequence numbers. For a stream that the viewer limits itself, such as point clouds, the rate is the limited
 rate. `--no-ages` removes all of these. [Timestamps](../concepts/timestamps.md#ages) defines the ages.
 
+Without a selection, `xblick rerun` looks for streams again every `--report` seconds. When a look no longer finds
+the publisher of a row, the row says "ended" with the time of its last sample. A camera's bodies end with the
+last stream of their camera. A row that receives samples again shows its numbers again.
+
 ## What you should know
 
 - **The viewer keeps publishers busy.** Rerun cannot tell which streams you look at, so `xblick rerun`

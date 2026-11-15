@@ -1096,6 +1096,34 @@ def test_rates_and_drops(sessions):  # noqa: F811
     publisher.close()
 
 
+def test_ages_table_marks_ended_publishers(sessions):  # noqa: F811
+    """Without a selection, a row of the ages table whose publisher is gone says "ended" with the time of its last
+    sample once a look no longer finds it (#17), and comes back with the publisher."""
+    a, b = sessions
+    publisher = CameraPublisher(a, BASE, encoding="rgb8", frame_id="cam")
+    rr = FakeRerun()
+    bridge = RerunBridge(b, rr, [BASE])
+    wait_until(lambda: publisher.subscribed)
+    time.sleep(0.3)
+
+    def row():
+        text = ([f["text"] for e, _, f, _ in of(rr, "TextDocument") if e == "ages_now"] or [""])[-1]
+        return next((line for line in text.splitlines() if line.startswith(f"| {BASE} |")), "")
+
+    publisher.publish(pattern(1), stamp_ns=time.time_ns())
+    wait_until(lambda: row())
+    bridge.mark_ended({"bases": [BASE], "clouds": [], "detections": [], "segmentations": []})
+    assert "ended" not in row()
+    bridge.mark_ended({"bases": [], "clouds": [], "detections": [], "segmentations": []})
+    assert row().startswith(f"| {BASE} | ended ") and row().endswith("| - | - | - |"), row()
+    time.sleep(1.1)  # the table is written at most once a second
+    publisher.publish(pattern(2), stamp_ns=time.time_ns())
+    wait_until(lambda: "ended" not in row())
+    bridge.check()
+    bridge.close()
+    publisher.close()
+
+
 def test_the_viewer_next_to_python_without_path(monkeypatch):
     """The viewer is rerun-sdk's next to this Python even without PATH (a venv not activated)."""
     pytest.importorskip("rerun")  # the extra xblick[rerun] brings the viewer; CI installs without extras

@@ -188,13 +188,18 @@ def _seq(sample: zenoh.Sample) -> int | None:
 
 
 def ages_table(rows: dict[str, dict]) -> str:
-    """The newest rate, ages and drops per topic as a Markdown table with its legend."""
+    """The newest rate, ages and drops per topic as a Markdown table with its legend; a row whose publisher ended
+    (``ended``: the wall clock of its last sample, s) says so with that time instead of its numbers."""
     def cell(row, key, form):
         return form.format(row[key]) if row.get(key) is not None else "-"
 
     lines = ["| topic | rate Hz | age at send ms | age at receive ms | dropped/s |", "| --- | --: | --: | --: | --: |"]
-    lines += [f"| {topic} | {cell(r, 'rate', '{:.1f}')} | {cell(r, 'send', '{:.1f}')} | {cell(r, 'receive', '{:.1f}')} "
-              f"| {cell(r, 'dropped', '{:d}')} |" for topic, r in sorted(rows.items())]
+    for topic, r in sorted(rows.items()):
+        if r.get("ended") is not None:
+            lines.append(f"| {topic} | ended {time.strftime('%H:%M:%S', time.localtime(r['ended']))} | - | - | - |")
+        else:
+            lines.append(f"| {topic} | {cell(r, 'rate', '{:.1f}')} | {cell(r, 'send', '{:.1f}')} "
+                         f"| {cell(r, 'receive', '{:.1f}')} | {cell(r, 'dropped', '{:d}')} |")
     return "\n".join(lines) + "\n\n" + AGES_LEGEND + "\n"
 
 
@@ -615,7 +620,8 @@ class RerunBridge:
         while gaps and gaps[0][0] < now - 1.0:
             gaps.popleft()
         row = self._age_now.setdefault(topic, {})
-        row["rate"], row["dropped"] = rate, sum(n for _, n in gaps)
+        row["rate"], row["dropped"], row["at"] = rate, sum(n for _, n in gaps), time.time()
+        row.pop("ended", None)  # its publisher is back
         if len(arrivals) > 1:
             rr.log(f"rates/{topic}", rr.Scalars([rate]))
         if age_ns is not None:
@@ -630,6 +636,28 @@ class RerunBridge:
             rr.log("ages_now", rr.TextDocument(ages_table(self._age_now), media_type="text/markdown"))
         if first:
             self._update_blueprint()  # the ages' views
+
+    def mark_ended(self, found: dict[str, list[str]]):
+        """``xblick rerun`` without a selection, after each look (``found``: what it found, by kind): the rows of the
+        ages table whose publisher is gone say "ended" with the time of their last sample, as the terminal interface's
+        Rerun tab says "gone since". A row is gone when its key was not found; a camera's bodies, IMU and diagnostics,
+        which the look does not find by themselves, when nothing of their camera was found."""
+        if not self._ages:
+            return
+        keys = {k for ks in found.values() for k in ks}
+        cameras = {camera_of_entry(kind, k) for kind, ks in found.items() if kind in PLACED_KINDS for k in ks}
+        with self._lock:
+            looked_for = set(self.bases + self.clouds + self.detections + self.segmentations)
+            changed = False
+            for topic, row in self._age_now.items():
+                alive = topic in keys or (topic not in looked_for and any(topic.startswith(c + "/") for c in cameras))
+                if alive or row.get("ended") is not None:
+                    continue
+                row["ended"] = row.get("at", time.time())
+                changed = True
+            if changed:
+                self.rr.set_time(TIMELINE, timestamp=np.datetime64(time.time_ns(), "ns"))
+                self.rr.log("ages_now", self.rr.TextDocument(ages_table(self._age_now), media_type="text/markdown"))
 
     def _bridge_cloud(self, session: zenoh.Session, base: str, rate: float, stop: threading.Event):
         """Thread of one point cloud stream: the newest cloud, at most ``rate`` a second, until ``stop`` (set by
