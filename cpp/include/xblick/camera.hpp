@@ -30,6 +30,7 @@
 
 #include <zenoh.hxx>
 
+#include "xblick/command.hpp"
 #include "xblick/cuda_ring.hpp"
 #include "xblick/image.hpp"
 #include "xblick/msg.hpp"
@@ -183,19 +184,23 @@ namespace xblick
     {
         std::string node;
         std::int64_t offset_ns = 0;
-        // `timeout` from now on the node's clock, at the earliest that can be
+        // `timeout` from now on the node's clock, at the earliest that can be (late only by the clocks' rate
+        // difference, at most 0.05 % with NTP, over the time from the read to the node's check).
+        // std::invalid_argument for a timeout above 24 h; std::runtime_error ("not sent") for a deadline out of range.
         std::int64_t deadline_ns(std::chrono::milliseconds timeout) const;
     };
 
     // The target of a command from the one successful reply of the read before it and the time the read ended
     // (command_clock_ns() once it returned); empty when the reply has no attachment of a receiver of 0.5.13 (an older
-    // one: nothing new is sent or checked). The deadline converted with it comes out early by at most the read's
-    // round trip, never late. std::runtime_error ("not sent: ...") for an attachment it cannot read.
+    // one, or one that does not take part: nothing new is sent or checked). The deadline converted with it comes out
+    // early by at most the read's round trip, late only by the clocks' rate difference (deadline_ns).
+    // std::runtime_error ("not sent: ...") for an attachment it cannot read.
     std::optional<CommandTarget> target_of(const zenoh::Reply& reply, std::int64_t answered_ns);
 
     // ask_once, the query naming `to` and its deadline, `timeout` from the moment it is sent, on to's clock. A
-    // receiver of 0.5.13 that is not that node does not execute it, nor does that node after the deadline; an older
-    // receiver executes it as before. Without `to` the same as the overload above (nothing attached).
+    // receiver that checks (CommandQuery) and is not that node does not execute it, nor does that node after the
+    // deadline. A receiver that does not check executes it as before; the sender cannot tell which it is until it has
+    // an answer (checked()). Without `to` the same as the overload above (nothing attached).
     std::vector<zenoh::Reply> ask_once(const zenoh::Session& session, const std::string& selector,
                                        std::chrono::milliseconds timeout,
                                        const std::optional<std::vector<std::uint8_t>>& payload,
@@ -207,42 +212,48 @@ namespace xblick
     bool not_target(const zenoh::Reply& reply);
 
     // True when a successful reply to a command sent to `to` says that its node checked node and deadline before
-    // executing it (a receiver of 0.5.13); false otherwise (Python's session.checked).
+    // executing it; false otherwise (Python's session.checked).
     bool checked(const zenoh::Reply& reply, const std::optional<CommandTarget>& to);
 
     // What a receiver's replies carry (to a command and to the read before it): its session's Zenoh id `zid`
     // (session.get_zid().to_string()), its clock now and what it checked ("node", "deadline"; none for a read).
     std::string answer_attachment(const std::string& zid, const std::vector<std::string>& checked = {});
 
-    // A receiver's refusal of a command before its effect (CommandQuery::check). `schema`: kExpired, kNotTarget or
+    // A receiver's refusal of a command before its effect (CommandQuery::check_node, check_deadline). `schema`:
+    // kExpired, kNotTarget or
     // kInvalidCommand; what() the error reply's text.
     class CommandRefused : public std::runtime_error
     {
     public:
-        CommandRefused(std::string schema, const std::string& text) : std::runtime_error(text), schema(std::move(schema))
+        CommandRefused(std::string schema, const std::string& text)
+            : std::runtime_error(text), schema(std::move(schema))
         {
         }
         std::string schema;
     };
 
     // A command as its receiver got it (the query on the key `what`; `zid`: the receiver's session): the node it is
-    // meant for and its deadline, as a sender of 0.5.13 attached them. A query without them (an older sender, a
-    // command without a target) has nothing to check. Call check() as late as possible before the command takes
-    // effect; reply with answer_attachment(zid, checked()); send a refusal with refuse(). Python's
-    // session.CommandQuery.
+    // meant for and its deadline, as a sender attached them (command.hpp has the rules). A query without them (an older
+    // sender, a command without a target) has nothing to check. Construct it inside the code that answers the query
+    // with an error reply on any exception: it never throws itself, and no input ends the receiver. Call
+    // check_node() on receipt, before anything else (an unreadable attachment, or a command meant for another node),
+    // and check_deadline() as late as possible before the command takes effect; reply with answer_attachment(zid,
+    // checked()); send a refusal with refuse(). Python's session.CommandQuery.
     class CommandQuery
     {
     public:
         CommandQuery(const zenoh::Query& query, std::string zid, std::string what);
-        // CommandRefused when it must not be executed: an attachment it cannot read, meant for another node, or the
-        // deadline passed (command_clock_ns() at or after it). Nothing for a command without a target.
-        void check();
+        // CommandRefused (kInvalidCommand, kNotTarget) when it must not be executed by this node
+        void check_node();
+        // CommandRefused (kExpired, kInvalidCommand for a deadline more than 24 h ahead) when the deadline has passed
+        // on this PC's command_clock_ns(); runs check_node() first. Afterwards checked() names both checks.
+        void check_deadline();
         const std::vector<std::string>& checked() const { return checked_; }
         const std::string& zid() const { return zid_; }
 
     private:
-        std::string zid_, what_, node_, invalid_;
-        std::int64_t deadline_ns_ = 0;
+        std::string zid_, what_;
+        CommandAttachment attachment_;
         std::vector<std::string> checked_;
     };
 

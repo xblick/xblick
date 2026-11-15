@@ -428,8 +428,9 @@ class Parameters:
 
     def _set(self, parameters: list[Parameter], atomic: bool, local: bool = False,
              gate: Callable | None = None) -> list[SetParametersResult]:
-        """``gate``: called just before the first change (a command's CommandQuery.check), after everything that may
-        take time but changes nothing (the lock, the readers); its CommandRefused leaves everything as it was."""
+        """``gate``: called just before the first change (a command's CommandQuery.check_deadline), after everything
+        that may take time but changes nothing (the lock, the readers); its CommandRefused leaves everything as it
+        was."""
         with self._lock:
             reasons = [self._refusal(p, local) for p in parameters]
             if atomic and any(reasons):
@@ -490,16 +491,20 @@ class Parameters:
             raise
 
     def _answer(self, service: str, query: zenoh.Query):
-        """A service's query answered; a set (a command) checked first (session.CommandQuery: the node it is meant
-        for, its deadline), just before its first change (``_set``). Every reply names this node and its clock
-        (session.answer_attachment), so that a sender of 0.5.13 can address a command to it."""
+        """A service's query answered, whatever it holds (no input ends the server thread). A set (a command) is
+        checked twice (session.CommandQuery): the node it is meant for on receipt, before anything else, so that a node
+        it is not meant for never answers in its own name; the deadline just before its first change (``_set``).
+        Every reply names this node and its clock (session.answer_attachment), so that a sender can address a command
+        to it."""
         request_type, _ = SERVICES[service]
-        payload = query.payload
-        received = (CommandQuery(query, self._zid, f"{self.key}/{service}")
-                    if service in (P.SET_PARAMETERS, P.SET_PARAMETERS_ATOMICALLY) else None)
+        received = None
         try:
+            if service in (P.SET_PARAMETERS, P.SET_PARAMETERS_ATOMICALLY):
+                received = CommandQuery(query, self._zid, f"{self.key}/{service}")
+                received.check_node()
+            payload = query.payload
             request = request_type.deserialize(payload.to_bytes()) if payload is not None else request_type()
-            response = self._respond(service, request, received.check if received is not None else None)
+            response = self._respond(service, request, received.check_deadline if received is not None else None)
         except CommandRefused as refused:
             log.warning(str(refused))
             refuse(query, refused)
@@ -581,9 +586,10 @@ class ParameterClient:
     """Another node's parameters over Zenoh (``key``: its ``<namespace>/<name>``): ROS 2's services, and its events
     (``on_event``). Reads: TimeoutError when it does not answer within ``timeout``, RuntimeError when several do.
     Sets: not sent unless exactly one node answers first (``_call``); then sent once, to that node with a deadline
-    when it is of 0.5.13 or later: NotReached (a TimeoutError, nothing sent), Expired (refused by the node, past its
-    deadline: not applied), NoAnswer (no TimeoutError: sent once, no answer; not sent again). ``last_checked``: the
-    node of the last set said that it checked node and deadline before applying it (session.checked)."""
+    when that node takes part (its answer names it, session.one_node): NotReached (a TimeoutError, nothing sent),
+    Expired (refused by the node, past its deadline: not applied), NoAnswer (no TimeoutError: sent once, no answer;
+    not sent again). ``last_checked``: the node of the last set said that it checked node and deadline before
+    applying it (session.checked)."""
 
     def __init__(self, session: zenoh.Session, key: str, timeout: float = 2.0):
         self.key = topics.check_name(key.strip("/"))
@@ -597,7 +603,7 @@ class ParameterClient:
         """One service call: a read (list, describe, get, types) asked again while nothing answers (session.ask);
         a set (a command: a node may act on it) sent once (session.command), and only after a read (list_parameters)
         had exactly one answer and no "Timeout" reply (session.one_node: a best-effort check of two nodes on the key,
-        which would both apply it), to the node that answered it (with a deadline, when it is of 0.5.13 or later).
+        which would both apply it), to the node that answered it (with a deadline, when that node takes part).
         NotReached, Expired, NoAnswer, PartlyAnswered: as session.command. Ordinary reads keep the one answer that came
         and ignore a "Timeout" reply, which says that another node had not finished the read: a read changes
         nothing."""

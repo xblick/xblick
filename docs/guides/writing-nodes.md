@@ -105,8 +105,8 @@ A node that serves a [queryable](https://zenoh.io/docs/manual/abstractions/#quer
 command, replies and then ends the query's callback at once. It does long work outside the callback and keeps no query
 object. A node that keeps the query after its reply keeps the query open until the caller's timeout. The caller's
 session then adds an error reply `Timeout`. A caller takes that reply for a second node and sends nothing.
-`node.Parameters` does this right. A node whose queryable executes commands checks each command's node and
-deadline with `xblick.session.CommandQuery` just before the effect
+`node.Parameters` does this right. A node whose queryable executes commands checks each command with
+`xblick.session.CommandQuery`: the node when the command arrives, the deadline just before the effect
 ([Node and deadline](../reference/python-api.md#node-and-deadline)).
 
 ## Restarts and changing cameras

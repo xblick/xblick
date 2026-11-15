@@ -151,6 +151,7 @@
 // "encoding":"<ROS encoding>" for an image stream and "fields":["x","y","z",...] for a point cloud stream.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -217,21 +218,30 @@ namespace xblick::protocol
     // "metadata").
     inline constexpr std::string_view kSessions = "xblick/sessions";
     inline constexpr std::string_view kProgram = "program";
-    // A command's node and deadline (since 0.5.13, an addition older programs neither send nor look at): a command (a
-    // parameter set, a controller manager's command, a torque step, a recorder command) whose read before it was
-    // answered by a receiver of 0.5.13 carries the query attachment, compact JSON {"xblick_command":1,"node":"<the
-    // Zenoh id of the session that answered the read>","deadline_ns":<the time the sender stops waiting, on that
-    // node's clock: CLOCK_BOOTTIME in ns>}. Such a receiver answers the read and the command with the reply
-    // attachment {"xblick_command":1,"zid":"<its session's Zenoh id>","clock_ns":<its CLOCK_BOOTTIME now>,
-    // "checked":[...]} ("node", "deadline": what it checked before executing the command; empty for a read) and
-    // refuses a command meant for another node, or one whose deadline has passed, by an error reply whose encoding is
-    // "text/plain;<kNotTarget|kExpired>" (kInvalidCommand: an attachment with kCommandField it cannot read). An
-    // attachment without kCommandField is not one of these and is ignored, as before 0.5.13.
+    // A command's node and deadline (since 0.5.13, an addition older programs neither send nor look at). A receiver
+    // that takes part (xblick's Parameters and record and play node; another receiver only if its own code uses
+    // CommandQuery) answers the read before a command, and the command, with the reply attachment, compact JSON
+    // {"xblick_command":1,"zid":"<its session's Zenoh id>","clock_ns":<its CLOCK_BOOTTIME now>,"checked":[...]}
+    // ("node", "deadline": what it checked before executing the command; empty for a read). A command whose read was
+    // answered so carries the query attachment {"xblick_command":1,"node":"<the zid of that answer>","deadline_ns":
+    // <the time the sender stops waiting, on that node's CLOCK_BOOTTIME, ns>}. The receiver refuses a command meant
+    // for another node on receipt and one whose deadline has passed just before its effect, by an error reply whose
+    // encoding is "text/plain;<kNotTarget|kExpired>" (kInvalidCommand: an attachment with kCommandField that breaks
+    // the rules of command.hpp, or a deadline more than kCommandMaxAheadNs ahead). An attachment without the bytes
+    // "xblick_command" is another program's and is ignored, as before 0.5.13. A read answer without the reply
+    // attachment means only that its receiver does not take part, whatever its version.
+    // Version 1 grows by new fields, which every reader ignores; a receiver keeps answering version 1, because a
+    // sender of 0.5.13 sends nothing to a read answer of another version (it fails safe: "not sent").
+    // The identity is the session's Zenoh id, random unless a Zenoh configuration sets "id": two programs given the
+    // same id are one node to this check.
     inline constexpr std::string_view kCommandField = "xblick_command";
     inline constexpr std::uint32_t kCommandVersion = 1;
     inline constexpr std::string_view kExpired = "xblick-expired";
     inline constexpr std::string_view kNotTarget = "xblick-not-target";
     inline constexpr std::string_view kInvalidCommand = "xblick-invalid-command";
+    inline constexpr std::uint32_t kCommandMaxDepth = 16;        // nesting of a command's attachment, at most
+    inline constexpr std::size_t kCommandMaxBytes = 65536;      // its length, at most
+    inline constexpr std::int64_t kCommandMaxAheadNs = 86400LL * 1000000000LL;  // a deadline at most 24 h ahead
 
     inline constexpr std::uint32_t kAttachmentVersion = 1;
     // 3 (0.3.59): the rings' keys name host and GPU; 4 (0.5.0): the field "durchblick" is "xblick"

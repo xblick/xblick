@@ -541,6 +541,28 @@ def test_cpp_parameters_check_node_and_deadline(cpp_camera):
     assert client.get(["pattern.shift"])[0].value() == 7  # neither applied
     (ok,) = zs.command(session, f"{key}/set_parameters", 2.0, payload=request(11))  # no target: as before 0.5.13
     assert json.loads(ok.attachment.to_bytes())["checked"] == [] and client.get(["pattern.shift"])[0].value() == 11
+    # malformed and extreme attachments (the review's): each an error reply of its case, nothing applied, the node
+    # answers afterwards; an atomic set with a refused value meant for another node: refused as such, on receipt
+    from xblick.msg import SetParametersAtomicallyRequest
+
+    now = zs.command_clock_ns() + to.offset_ns
+    atomic = bytes(SetParametersAtomicallyRequest([Parameter("pattern.shift", ParameterValue.of(300))]).serialize())
+    cases = [(b'{"xblick_command": 1, "x": ' + b"[" * 100000 + b"]" * 100000 + b"}", request(12), zs.INVALID_COMMAND),
+             (json.dumps({"xblick_command": 1, "node": to.node, "deadline_ns": -2**63}).encode(), request(12),
+              zs.INVALID_COMMAND),
+             (json.dumps({"xblick_command": 1, "node": to.node, "deadline_ns": 2**63 - 1}).encode(), request(12),
+              zs.INVALID_COMMAND),
+             (json.dumps({"xblick_command": 1, "node": to.node, "deadline_ns": now + 10**10}).encode() + b"garbage",
+              request(12), zs.INVALID_COMMAND),
+             (json.dumps({"xblick_command": 1, "node": "0" * 32, "deadline_ns": now + 10**10}).encode(), b"not cdr",
+              zs.NOT_TARGET)]
+    for attachment, payload, schema in cases:
+        (reply,) = replies(session, f"{key}/set_parameters", 5.0, payload=payload, attachment=attachment)
+        assert reply.err is not None and zs._schema(reply) == schema, (attachment[:80], reply)
+    (reply,) = replies(session, f"{key}/set_parameters_atomically", 5.0, payload=atomic,
+                       attachment=json.dumps({"xblick_command": 1, "node": "0" * 32, "deadline_ns": now + 10**10}))
+    assert reply.err is not None and zs._schema(reply) == zs.NOT_TARGET
+    assert client.get(["pattern.shift"])[0].value() == 11
     session.close()
 
     # the second node: a Python node "cpp_camera" in t/cpp2 alone first, then a C++ one of that name

@@ -156,8 +156,8 @@ query to every queryable of its key, as long as none of them is declared complet
 complete. `xblick::ParameterClient` sends a set only after a read had exactly one answer and ended before its timeout.
 This check is best effort. A second node that drops the read or starts after it still gets the set. So does a second
 node that a session just opened has not linked to yet. The set then names the node that answered the read and carries
-a deadline. A node of 0.5.13 or later refuses a set meant for another node, or one past its deadline
-([Node and deadline](python-api.md#node-and-deadline)).
+a deadline. A node on `xblick::Parameters` of 0.5.13 or later refuses a set meant for another node, or one past its
+deadline ([Node and deadline](python-api.md#node-and-deadline)).
 
 | Exception (base) | Sent? | Meaning |
 | --- | --- | --- |
@@ -174,8 +174,9 @@ All of them derive from `std::runtime_error`. `NotReached`, `Expired` and `NoAns
 is true when the node of the last set confirmed that it checked node and deadline.
 
 A receiver of commands outside this library, such as a robot's controller manager, checks node and deadline with
-`xblick::CommandQuery`. It creates one from the query and its session's Zenoh id, and calls `check()` just before the
-command takes effect. A refusal is a `CommandRefused`, which `xblick::refuse(query, refused)` sends back. Every reply,
+`xblick::CommandQuery`. It creates one from the query and its session's Zenoh id, inside the code that answers every
+exception with an error reply. It calls `check_node()` when the command arrives, before anything else, and
+`check_deadline()` just before the command takes effect. A refusal is a `CommandRefused`, which `xblick::refuse(query, refused)` sends back. Every reply,
 also the one to the read before the command, carries `xblick::answer_attachment(zid, checked)`. A sender of its own
 uses `xblick::target_of` on the read's answer and the overload of `ask_once` with a `CommandTarget`. Python has the
 same functions in `xblick.session`.

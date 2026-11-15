@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import os
 import socket
 import threading
@@ -35,6 +36,7 @@ from . import _core, topics
 
 LANGUAGE = "python"
 SERVE_PERIOD_S = 0.02  # how often the declaration looks for queries: an answer waits at most this much longer
+JOIN_S = 2.0  # how long close() waits for the serving thread
 ALL = f"{topics.SESSIONS}/*/{topics.PROGRAM}"  # every program's key
 
 
@@ -158,12 +160,20 @@ class Declaration:
         query.drop()
 
     def close(self):
+        """Undeclares token and queryable. The serving thread ends first: undeclaring the queryable while that thread
+        is in its try_recv made zenoh-python raise "Already mutably borrowed" in the thread (#19), as parameters.py
+        avoids since 0.5.7. It ends within SERVE_PERIOD_S plus one answer; one that has not ended by JOIN_S is
+        logged, and the queryable is left to the session's close."""
         if _declarations.get(self.zid) is self:
             del _declarations[self.zid]
         self._stop.set()
         self._token.undeclare()
+        self._server.join(JOIN_S)
+        if self._server.is_alive():
+            logging.getLogger("xblick").warning(f"the declaration's thread of session {self.zid} did not end within "
+                                                f"{JOIN_S:g} s: its queryable is left to the session's close")
+            return
         self._queryable.undeclare()
-        self._server.join(1.0)
 
 
 def of(session) -> Declaration | None:

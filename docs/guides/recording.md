@@ -68,8 +68,9 @@ answers "ready", and `stop` answers with the counts and the check. A refused com
 recorder <command>` and `recording.request(...)` in Python use this. A command sent from Python (`recording.request`,
 `send_command`) or with `xblick recorder` goes out once, and only after the node's status had exactly one answer and
 no late answer: a best-effort check of two nodes of one name. The command names the node that answered and carries a
-deadline. The node refuses a command meant for another node, and one whose deadline had passed when the command was
-about to start ([Node and deadline](../reference/python-api.md#node-and-deadline)). A put on the control key, as
+deadline. The node refuses a command meant for another node when it arrives. It refuses a command whose deadline
+has passed just before the command acts, inside its locks. A `play` builds its new playback after that check, which
+can take longer than the deadline ([Node and deadline](../reference/python-api.md#node-and-deadline)). A put on the control key, as
 before 0.5.2, is still taken, but nothing checks it, and a put from a session just opened can be lost.
 
 The node does not record while it plays, because it would record its own playback. It refuses such a command and

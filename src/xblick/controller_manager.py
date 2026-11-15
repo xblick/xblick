@@ -33,13 +33,13 @@ manager to become known, then up to C + max(0.5, C) + 1 s for the reply). ``swit
 C = 2 + 5 s): up to 5 s + 7 s + 15 s = 27 s; a few ms when the manager answers at once. A manager whose read takes
 longer than T gets nothing ("not sent"); before 0.5.2 the command went out. This fails safe.
 
-Node and deadline (0.5.13): when the read's answer comes from a receiver of 0.5.13 or later (it names its session
-and its clock), the command names that node and carries a deadline, the time the caller stops waiting. A receiver
-that checks them (the robot's software has to; ``session.CommandQuery``) executes the command only if it is that
-node and only before the deadline, so that after a NoAnswer it no longer begins it. An older receiver, or one that
-does not check, executes it as before: when it gets it, also after the caller gave up (NoAnswer). The caller cannot
-tell which before it has an answer (``ControllerManager.last_checked`` afterwards). Check the robot's state before
-acting on a NoAnswer.
+Node and deadline: when the read's answer names its session and its clock (``session.answer_attachment``), the
+command names that node and carries a deadline, the time the caller stops waiting. Only a manager or controller
+whose own code checks them (``session.CommandQuery``, C++ ``xblick::CommandQuery``) refuses a command meant for
+another node or one past its deadline; no manager or torque-step server in this repository does, they belong to the
+robot's software. Any other receiver executes the command as before: when it gets it, also after the caller gave up
+(NoAnswer). The caller cannot tell which before it has an answer (``ControllerManager.last_checked`` afterwards).
+Check the robot's state before acting on a NoAnswer.
 """
 
 from __future__ import annotations
@@ -183,12 +183,13 @@ def torque_step(session: zenoh.Session, key: str, joint: str, torque: float, dur
     Not sent unless exactly one controller answers a read of its parameters (``<key>/list_parameters``; every
     controller offers parameters) and none answers it late. Best effort: the read counts the controller's parameter
     servers, not its torque_step servers, so a second torque_step server without parameters (an older bridge), one
-    that drops the read, or one that starts after it still gets the step (a torque_step server of 0.5.13 or later in
-    another session refuses it: the step names the session that answered the read). ``timeout`` [s]: how long to wait
-    for the controller to become known and then for its answer; the step's deadline (module docstring) is the end of
-    that answer's wait. Expired: refused as past its deadline, not executed. NoAnswer: sent once, no answer within
-    ``timeout``; a controller that does not check the deadline may still execute the step later, and it was not sent
-    again."""
+    that drops the read, or one that starts after it still gets the step (a torque_step server that checks the node,
+    ``session.CommandQuery``, refuses it when it runs in another session than the one that answered the read).
+    ``timeout`` [s]: how long to wait for the controller to become known and then for its answer; the step's deadline
+    (module docstring) is the end of that answer's wait. Expired: refused as past its deadline, not executed.
+    NoAnswer: sent once, no answer within ``timeout``; it may still be executed unless the torque_step server checks
+    the deadline, which this program cannot tell (a controller's parameters that answer the read with the attachment
+    do not make its torque_step server check), and it was not sent again."""
     from .msg import ListParametersRequest
 
     key = topics.check_name(key.strip('/'))

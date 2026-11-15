@@ -159,8 +159,8 @@ namespace xblick
             Reader read;
         };
         ParameterValue current(const Declared& d) const;
-        // `gate`: called just before the first change (a command's CommandQuery::check), after everything that may
-        // take time but changes nothing; its CommandRefused leaves everything as it was
+        // `gate`: called just before the first change (a command's CommandQuery::check_deadline), after everything
+        // that may take time but changes nothing; its CommandRefused leaves everything as it was
         std::vector<SetParametersResult> set_all(const std::vector<Parameter>& parameters, bool atomic, bool local,
                                                  const std::function<void()>& gate = {});
         std::optional<std::string> refusal(const Parameter& p, bool local) const;
@@ -182,7 +182,7 @@ namespace xblick
 
     // Another node's parameters over Zenoh (key: its <namespace>/<name>): each call queries <key>/<service>; throws
     // if none or several answer within the timeout, or the node replies an error. A set goes to the node that
-    // answered the read before it, with a deadline when that node is of 0.5.13 or later (Python's ParameterClient);
+    // answered the read before it, with a deadline when that node takes part (Python's ParameterClient);
     // last_checked(): the node of the last set said that it checked node and deadline before applying it.
     class ParameterClient
     {

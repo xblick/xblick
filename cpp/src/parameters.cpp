@@ -1217,18 +1217,20 @@ namespace xblick
 
     void Parameters::answer(const std::string& service, const zenoh::Query& query)
     {
-        // a set (a command) checked first (CommandQuery: the node it is meant for, its deadline), just before its
-        // first change (set_all); every reply names this node and its clock (answer_attachment), so that a sender of
-        // 0.5.13 can address a command to it
+        // a set (a command) is checked twice (CommandQuery): the node it is meant for on receipt, before anything
+        // else, so that a node it is not meant for never answers in its own name; the deadline just before its first
+        // change (set_all). Every reply names this node and its clock (answer_attachment), so that a sender can
+        // address a command to it. Whatever the query holds, it gets a reply.
         const bool is_set = service == p::kSetParameters or service == p::kSetParametersAtomically;
         std::optional<CommandQuery> received;
-        if (is_set)
-        {
-            received.emplace(query, zid_, key_ + "/" + service);
-        }
-        const std::function<void()> gate = [&] { received->check(); };
+        const std::function<void()> gate = [&] { received->check_deadline(); };
         try
         {
+            if (is_set)
+            {
+                received.emplace(query, zid_, key_ + "/" + service);
+                received->check_node();
+            }
             std::vector<std::uint8_t> request;
             if (const auto payload = query.get_payload())
             {
@@ -1287,6 +1289,10 @@ namespace xblick
         {
             query.reply_err(zenoh::Bytes(name_ + "/" + service + ": " + e.what()));
         }
+        catch (...)
+        {
+            query.reply_err(zenoh::Bytes(name_ + "/" + service + ": an unknown error"));
+        }
     }
 
     // ------------------------------------------------------------------------------------------------ the client
@@ -1316,7 +1322,8 @@ namespace xblick
             const std::string list_key = key_ + "/" + std::string(p::kListParameters);
             std::size_t answered = 0;
             bool still_open = false;
-            const std::vector<zenoh::Reply> read = ask(session_, list_key, timeout, ListParametersRequest{}.serialize());
+            const std::vector<zenoh::Reply> read =
+                ask(session_, list_key, timeout, ListParametersRequest{}.serialize());
             const std::int64_t answered_ns = command_clock_ns();
             const zenoh::Reply* answer = nullptr;
             for (const auto& reply : read)
@@ -1405,9 +1412,9 @@ namespace xblick
                                          "): a second node may still execute it; not sent again");
                 }
                 throw NoAnswer(to ? key + ": sent once with a deadline, no answer within " + ms + " ms: it may have "
-                                          "been executed; a receiver that checks the deadline (xblick 0.5.13 or "
-                                          "later) no longer begins it, one that does not may still execute it; not "
-                                          "sent again" + refused_by_others
+                                          "been executed, and it may still be executed unless its receiver checks "
+                                          "the deadline, which this program cannot tell; not sent again" +
+                                          refused_by_others
                                   : key + ": sent once, no answer within " + ms +
                                         " ms: it may still be executed; not sent again" + refused_by_others);
             }
@@ -1421,9 +1428,11 @@ namespace xblick
             {
                 throw SeveralExecuted(
                     expired_texts.empty()
-                        ? key + ": sent, and " + std::to_string(ok.size()) + " nodes answered: each of them executed it" +
+                        ? key + ": sent, and " + std::to_string(ok.size()) +
+                              " nodes answered: each of them executed it" +
                               refused_by_others + "; not sent again (one key, one node)"
-                        : key + ": sent, and " + std::to_string(ok.size() + expired_texts.size()) + " nodes answered: " +
+                        : key + ": sent, and " + std::to_string(ok.size() + expired_texts.size()) +
+                              " nodes answered: " +
                               std::to_string(ok.size()) + " executed it and " + std::to_string(expired_texts.size()) +
                               " refused it as expired" + refused_by_others + "; not sent again (one key, one node)");
             }

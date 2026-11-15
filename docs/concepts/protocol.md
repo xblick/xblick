@@ -112,12 +112,25 @@ The caller then puts this attachment on the command's query:
 | `node` | the Zenoh id of the session that the command is meant for |
 | `deadline_ns` | the moment at which the caller stops waiting for the answer, on the receiver's `CLOCK_BOOTTIME` |
 
-A receiver refuses a command with an error reply. Its encoding names the case: `text/plain;xblick-not-target` for a
-command meant for another node, and `text/plain;xblick-expired` for a command whose deadline has passed. A receiver
-that cannot read an attachment with the field `xblick_command` refuses the command with
-`text/plain;xblick-invalid-command`. It ignores an attachment without that field, which another program may send.
+A receiver that takes part refuses a command with an error reply. Its encoding names the case:
+`text/plain;xblick-not-target` for a command meant for another node, and `text/plain;xblick-expired` for a command
+whose deadline has passed. It checks the node when the command arrives and the deadline just before the effect.
 
-A program older than 0.5.13 sends none of these attachments and reads none. The
+These rules decide how a receiver reads an attachment, the same in Python and C++:
+
+- An attachment whose bytes do not contain `"xblick_command"` belongs to another program. The receiver ignores it.
+- Otherwise the attachment must be a JSON object in UTF-8 of at most 64 KiB, nested at most 16 deep, with
+  `xblick_command` at its top level and nothing after it. A receiver refuses anything else with
+  `text/plain;xblick-invalid-command`.
+- The known fields have fixed types: integers within int64 for `xblick_command`, `deadline_ns` and `clock_ns`,
+  strings for `node` and `zid`, and a list of strings for `checked`. `true` is no integer, and `1.0` is none either.
+- A receiver ignores unknown fields of any type. Version 1 grows by new fields. A receiver keeps answering version
+  1, because a caller sends nothing to a read answer of another version.
+- A deadline that is negative, or more than 24 h ahead of the receiver's clock, is refused as invalid.
+
+A read answer without the reply attachment means only that its receiver does not take part, whatever its version.
+The identity is the session's Zenoh id, which is random unless a Zenoh configuration sets `id`. Two programs given
+the same id count as one node. A program older than 0.5.13 sends none of these attachments and reads none. The
 [Python reference](../reference/python-api.md#node-and-deadline) explains the clocks and what the caller may claim.
 
 ## Related pages

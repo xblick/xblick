@@ -13,24 +13,25 @@ GitHub release. The rule is in [Development](docs/project/development.md#release
 
 ## 0.5.13
 
-A command names the node it is meant for and carries the deadline at which its caller stops waiting, and receivers of 0.5.13 refuse it when it is meant for another node or late.
+A command names the node it is meant for and carries the deadline at which its caller stops waiting; Durchblick's parameter servers and record and play node refuse it when it is meant for another node or late.
 
 ### Fixed
-- **A parameter set or a record and play command whose deadline has passed when the node comes to execute it is refused, so that a busy node no longer executes it after the caller's `NoAnswer`; the caller raises `Expired` (#1) ([node and deadline](docs/reference/python-api.md#node-and-deadline)).**
-- **A command names the session that answered the read before it, and a second node of 0.5.13 on the key that the read missed refuses it: only the named node executes it (#2).**
+- **A parameter set or a record and play command whose deadline has passed when the node comes to act on it is refused, so that a busy node no longer executes it after the caller's `NoAnswer`; the caller raises `Expired` (#1) ([node and deadline](docs/reference/python-api.md#node-and-deadline)).**
+- **A command names the session that answered the read before it; a second parameter server or record and play node on the key that the read missed refuses it on arrival: only the named node executes it (#2).**
+- A program's declaration no longer raises "Already mutably borrowed" in its thread when it closes (#19).
 
 ### Added
-- The deadline is converted into the receiver's clock with the clock reading in its answer to the read: the clocks of two PCs need not agree.
-- `xblick.session.CommandQuery`, `answer_attachment` and `refuse` (C++ `xblick::CommandQuery`) for receivers of commands outside Durchblick, such as a robot's controller manager or torque-step server.
+- The deadline is converted into the receiver's clock with the clock reading in its answer to the read: the clocks of two PCs need not agree, only run at the same rate.
+- `xblick.session.CommandQuery`, `answer_attachment` and `refuse` (C++ `xblick::CommandQuery`) for receivers outside Durchblick; a robot's controller manager and torque-step server check only once their code uses them.
 - `ParameterClient.last_checked` and `ControllerManager.last_checked` (C++ `ParameterClient::last_checked()`, `xblick-cpp-probe --set`: `checked`): the receiver confirmed that it checked node and deadline.
 
 ### Changed
-- `NoAnswer` after a command with a deadline says that a receiver which checks the deadline no longer begins the command.
+- `NoAnswer` after a command with a deadline says that the command may still be executed unless its receiver checks the deadline, which the caller cannot tell.
 
 ### Known limit
-- A receiver that does not check, because it is older than 0.5.13 or its own code does not use `CommandQuery`, executes a command as before, also after `NoAnswer`. The caller learns whether the receiver checked only from its answer.
+- A receiver whose code does not check, older or not, executes a command as before, also after `NoAnswer`; a `play` builds its new playback after the check, which can take longer than the deadline.
 
-Works with programs of 0.5.0 and later: node and deadline travel in attachments that older programs ignore, and a command to an older receiver carries none.
+Works with programs of 0.5.0 and later: node and deadline travel in attachments that older programs ignore, and a command to a receiver that does not announce the check carries none.
 
 ## 0.5.12
 

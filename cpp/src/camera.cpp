@@ -1234,33 +1234,13 @@ namespace xblick
 
     namespace
     {
-        // A query's or reply's attachment as a command's JSON object (with kCommandField); empty for none or for
-        // another program's attachment. `unreadable`: set when it names kCommandField but is no JSON this parser
-        // reads (so that it is refused, not taken as another program's).
-        std::optional<json::Object> command_record(const std::optional<std::reference_wrapper<const zenoh::Bytes>>& a,
-                                                   bool* unreadable = nullptr)
+        CommandAttachment attachment_of(const std::optional<std::reference_wrapper<const zenoh::Bytes>>& a)
         {
             if (not a)
             {
-                return std::nullopt;
+                return CommandAttachment{};
             }
-            const std::string text = a->get().as_string();
-            try
-            {
-                json::Object o = json::parse(text);
-                if (o.count(std::string(p::kCommandField)))
-                {
-                    return o;
-                }
-            }
-            catch (const std::exception&)
-            {
-                if (unreadable and text.find("\"" + std::string(p::kCommandField) + "\"") != std::string::npos)
-                {
-                    *unreadable = true;
-                }
-            }
-            return std::nullopt;
+            return parse_command_attachment(a->get().as_string());
         }
 
         std::string error_schema(const zenoh::Reply& reply)
@@ -1287,7 +1267,20 @@ namespace xblick
 
     std::int64_t CommandTarget::deadline_ns(std::chrono::milliseconds timeout) const
     {
-        return command_clock_ns() + std::chrono::duration_cast<std::chrono::nanoseconds>(timeout).count() + offset_ns;
+        const std::int64_t budget = std::chrono::duration_cast<std::chrono::nanoseconds>(timeout).count();
+        if (budget < 0 or budget > p::kCommandMaxAheadNs)
+        {
+            throw std::invalid_argument("a command's timeout is between 0 and 24 h (a receiver refuses a deadline "
+                                        "further ahead)");
+        }
+        std::int64_t deadline = 0;
+        if (__builtin_add_overflow(command_clock_ns(), budget, &deadline) or
+            __builtin_add_overflow(deadline, offset_ns, &deadline) or deadline < 0)
+        {
+            throw std::runtime_error("not sent: the deadline on the node of session " + node +
+                                     " is out of range (its clock reading cannot be right)");
+        }
+        return deadline;
     }
 
     std::optional<CommandTarget> target_of(const zenoh::Reply& reply, std::int64_t answered_ns)
@@ -1296,27 +1289,19 @@ namespace xblick
         {
             return std::nullopt;
         }
-        bool unreadable = false;
-        const auto record = command_record(reply.get_ok().get_attachment(), &unreadable);
-        const std::string key(reply.get_ok().get_keyexpr().as_string_view());
-        if (unreadable)
-        {
-            throw std::runtime_error("not sent: the answer of " + key + " has a " + std::string(p::kCommandField) +
-                                     " attachment this program cannot read");
-        }
-        if (not record)
+        const CommandAttachment a = attachment_of(reply.get_ok().get_attachment());
+        if (a.kind == CommandAttachment::Kind::none)
         {
             return std::nullopt;
         }
-        const auto version = json::get<std::int64_t>(*record, std::string(p::kCommandField));
-        const auto zid = json::get<std::string>(*record, "zid");
-        const auto clock = json::get<std::int64_t>(*record, "clock_ns");
-        if (version != static_cast<std::int64_t>(p::kCommandVersion) or not zid or zid->empty() or not clock)
+        if (a.kind != CommandAttachment::Kind::ours or a.version != static_cast<std::int64_t>(p::kCommandVersion) or
+            not a.zid or a.zid->empty() or not a.clock_ns or *a.clock_ns < 0 or answered_ns < 0)
         {
+            const std::string key(reply.get_ok().get_keyexpr().as_string_view());
             throw std::runtime_error("not sent: the answer of " + key + " has a " + std::string(p::kCommandField) +
                                      " attachment this program cannot read");
         }
-        return CommandTarget{*zid, *clock - answered_ns};
+        return CommandTarget{*a.zid, *a.clock_ns - answered_ns};  // both >= 0: no overflow
     }
 
     std::vector<zenoh::Reply> ask_once(const zenoh::Session& session, const std::string& selector,
@@ -1367,12 +1352,13 @@ namespace xblick
         {
             return false;
         }
-        const auto record = command_record(reply.get_ok().get_attachment());
-        if (not record or json::get<std::string>(*record, "zid") != to->node)
+        const CommandAttachment a = attachment_of(reply.get_ok().get_attachment());
+        if (a.kind != CommandAttachment::Kind::ours or a.version != static_cast<std::int64_t>(p::kCommandVersion) or
+            a.zid != to->node or not a.checked)
         {
             return false;
         }
-        const auto list = json::get<std::vector<std::string>>(*record, "checked").value_or(std::vector<std::string>{});
+        const auto& list = *a.checked;
         return std::find(list.begin(), list.end(), "node") != list.end() and
                std::find(list.begin(), list.end(), "deadline") != list.end();
     }
@@ -1388,60 +1374,38 @@ namespace xblick
     CommandQuery::CommandQuery(const zenoh::Query& query, std::string zid, std::string what)
         : zid_(std::move(zid)), what_(std::move(what))
     {
-        bool unreadable = false;
-        const auto record = command_record(query.get_attachment(), &unreadable);
-        if (unreadable)
+        try
         {
-            invalid_ = "its " + std::string(p::kCommandField) + " attachment is no JSON this node reads";
-            return;
+            attachment_ = attachment_of(query.get_attachment());
         }
-        if (not record)
+        catch (const std::exception& e)  // no input may end a receiver: refused as unreadable
         {
-            return;
-        }
-        const auto version = json::get<std::int64_t>(*record, std::string(p::kCommandField));
-        const auto node = json::get<std::string>(*record, "node");
-        const auto deadline = json::get<std::int64_t>(*record, "deadline_ns");
-        if (version != static_cast<std::int64_t>(p::kCommandVersion))
-        {
-            invalid_ = "its " + std::string(p::kCommandField) + " attachment is of another version, this node reads " +
-                       std::to_string(p::kCommandVersion);
-        }
-        else if (not node or node->empty() or not deadline)
-        {
-            invalid_ = "its " + std::string(p::kCommandField) + " attachment has no node and deadline_ns";
-        }
-        else
-        {
-            node_ = *node;
-            deadline_ns_ = *deadline;
+            attachment_.kind = CommandAttachment::Kind::invalid;
+            attachment_.problem = std::string("its attachment cannot be read: ") + e.what();
         }
     }
 
-    void CommandQuery::check()
+    void CommandQuery::check_node()
     {
-        if (not invalid_.empty())
+        if (const auto refusal = refuse_on_receipt(attachment_, zid_))
         {
-            throw CommandRefused(std::string(p::kInvalidCommand), what_ + ": not executed: " + invalid_);
+            throw CommandRefused(refusal->schema, what_ + ": not executed" +
+                                                      (refusal->schema == p::kNotTarget ? " here: " : ": ") +
+                                                      refusal->reason);
         }
-        if (node_.empty())
+    }
+
+    void CommandQuery::check_deadline()
+    {
+        check_node();  // cheap, and a check_deadline alone is then complete
+        if (const auto refusal = refuse_at_effect(attachment_, command_clock_ns()))
         {
-            return;
+            throw CommandRefused(refusal->schema, what_ + ": not executed: " + refusal->reason);
         }
-        if (node_ != zid_)
+        if (attachment_.kind == CommandAttachment::Kind::ours)
         {
-            throw CommandRefused(std::string(p::kNotTarget), what_ + ": not executed here: it is meant for the node of "
-                                                             "session " + node_ + ", this is " + zid_);
+            checked_ = {"node", "deadline"};
         }
-        const std::int64_t late = command_clock_ns() - deadline_ns_;
-        if (late >= 0)
-        {
-            char seconds[32];
-            std::snprintf(seconds, sizeof seconds, "%.3f", static_cast<double>(late) / 1e9);
-            throw CommandRefused(std::string(p::kExpired), what_ + ": not executed: its deadline had passed " + seconds +
-                                                           " s before this node came to execute it");
-        }
-        checked_ = {"node", "deadline"};
     }
 
     void refuse(const zenoh::Query& query, const CommandRefused& refused)

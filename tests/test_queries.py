@@ -489,8 +489,8 @@ def test_the_command_line_says_which_case_it_was(network, capsys):
         assert cli.main(["param", "--node", "t/cli/node", "--set", "x:=9.0", "--timeout", "0.5", *endpoint]) == 1
         err = capsys.readouterr().err
         assert err == ("xblick param: t/cli/node/set_parameters: sent once with a deadline, no answer within 0.5 s: it "
-                       "may have been executed; a receiver that checks the deadline (xblick 0.5.13 or later) no longer "
-                       "begins it, one that does not may still execute it; not sent again\n"), err
+                       "may have been executed, and it may still be executed unless its receiver checks the deadline, "
+                       "which this program cannot tell; not sent again\n"), err
         assert cli.main(["param", "--node", "t/twin/node", "--set", "x:=1.0", *endpoint]) == 1
         err = capsys.readouterr().err
         assert err.startswith("xblick param: ") and "2 nodes answer" in err and err.count("\n") == 1, err
@@ -810,7 +810,7 @@ def test_a_receiver_checks_node_then_deadline():
 
     def check(attachment, zid="me"):
         q = zs.CommandQuery(Query(attachment), zid, "t/k")
-        q.check()
+        q.check_deadline()
         return q.checked
 
     later = zs.command_clock_ns() + 10**10
@@ -821,10 +821,10 @@ def test_a_receiver_checks_node_then_deadline():
              ({zs.COMMAND_FIELD: 1, "node": "me", "deadline_ns": zs.command_clock_ns() - 1}, zs.EXPIRED,
               "t/k: not executed: its deadline had passed 0.0"),
              ({zs.COMMAND_FIELD: 2, "node": "me", "deadline_ns": later}, zs.INVALID_COMMAND,
-              "t/k: not executed: its xblick_command attachment is of version 2"),
+              "t/k: not executed: its xblick_command attachment is not of version 1"),
              ({zs.COMMAND_FIELD: 1, "node": "me"}, zs.INVALID_COMMAND, "t/k: not executed: its xblick_command"),
              (b'{"xblick_command": 1, "node": "me", "deadline', zs.INVALID_COMMAND,
-              "t/k: not executed: its xblick_command attachment is no JSON this node reads")]
+              "t/k: not executed: its xblick_command attachment is no valid JSON")]
     for record, schema, text in cases:
         with pytest.raises(zs.CommandRefused) as refused:
             check(record if isinstance(record, bytes) else json.dumps(record).encode())
@@ -979,8 +979,9 @@ def test_a_busy_node_does_not_execute_a_set_after_the_sender_gave_up(network, ca
             knows_all(s, "t/late/node/list_parameters", 1)
             armed.set()
             with pytest.raises(NoAnswer, match="t/late/node/set_parameters: sent once with a deadline, no answer "
-                                               "within 0.5 s: it may have been executed; a receiver that checks the "
-                                               "deadline"):
+                                               "within 0.5 s: it may have been executed, and it may still be "
+                                               "executed unless its receiver checks the deadline, which this program "
+                                               "cannot tell"):
                 ParameterClient(s, "t/late/node", 0.5).set({"x": 1.0})
             assert entered.is_set()  # the node had the set before the sender gave up
             armed.clear()
@@ -1095,7 +1096,7 @@ def test_a_cpp_set_with_node_and_deadline(network, case):
         def second(query):
             received = zs.CommandQuery(query, zid, f"t/cpp13/node/{SET}")
             try:
-                received.check()
+                received.check_deadline()
             except zs.CommandRefused as refused:
                 seen.append(refused.schema)
                 zs.refuse(query, refused)
@@ -1131,3 +1132,314 @@ def test_a_cpp_set_with_node_and_deadline(network, case):
         for q in extra:
             q.undeclare()
         params.close()
+
+
+# ------------------------------------------------------------ commands: malformed input, robot-path receivers
+# What the review of 0.5.13 asked for: one table of attachments through the Python and the C++ rules, no input that
+# ends a server or leaves a query without a reply, the node checked on receipt, the recorder's deadline inside its
+# locks, and stand-in servers for a robot's controller manager and torque step that use the receiver functions as a
+# bridge must (session.CommandQuery, answer_attachment, refuse).
+
+NOW = 10**15  # a command clock reading for the table (ns)
+
+
+def attachment_table() -> list[tuple[str, bytes, str, str]]:
+    """(name, bytes, refused on receipt, refused at the effect) of attachments, for the zid "me" at NOW."""
+    def obj(**fields):
+        return json.dumps({zs.COMMAND_FIELD: 1, **fields}).encode()
+
+    good = dict(node="me", deadline_ns=NOW + 10**9)
+    nested = '{"a": ' * 15 + "1" + "}" * 15
+    INV, N = zs.INVALID_COMMAND, ""
+    return [
+        ("none", b"", N, N), ("binary", b"\x00\x01binary", N, N), ("another program's JSON", b'{"seq": 1}', N, N),
+        ("escaped key: not ours", b'{"xblick\\u005fcommand": 1, "node": "x", "deadline_ns": 1}', N, N),
+        ("valid", obj(**good), N, N),
+        ("past", obj(node="me", deadline_ns=NOW - 1), N, zs.EXPIRED),
+        ("exactly now", obj(node="me", deadline_ns=NOW), N, zs.EXPIRED),
+        ("INT64_MIN", obj(node="me", deadline_ns=-2**63), INV, N),
+        ("negative", obj(node="me", deadline_ns=-1), INV, N),
+        ("INT64_MAX: too far ahead", obj(node="me", deadline_ns=2**63 - 1), N, INV),
+        ("24 h ahead", obj(node="me", deadline_ns=NOW + 86400 * 10**9), N, N),
+        ("24 h + 1 ns ahead", obj(node="me", deadline_ns=NOW + 86400 * 10**9 + 1), N, INV),
+        ("2^63: no int64", obj(node="me", deadline_ns=2**63), INV, N),
+        ("float deadline", obj(node="me", deadline_ns=1.5e15), INV, N),
+        ("deadline as text", obj(node="me", deadline_ns=str(NOW + 10**9)), INV, N),
+        ("version true", json.dumps({zs.COMMAND_FIELD: True, **good}).encode(), INV, N),
+        ("version 2", json.dumps({zs.COMMAND_FIELD: 2, **good}).encode(), INV, N),
+        ("version 1.0", ('{"xblick_command": 1.0, "node": "me", "deadline_ns": %d}' % (NOW + 10**9)).encode(), INV, N),
+        ("version text", json.dumps({zs.COMMAND_FIELD: "1", **good}).encode(), INV, N),
+        ("other node", obj(node="other", deadline_ns=NOW + 10**9), zs.NOT_TARGET, N),
+        ("other node, past", obj(node="other", deadline_ns=NOW - 1), zs.NOT_TARGET, N),
+        ("no node", obj(deadline_ns=NOW + 10**9), INV, N),
+        ("empty node", obj(node="", deadline_ns=NOW + 10**9), INV, N),
+        ("trailing garbage", obj(**good) + b"garbage", INV, N),
+        ("trailing whitespace", obj(**good) + b" \n\t\r", N, N),
+        ("unknown nested fields", json.dumps({zs.COMMAND_FIELD: 1, **good, "meta": {"a": [1, {"b": None}, 2.5],
+                                                                                 "c": True}}).encode(), N, N),
+        ("unknown fields of every kind", obj(**good, f=1.5, b=False, n=None, s="x", big=10**30, e=[]), N, N),
+        ("depth 16", ('{"xblick_command": 1, "node": "me", "deadline_ns": %d, "x": %s}'
+                      % (NOW + 10**9, nested)).encode(), N, N),
+        ("depth 17", ('{"xblick_command": 1, "node": "me", "deadline_ns": %d, "x": {"a": %s}}'
+                      % (NOW + 10**9, nested)).encode(), INV, N),
+        ("deep nesting (the review's)", b'{"xblick_command": 1, "x": ' + b"[" * 100000 + b"]" * 100000 + b"}", INV, N),
+        ("a 4400-digit integer", obj(**good, x=0)[:-2] + b"9" * 4400 + b"}", N, N),
+        ("longer than 64 KiB", obj(**good, pad="x" * 70000), INV, N),
+        ("no UTF-8", obj(**good)[:-1] + b', "s": "\xff"}', INV, N),
+        ("BOM", b"\xef\xbb\xbf" + obj(**good), INV, N),
+        ("a list", b'["xblick_command", 1]', INV, N),
+        ("field below the top level", b'{"a": {"xblick_command": 1}}', INV, N),
+        ("NaN", obj(**good)[:-1] + b', "x": NaN}', INV, N),
+        ("leading zero", ('{"xblick_command": 1, "node": "me", "deadline_ns": 0%d}' % (NOW + 10**9)).encode(), INV, N),
+        ("bad escape", b'{"xblick_command": 1, "node": "m\\x"}', INV, N),
+        ("control character in a string", obj(**good)[:-1] + b', "s": "a\x01b"}', N, N),
+        ("duplicate: last true",
+         b'{"xblick_command": 1, "xblick_command": true, "node": "me", "deadline_ns": 1}', INV, N),
+        ("duplicate: last 1", ('{"xblick_command": true, "xblick_command": 1, "node": "me", "deadline_ns": %d}'
+                               % (NOW + 10**9)).encode(), N, N),
+        ("truncated", obj(**good)[:-3], INV, N),
+        ("a reply's attachment", json.dumps({zs.COMMAND_FIELD: 1, "zid": "z", "clock_ns": 5,
+                                             "checked": ["node", "deadline"]}).encode(), INV, N),
+        ("checked of numbers", json.dumps({zs.COMMAND_FIELD: 1, "zid": "z", "clock_ns": 5,
+                                           "checked": [1]}).encode(), INV, N),
+    ]
+
+
+def python_reading(data: bytes, zid: str, now: int) -> tuple:
+    import zenoh
+
+    kind, problem, fields = zs._parse_attachment(zenoh.ZBytes(data))
+    receipt = zs.refuse_on_receipt(kind, problem, fields, zid)
+    effect = zs.refuse_at_effect(kind, fields, now) if receipt is None else None
+    return (kind, *(fields.get(k) for k in ("version", "node", "deadline_ns", "zid", "clock_ns", "checked")),
+            receipt[0] if receipt else "", effect[0] if effect else "")
+
+
+@pytest.mark.parametrize("name,data,receipt,effect", attachment_table(), ids=[c[0] for c in attachment_table()])
+def test_python_and_cpp_read_an_attachment_alike(name, data, receipt, effect):
+    """One table of attachments through session.py's rules and C++'s (command.hpp, through xblick._core): the same
+    kind, the same known fields, the same refusals, and the refusals expected."""
+    from xblick import _core
+
+    py = python_reading(data, "me", NOW)
+    cpp = tuple(_core.command_attachment(data, "me", NOW))
+    assert py == cpp, f"{name}: Python {py}, C++ {cpp}"
+    assert (py[7], py[8]) == (receipt, effect), f"{name}: {py}"
+
+
+def test_the_sender_refuses_absurd_deadlines():
+    """A target whose clock reading puts the deadline out of int64 is not sent to; a timeout above 24 h is refused."""
+    with pytest.raises(RuntimeError, match="not sent: the deadline on the node of session z is out of range"):
+        CommandTarget("z", 2**63 - 1).deadline_ns(1.0)
+    with pytest.raises(RuntimeError, match="not sent: the deadline on the node of session z is out of range"):
+        CommandTarget("z", -2**63).deadline_ns(1.0)
+    with pytest.raises(ValueError, match="a command's timeout is between 0 and 24 h"):
+        CommandTarget("z", 0).deadline_ns(86401.0)
+
+
+MALFORMED = [b'{"xblick_command": 1, "x": ' + b"[" * 100000 + b"]" * 100000 + b"}",
+             b'{"xblick_command": 1, "node": "x", "deadline_ns": ' + b"9" * 30 + b"}",
+             b'{"xblick_command": tru', b'"xblick_command"\xff\xfe']
+
+
+@pytest.mark.parametrize("server", ["parameters", "recorder"])
+def test_no_attachment_ends_a_server(network, server, tmp_path):
+    """Malformed attachments (the review's deep nesting among them) on a command: each gets the error reply
+    "xblick-invalid-command", nothing is executed, and the server answers afterwards as before (its thread alive)."""
+    writes = []
+    if server == "parameters":
+        from xblick.parameters import ParameterClient, Parameters
+
+        node = Parameters(network.server, "node", "t/bad")
+        node.declare("x", 0.0, write=writes.append)
+        read_key, key, payload = "t/bad/node/list_parameters", f"t/bad/node/{SET}", set_request("x", 1.0)
+    else:
+        node = recording.Recorder(network.server, tmp_path, name="bad")
+        read_key, key, payload = "xblick/bad/status", "xblick/bad/control", json.dumps({"command": "record"})
+    try:
+        with network.new_session() as s:
+            knows_all(s, read_key, 1)
+            for attachment in MALFORMED:
+                (reply,) = replies(s, key, 5.0, payload=payload, attachment=attachment)
+                assert reply.err is not None and zs._schema(reply) == zs.INVALID_COMMAND, reply
+                assert "not executed" in reply.err.payload.to_string()
+            if server == "parameters":
+                assert node._server.is_alive()
+                assert ParameterClient(s, "t/bad/node", 2.0).get(["x"])[0].value() == 0.0 and writes == []
+            else:
+                assert recording.query_status(s, "bad")["state"] == "idle"
+        assert list(tmp_path.iterdir()) == []
+    finally:
+        node.close()
+
+
+def test_a_node_the_set_is_not_meant_for_refuses_before_its_own_checks(network):
+    """The review's case: a set meant for another node reaches a node whose own checks would answer it (an atomic set
+    with a value out of range, a reader that fails). That node refuses it as not meant for it, on receipt: the caller
+    gets NoAnswer naming one refusal, never that node's answer in the named node's place."""
+    from xblick.msg import Parameter, ParameterValue, SetParametersAtomicallyRequest
+    from xblick.parameters import Parameters
+
+    def failing():
+        raise OSError("the device is gone")
+
+    params = Parameters(network.server, "node", "t/s1")
+    params.declare("x", 0.0, range=(0.0, 1.0))
+    params.declare("y", 0.0, read=lambda: 0.0)
+    try:
+        with network.new_session() as s:
+            knows_all(s, "t/s1/node/list_parameters", 1)
+            params._declared["y"].read = failing  # its reader fails from now on (set_parameters reads every value)
+            elsewhere = CommandTarget("0" * 32, 0)
+            atomic = bytes(SetParametersAtomicallyRequest([Parameter("x", ParameterValue.of(5.0))]).serialize())
+            for key, payload in (("t/s1/node/set_parameters_atomically", atomic),
+                                 (f"t/s1/node/{SET}", set_request("x", 0.5)), (f"t/s1/node/{SET}", b"not cdr")):
+                with pytest.raises(NoAnswer, match="1 other node\\(s\\) refused it as not meant for them"):
+                    command(s, key, 1.0, elsewhere, payload=payload)
+        assert params._declared["x"].value.value() == 0.0
+    finally:
+        params.close()
+
+
+def test_the_recorder_checks_the_deadline_inside_its_lock(network, tmp_path):
+    """The recorder's deadline check comes after the waits before an effect: a record held up by the recorder's lock
+    until the caller gave up (NoAnswer) is refused once it gets the lock, and nothing is recorded."""
+    rec = recording.Recorder(network.server, tmp_path, name="lk")
+    try:
+        with network.new_session() as s:
+            knows_all(s, "xblick/lk/status", 1)
+            to = one_node(s, "xblick/lk/status", 2.0)  # the read before (its status also takes the lock)
+            with rec._lock:  # what a record waits for
+                with pytest.raises(NoAnswer, match="sent once with a deadline"):
+                    command(s, "xblick/lk/control", 0.5, to, payload=json.dumps({"command": "record"}))
+            end = time.monotonic() + 10
+            while rec.refused is None:
+                assert time.monotonic() < end, "the record was never handled"
+                time.sleep(0.02)
+            assert "its deadline had passed" in rec.refused and rec.state == "idle"
+        assert list(tmp_path.iterdir()) == []
+    finally:
+        rec.close()
+
+
+def test_the_recorder_refuses_a_command_meant_for_another_node(network, tmp_path):
+    rec = recording.Recorder(network.server, tmp_path, name="nt")
+    try:
+        with network.new_session() as s:
+            knows_all(s, "xblick/nt/status", 1)
+            with pytest.raises(NoAnswer, match="1 other node\\(s\\) refused it as not meant for them"):
+                command(s, "xblick/nt/control", 1.0, CommandTarget("0" * 32, 0),
+                        payload=json.dumps({"command": "record"}))
+            assert recording.query_status(s, "nt")["state"] == "idle"
+        assert list(tmp_path.iterdir()) == []
+    finally:
+        rec.close()
+
+
+class StandInRobot:
+    """A robot's controller manager and one controller (``robot/controller/arms``), each service in one session, the
+    way a bridge must serve them: reads answered with answer_attachment, commands checked with CommandQuery (the node
+    on receipt, the deadline just before the effect), refusals sent with refuse, the work outside the callback. The
+    effect is counting the command in ``executed``; ``hold`` (an Event) holds a command before its effect."""
+
+    def __init__(self, session, list_reads: bool = True):
+        self.session, self.zid = session, node_id(session)
+        self.executed: list[str] = []
+        self.refused: list[str] = []
+        self.handled = threading.Event()
+        self.hold: threading.Event | None = None
+        self._queryables = []
+        if list_reads:
+            self._read(f"{M}/list_controllers", bytes(ListControllersResponse([STATE]).serialize()))
+            self._read("robot/controller/arms/list_parameters",
+                       bytes(ListParametersResponse(["level"], []).serialize()))
+        for key, answer in ((f"{M}/switch_controller", SwitchControllerResponse(True, "switched")),
+                            (f"{M}/create_controller", CreateControllerResponse(True, "")),
+                            ("robot/controller/arms/torque_step", TorqueStepResponse(True, ""))):
+            self._command(key, bytes(answer.serialize()))
+
+    def _read(self, key, payload):
+        self._queryables.append(self.session.declare_queryable(key, lambda q: q.reply(
+            q.key_expr, payload, attachment=zs.answer_attachment(self.zid))))
+
+    def _command(self, key, payload):
+        def work(query):
+            try:
+                received = zs.CommandQuery(query, self.zid, key)
+                received.check_node()
+                if self.hold is not None:
+                    self.hold.wait(10.0)
+                received.check_deadline()
+                self.executed.append(key)
+                query.reply(query.key_expr, payload, attachment=zs.answer_attachment(self.zid, received.checked))
+            except zs.CommandRefused as refused:
+                self.refused.append(refused.schema)
+                zs.refuse(query, refused)
+            finally:
+                query.drop()
+                self.handled.set()
+
+        self._queryables.append(self.session.declare_queryable(
+            key, lambda q: threading.Thread(target=work, args=(q,), daemon=True).start()))
+
+    def close(self):
+        for q in self._queryables:
+            q.undeclare()
+
+
+def test_a_stand_in_robot_checks_its_commands(network):
+    """The robot path with receivers that check: the manager confirms the check (last_checked), a torque step meant for
+    a past deadline is Expired and not executed, a switch held until the caller gave up is not executed afterwards,
+    and a second torque-step server and manager that the read cannot see (they serve no reads) refuse what is meant
+    for the first."""
+    robot = StandInRobot(network.server)
+    second = StandInRobot(network.second_server(), list_reads=False)
+    # declared last on each session: a session that reaches both has their commands' queryables too (one link per
+    # serving session, its declarations in order)
+    for server, name in ((network.server, "known"), (second.session, "second known")):
+        network.serve("t/known", server=server, name=name)
+    try:
+        with network.new_session() as s:
+            knows_all(s, "t/known", 2)
+            m = controller_manager.ControllerManager(s, "robot", timeout=2.0)
+            assert m.switch(activate=["arms"]) == "switched" and m.last_checked
+            controller_manager.torque_step(s, "robot/controller/arms", "j", 1.0, 0.1)
+            assert robot.executed == [f"{M}/switch_controller", "robot/controller/arms/torque_step"]
+            assert second.executed == [] and second.refused == [zs.NOT_TARGET, zs.NOT_TARGET]
+            to = one_node(s, "robot/controller/arms/list_parameters", 2.0)
+            with pytest.raises(Expired, match="torque_step: not executed: its deadline had passed"):
+                command(s, "robot/controller/arms/torque_step", 2.0, CommandTarget(to.node, to.offset_ns - 10**10),
+                        payload=b"x")
+            robot.hold, robot.handled = threading.Event(), threading.Event()
+            with pytest.raises(NoAnswer, match="switch_controller: sent once with a deadline"):
+                controller_manager.ControllerManager(s, "robot", timeout=0.5).switch(activate=["arms"], timeout=0.0)
+            robot.hold.set()
+            assert robot.handled.wait(10.0)
+        assert robot.executed == [f"{M}/switch_controller", "robot/controller/arms/torque_step"]
+        assert robot.refused == [zs.EXPIRED, zs.EXPIRED]
+    finally:
+        robot.close()
+        second.close()
+
+
+def test_the_declarations_thread_ends_before_its_queryable_goes(network):
+    """#19: undeclaring the declaration's queryable while its thread is in try_recv made zenoh-python raise "Already
+    mutably borrowed" in that thread. close() now ends the thread first: at the undeclare it is no longer alive."""
+    from xblick import declaration
+
+    with open_session(connect=network.endpoint, listen=["127.0.0.1:0"]) as s:
+        d = declaration.of(s)
+        real = d._queryable
+        seen = []
+
+        class Watch:  # the queryable, with a look at the thread when it is undeclared
+            def try_recv(self):
+                return real.try_recv()
+
+            def undeclare(self):
+                seen.append(d._server.is_alive())
+                real.undeclare()
+
+        d._queryable = Watch()
+        d.close()
+        assert seen == [False]

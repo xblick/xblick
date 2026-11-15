@@ -59,7 +59,7 @@ find_package(Threads REQUIRED)
 # ------------------------------------------------------------------------------------------------ core
 
 add_library(xblick_core cpp/src/ring.cpp cpp/src/cuda_ring.cpp cpp/src/rvl.cpp cpp/src/ray_cloud.cpp
-            cpp/src/rectify.cpp cpp/src/pairing.cpp cpp/src/paths.cpp)
+            cpp/src/rectify.cpp cpp/src/pairing.cpp cpp/src/paths.cpp cpp/src/command.cpp)
 add_library(xblick::core ALIAS xblick_core)
 set_target_properties(xblick_core PROPERTIES EXPORT_NAME core)
 target_include_directories(xblick_core

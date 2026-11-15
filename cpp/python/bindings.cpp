@@ -13,6 +13,7 @@
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
 
+#include "xblick/command.hpp"
 #include "xblick/cuda_ring.hpp"
 #include "xblick/pairing.hpp"
 #include "xblick/paths.hpp"
@@ -154,6 +155,27 @@ NB_MODULE(_core, m)
               std::memcpy(y.data(), map.y.data(), n * 4);
           }, "width"_a, "height"_a, "k"_a, "distortion_model"_a, "d"_a, "r"_a, "p"_a, "x"_a, "y"_a,
           "writes the rectification map of the camera (rectify.hpp) into x and y (float32, height x width)");
+    // a command's attachment (command.hpp): the C++ rules, which tests compare with session.py's
+    m.def("command_attachment", [](nb::bytes data, const std::string& zid, std::int64_t now_ns) {
+              const xblick::CommandAttachment a =
+                  xblick::parse_command_attachment(std::string_view(data.c_str(), data.size()));
+              const char* kind = a.kind == xblick::CommandAttachment::Kind::none      ? "none"
+                                 : a.kind == xblick::CommandAttachment::Kind::invalid ? "invalid"
+                                                                                       : "ours";
+              std::string receipt, effect;
+              if (const auto r = xblick::refuse_on_receipt(a, zid))
+              {
+                  receipt = r->schema;
+              }
+              else if (const auto e = xblick::refuse_at_effect(a, now_ns))
+              {
+                  effect = e->schema;
+              }
+              return nb::make_tuple(std::string(kind), a.version, a.node, a.deadline_ns, a.zid, a.clock_ns, a.checked,
+                                    receipt, effect);
+          }, "data"_a, "zid"_a, "now_ns"_a,
+          "(kind, version, node, deadline_ns, zid, clock_ns, checked, refused on receipt, refused at the effect) of "
+          "a command's attachment by command.hpp's rules, for the tests");
     // pairing by stamp (pairing.hpp): history.PartnerHistory pairs with these
     m.attr("PAIR_MAX_OFFSET_NS") = xblick::kPairMaxOffsetNs;
     m.def("partner_period_ns", &xblick::partner_period_ns, "kept"_a,

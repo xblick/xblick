@@ -32,9 +32,11 @@ command's reason is its ``refused``.
 While it does not record it subscribes to nothing (the publishers encode nothing for it). The control key is a
 queryable too: a command sent as a query (``request``) is answered once it took effect, with its result (JSON
 ``{"v":1,"ok":true,"command":...,"result":{...}}``, or ``"ok":false`` with ``refused`` or ``error``). Such a command
-from a sender of 0.5.13 names this node and has a deadline (session.CommandQuery): checked just before the command
-starts, refused as an error reply when it is meant for another node or late; a command that waits for another one
-(a play behind a stop) can start after its deadline. A put on the control key has neither.
+may name its node and carry a deadline (session.CommandQuery): the node is checked on receipt, the deadline just
+before the command acts, inside its locks (record: before it subscribes; play: before it ends a playback that runs;
+stop: before it ends a playback, then the recording; pause, resume, step: before the playback is told). Refused, it
+is an error reply. A play acts in two steps: building the new playback (a decoder, CUDA) comes after the check and
+can take longer than the deadline. A put on the control key has neither check.
 
 **Recording a simulation.** ``record`` with ``keys`` (a list of key expressions) subscribes to exactly those (no
 discovery), looks for their publishers and answers *ready* once it is subscribed to all of them, with the keys it
@@ -410,20 +412,25 @@ class Recorder:
         threading.Thread(target=self._command, args=(sample.payload.to_bytes(),), daemon=True).start()
 
     def _on_request(self, query: zenoh.Query):
-        payload = query.payload.to_bytes() if query.payload is not None else b""
-        received = CommandQuery(query, node_id(self.session), control_key(self.name))
-        threading.Thread(target=self._answer_request, args=(query, payload, received), daemon=True).start()
+        threading.Thread(target=self._answer_request, args=(query,), daemon=True).start()
 
-    def _answer_request(self, query: zenoh.Query, payload: bytes, received: CommandQuery):
-        """A command sent as a query: answered once it took effect (its result) or was refused; checked (node,
-        deadline) just before it starts, an error reply when refused so (session.refuse)."""
+    def _answer_request(self, query: zenoh.Query):
+        """A command sent as a query: answered once it took effect (its result) or was refused, whatever the query
+        holds. Its node checked on receipt, its deadline just before it acts (``_execute``); refused so, an error
+        reply (session.refuse)."""
         try:
             try:
-                reply = self._execute(payload, received.check)
+                received = CommandQuery(query, node_id(self.session), control_key(self.name))
+                received.check_node()
+                payload = query.payload.to_bytes() if query.payload is not None else b""
+                reply = self._execute(payload, received.check_deadline)
             except CommandRefused as refused:
                 self.refused = str(refused)
                 print(f"{self.prog}: refused: {refused}", flush=True)
                 refuse(query, refused)
+                return
+            except Exception as error:  # noqa: BLE001 - no input may leave a query without a reply
+                query.reply_err(f"{control_key(self.name)}: {type(error).__name__}: {error}")
                 return
             query.reply(control_key(self.name), json.dumps(reply), encoding=zenoh.Encoding.APPLICATION_JSON,
                         attachment=answer_attachment(received.zid, received.checked))
@@ -436,18 +443,22 @@ class Recorder:
 
     def _execute(self, payload: bytes, gate=None) -> dict:
         """Do a command: the reply of a request (REPLY_VERSION): ``ok`` and its ``result``, or why it was refused or
-        failed (also in the status and the log). ``gate``: called just before the command starts (CommandQuery.check;
-        its CommandRefused goes to the caller)."""
+        failed (also in the status and the log). ``gate``: called just before the command acts, inside its locks
+        (CommandQuery.check_deadline; its CommandRefused goes to the caller)."""
         self.refused = None  # the reason of this command's refusal, if it is refused
         command = None
         try:
             command, options = parse_command(payload)
-            if gate is not None:
-                gate()
-            result = {"record": lambda: self.record(**options), "stop": self.stop,
-                      "pause": lambda: (self.pause(), self.status())[1],
-                      "resume": lambda: (self.resume(), self.status())[1],
-                      "play": lambda: self.play(**options).status(), "step": lambda: self.step(**options)}[command]()
+
+            def now():
+                if gate is not None:
+                    gate()
+
+            result = {"record": lambda: self.record(**options, _gate=now), "stop": lambda: self.stop(_gate=now),
+                      "pause": lambda: (now(), self.pause(), self.status())[2],
+                      "resume": lambda: (now(), self.resume(), self.status())[2],
+                      "play": lambda: self.play(**options, _gate=now).status(),
+                      "step": lambda: (now(), self.step(**options))[1]}[command]()
             return {"v": REPLY_VERSION, "ok": True, "command": command, "result": result}
         except RecordingError as error:
             print(f"{self.prog}: {command} failed: {error}", flush=True)
@@ -464,7 +475,7 @@ class Recorder:
     # ------------------------------------------------------------------------------------------- start, stop
 
     def record(self, keys: list[str] | None = None, blocking: bool = False, log_time: str = "receive",
-               file: str | None = None, ready_timeout: float = READY_TIMEOUT) -> dict:
+               file: str | None = None, ready_timeout: float = READY_TIMEOUT, _gate=None) -> dict:
         """Start recording (module docstring): what it finds, or exactly ``keys``, into a new file (open when this
         returns; ``file``: that one, relative to the directory or absolute, never overwritten). Returns *ready*: the
         file, the keys, the publishers found (``publishers``: blocking ones' counts; ``streams``: keys with an info
@@ -488,6 +499,8 @@ class Recorder:
                 raise FileExistsError(f"{path}: exists (a recording is never overwritten)")
             path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
+            if _gate is not None:  # a command's deadline, just before it acts (``_execute``)
+                _gate()
             if self._recording.is_set():
                 if keys is None and not blocking and file is None and log_time == "receive":
                     return self._ready
@@ -527,11 +540,11 @@ class Recorder:
                        "log_time": log_time, **ready}
         return self._ready
 
-    def stop(self) -> dict:
+    def stop(self, _gate=None) -> dict:
         """Stop what it does: recording (the file is complete when this returns; ``recording``: its numbers and,
         with keys, the check) or playing (``played``: the playback's status). A blocking recording that lost samples
         or could not be checked raises RecordingError (the file is complete all the same)."""
-        played = self._stop_playing()
+        played = self._stop_playing(_gate)
         recorded = self._stop_recording()
         return {"state": self.state, "recording": recorded, "played": played}
 
@@ -739,7 +752,7 @@ class Recorder:
 
     def play(self, files: list, rate: float = 1.0, loop: bool = False, prefix: str = "", keys: list = (),
              cuda_device: int | None = None, pace: str = "wall", clock: str | None = None,
-             streams: list | None = None, **video) -> Player:
+             streams: list | None = None, _gate=None, **video) -> Player:
         """Play ``files`` (relative to the directory, or absolute) in a thread of its own; a playback before ends.
         MCAP recordings (told by their content) play one after another (Player); videos and image sequences at once,
         one stream each (``streams``; the other options for them in ``video``: video.VideoPlayer). Refused
@@ -771,6 +784,8 @@ class Recorder:
             if not streams:
                 raise ValueError("videos need their stream bases (streams; --stream, or --camera for one video)")
         with self._play_lock:
+            if _gate is not None:  # a command's deadline, just before it acts (``_execute``)
+                _gate()
             self._stop_playing_locked()
             if is_video:
                 player = videos.VideoPlayer(self.session, given, list(streams), rate=rate, loop=loop,
@@ -830,8 +845,10 @@ class Recorder:
             raise RuntimeError(f"{command}: nothing is playing")
         return player
 
-    def _stop_playing(self) -> dict | None:
+    def _stop_playing(self, gate=None) -> dict | None:
         with self._play_lock:
+            if gate is not None:  # a command's deadline, just before it acts (``_execute``)
+                gate()
             return self._stop_playing_locked()
 
     def _stop_playing_locked(self) -> dict | None:
@@ -1018,7 +1035,7 @@ def request(session: zenoh.Session, name: str, command: str, timeout: float = 30
     sent), Expired (refused by the node: past its deadline, not executed), NoAnswer (no TimeoutError: sent once, no
     answer within ``timeout`` s; not sent again), PartlyAnswered, RuntimeError for an error reply. The command names
     the node that answered the status and has a deadline, the end of the ``timeout`` (session.ask_once), when that
-    node is of 0.5.13 or later."""
+    node takes part (its status answer names it)."""
     payload = json.dumps({"command": command, **options})
     parse_command(payload.encode())  # bad ones fail here, not in the node
     # one node of that name as far as its status shows (best effort; session.count), then once (session.command)

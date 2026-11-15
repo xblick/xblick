@@ -42,9 +42,9 @@ set. So does a second node that a session just opened has not linked to yet, bec
 serving sessions one after the other. A node whose read takes longer than the timeout gets no set ("not sent"); this fails safe.
 
 The set names the node that answered the read and carries a deadline: the moment at which the client stops waiting.
-A node of 0.5.13 or later checks both just before its first writer runs. A second node of that kind refuses a set
-that is meant for another node. The named node refuses a set whose deadline has passed, and its writers do not run.
-An older node applies every set it gets, as before. The [Python reference](python-api.md#node-and-deadline) explains
+A node on Durchblick's `Parameters` of 0.5.13 or later checks both. It refuses a set meant for another node when
+the set arrives. It refuses a set whose deadline has passed just before its first writer runs, and its writers do
+not run. An older node, or a parameter server of other code, applies every set it gets, as before. The [Python reference](python-api.md#node-and-deadline) explains
 the clocks and what the client may claim. `ParameterClient.last_checked` is true when the node of the last set
 confirmed the check.
 
