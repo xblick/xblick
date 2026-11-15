@@ -29,7 +29,7 @@ A command names the node it is meant for and carries the deadline at which its c
 - `NoAnswer` after a command with a deadline says that the command may still be executed unless its receiver checks the deadline, which the caller cannot tell.
 
 ### Known limit
-- A receiver whose code does not check, older or not, executes a command as before, also after `NoAnswer`; a `play` builds its new playback after the check, which can take longer than the deadline.
+- A receiver whose code does not check, older or not, executes a command as before, also after `NoAnswer`; a set of several parameters is checked once, before its first writer; a `play` builds its new playback after the check, which can take longer than the deadline.
 
 Works with programs of 0.5.0 and later: node and deadline travel in attachments that older programs ignore, and a command to a receiver that does not announce the check carries none.
 

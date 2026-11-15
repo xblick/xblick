@@ -1238,7 +1238,8 @@ def test_the_sender_refuses_absurd_deadlines():
         CommandTarget("z", 0).deadline_ns(86401.0)
 
 
-MALFORMED = [b'{"xblick_command": 1, "x": ' + b"[" * 100000 + b"]" * 100000 + b"}",
+MALFORMED = [b'{"xblick_command": 1, "x": ' + b"[" * 20000 + b"]" * 20000 + b"}",  # below 64 KiB: reaches the JSON parser
+             b'{"xblick_command": 1, "x": ' + b"[" * 100000 + b"]" * 100000 + b"}",  # refused by its size
              b'{"xblick_command": 1, "node": "x", "deadline_ns": ' + b"9" * 30 + b"}",
              b'{"xblick_command": tru', b'"xblick_command"\xff\xfe']
 
