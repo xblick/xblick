@@ -11,6 +11,13 @@ terminal interface (tui.py).
         ...
     network.connections()                        # (publisher, key, subscriber, its key expression)
     network.uses(key)                            # who takes a stream's representation, and how (Use)
+    network.programs = declaration.query(session)[0]   # what the programs declare (one reply each)
+    network.hops(origins)                        # each router's distance from these routers (their links)
+    network.groups(origins)                      # the sessions by router, the nearest router first
+
+Each router's record has its sessions, the other routers among them: the routers it is linked to directly, so the
+links form a mesh (``Router.links``). A router started as ``xblick router`` carries its program record as its Zenoh
+metadata (``Router.program``).
 
 The admin space is a router's: ``zenohd`` serves it (read only) by default, a session opened in peer or client mode
 does not. Without a router nothing of it answers (``Network.routers`` is empty), and the sessions are unknown.
@@ -29,6 +36,7 @@ import numpy as np
 import zenoh
 
 from . import _core, declaration, topics
+from .declaration import Program
 from .msg import Message
 from .recording import message_types
 from .camera import parse_attachment
@@ -227,10 +235,28 @@ class Node:
 
 @dataclasses.dataclass
 class Router:
+    """A router as its admin space record says: its Zenoh version, the locators it listens on, its number of sessions,
+    the routers it is linked to directly (zid -> the links' addresses, ``<its end> <-> <the other's>``) and, from its
+    metadata, its program record (``xblick router``; None for ``zenohd`` and others)."""
+
     zid: str
     version: str = ""
     locators: list[str] = dataclasses.field(default_factory=list)
     sessions: int = 0
+    links: dict[str, list[str]] = dataclasses.field(default_factory=dict)
+    program: Program | None = None
+
+    @property
+    def host(self) -> str:
+        """Its hostname from its record; for another router the first address it listens on that names a host (not
+        a loopback or unspecified one); empty when neither says."""
+        if self.program is not None and self.program.host:
+            return self.program.host
+        for locator in self.locators:
+            host = _locator(locator)[1].strip("[]")
+            if host and host not in ("0.0.0.0", "::", "localhost") and not host.startswith("127.") and host != "::1":
+                return host
+        return ""
 
 
 @dataclasses.dataclass
@@ -239,9 +265,59 @@ class Network:
 
     routers: dict[str, Router] = dataclasses.field(default_factory=dict)
     nodes: dict[str, Node] = dataclasses.field(default_factory=dict)
+    programs: dict[str, Program] = dataclasses.field(default_factory=dict)  # zid -> its declaration (declaration.py)
 
     def node(self, zid: str) -> Node:
         return self.nodes.setdefault(zid, Node(zid))
+
+    def program(self, zid: str) -> Program | None:
+        """What a session declared, or a router's metadata; None for one that declares nothing."""
+        if zid in self.programs:
+            return self.programs[zid]
+        router = self.routers.get(zid)
+        return router.program if router is not None else None
+
+    def links(self) -> set[frozenset[str]]:
+        """The links between routers that answered, each once (a router names the routers it is linked to; a link
+        to a router that did not answer counts too)."""
+        return {frozenset((r.zid, other)) for r in self.routers.values() for other in r.links if other != r.zid}
+
+    def hops(self, origins) -> dict[str, int]:
+        """Each router's distance in links from the nearest of ``origins`` (the shortest path); routers no path reaches
+        are left out."""
+        near: dict[str, set[str]] = {}
+        for a, b in (tuple(link) for link in self.links()):
+            near.setdefault(a, set()).add(b)
+            near.setdefault(b, set()).add(a)
+        out = {o: 0 for o in origins if o in self.routers}
+        todo = list(out)
+        while todo:
+            here = todo.pop(0)
+            for other in sorted(near.get(here, ())):
+                if other not in out and other in self.routers:
+                    out[other] = out[here] + 1
+                    todo.append(other)
+        return out
+
+    def groups(self, origins, leave_out=()) -> list[tuple[str | None, list[str]]]:
+        """The sessions (not the routers) by router: (router zid, its sessions' zids), the routers ordered by
+        ``hops`` from ``origins`` (those no path reaches last, then by zid), and last (None, the sessions no router
+        knows: those that only declared themselves, linked directly). A session attached to several routers stands
+        with the nearest. Sessions in ``leave_out`` are left out."""
+        hops = self.hops(origins)
+        order = sorted(self.routers, key=lambda r: (hops.get(r, len(self.routers) + 1), r))
+        rank = {r: n for n, r in enumerate(order)}
+        members: dict[str | None, list[str]] = {r: [] for r in order}
+        leave_out = set(leave_out)
+        zids = {z for z, n in self.nodes.items() if n.whatami != "router"} | (set(self.programs) - set(self.routers))
+        for zid in sorted(zids - leave_out):
+            node = self.nodes.get(zid)
+            routers = sorted((r for r in node.routers if r in rank), key=rank.get) if node is not None else []
+            members.setdefault(routers[0] if routers else None, []).append(zid)
+        out = [(r, members[r]) for r in order]
+        if members.get(None):
+            out.append((None, members[None]))
+        return out
 
     def publishers(self) -> dict[str, set[str]]:
         """Key -> the zids of its publishers."""
@@ -366,10 +442,14 @@ def query_network(session: zenoh.Session, timeout: float = 1.0) -> Network:
     for key, payload in _admin(session, "@/*/router", timeout):
         record = json.loads(payload)
         router = Router(record["zid"], record.get("version", ""), record.get("locators") or [],
-                        len(record.get("sessions") or []))
+                        len(record.get("sessions") or []), program=_router_program(record))
         network.routers[router.zid] = router
         network.node(router.zid).whatami = "router"
         for s in record.get("sessions") or []:
+            if s.get("whatami") == "router":  # a link to another router: the mesh, not a session of this one
+                router.links[s["peer"]] = [f"{link.get('src', '?')} <-> {link.get('dst', '?')}"
+                                           for link in s.get("links") or []]
+                continue
             node = network.node(s["peer"])
             node.whatami = s.get("whatami", "")
             node.routers.add(router.zid)
@@ -384,6 +464,14 @@ def query_network(session: zenoh.Session, timeout: float = 1.0) -> Network:
             for zid in zids:
                 network.node(zid).declared(kind).add(declared)
     return network
+
+
+def _router_program(record: dict) -> Program | None:
+    """The program record in a router's metadata (``xblick router``); None without one (``zenohd``)."""
+    metadata = record.get("metadata")
+    if not isinstance(metadata, dict) or metadata.get("kind") != "program":
+        return None
+    return Program.from_record(metadata, record["zid"])
 
 
 def _admin(session: zenoh.Session, selector: str, timeout: float) -> list[tuple[str, bytes]]:
