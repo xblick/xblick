@@ -48,9 +48,11 @@ If the wish needs a subscription by default, say so to the user and offer the ex
 | Module | Holds |
 | --- | --- |
 | `src/xblick/tui.py` | the app, the Topics, Nodes and Rerun tabs, the connect dialog, `Connection`, presets, the key tree (`topic_tree`), short names |
-| `src/xblick/tui_graph.py` | the Graph tab: layout (layers, order, rows, lanes, compaction) and the `GraphView` widget |
+| `src/xblick/tui_nodes.py` | the Nodes tab without widgets: rows by router (`node_rows`), column widths, names, the details |
+| `src/xblick/tui_graph.py` | the Graph tab: layout (layers, order, bands per router, rows, lanes, compaction, router links) and the `GraphView` widget (selection, moving the view) |
 | `src/xblick/tui_parameters.py` | the Parameters tab: node list, form, set, step, events |
-| `src/xblick/survey.py` | what the interface reads from the network: `Network`, `Node.label`, `uses`, `connections`, `TrafficMeter` |
+| `src/xblick/survey.py` | what the interface reads from the network: `Network` (routers, their links, `hops`, `groups`), `Node.label`, `uses`, `connections`, `TrafficMeter` |
+| `src/xblick/declaration.py` | what each program declares of itself (program, version, names, host, command): `query`, `Program` |
 | `src/xblick/session.py` | `endpoint` (what a person types as an address), opening sessions |
 
 Keep logic that needs no widget in a plain function (`topic_tree`, `short_names`, `layout`, `step_of`). It is then
@@ -125,7 +127,12 @@ Branch: <name, commit>
 - **The interface's own session is in the admin space.** Leave it out of the graph, the subscribers and `uses`
   (`leave_out=[own zid]`), or it shows itself as a consumer of everything it measures.
 - **Peers' links to each other are not in the admin space.** The interface can say how a client's data travels, not
-  a peer's.
+  a peer's. Neither are the addresses a peer listens on. A router's links to other routers are: its record's
+  sessions of kind `router`.
+- **A DataTable's auto width never shrinks.** The Nodes tab's head is one band only when every cell is as wide as
+  its column: it sets the widths itself and rebuilds the columns when they change.
+- **The made-up network of the screenshots must not show this PC.** `tools/tui_screenshots.py` makes up each
+  program's host and command line; never let a real host name or path into `docs/media/`.
 - **`COLUMNS` and `LINES` in the environment fix Textual's size.** `tui.run` removes them, because Python's readline
   sets them for child processes.
 - **A thread that calls back after the app ended raises RuntimeError.** Catch it in every `call_from_thread` of a

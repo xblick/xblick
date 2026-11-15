@@ -117,7 +117,8 @@ Reference check: `tools/check_references.sh` (no internal or robot-framework nam
 | `cpp/python/bindings.cpp` | `xblick._core` |
 | `src/xblick/camera.py`, `points.py`, `detections.py`, `session.py` | Python API: streams, sessions |
 | `src/xblick/node.py`, `history.py`, `tensors.py`, `rgbd.py`, `parameters.py` | helpers for nodes |
-| `src/xblick/cli.py`, `tui.py`, `tui_graph.py`, `rerun_bridge.py`, `recording.py`, `video.py`, `cam.py`, `v4l2.py`, `pick.py` | tools |
+| `src/xblick/declaration.py`, `cpp/src/declaration.cpp` | every program's declaration (`xblick/sessions/<zid>/program`), opened with the session |
+| `src/xblick/cli.py`, `tui.py`, `tui_nodes.py`, `tui_graph.py`, `rerun_bridge.py`, `recording.py`, `video.py`, `cam.py`, `v4l2.py`, `pick.py` | tools |
 | `src/xblick/robot.py`, `sim.py`, `controller.py`, `poses.py`, `mps.py` | robot state, simulation, controller link, poses, MPS |
 | `tests/`, `cpp/tests/` | Python and C++ tests |
 | `tools/` | `check_references.sh` (+ `reference_allowlist.txt`), `install_zenoh.sh`, `gen_msgdefs.py`, `setup_python.sh`, `tui_screenshots.py`, `release_notes.sh` |
@@ -153,7 +154,10 @@ command); weights downloaded at the start through `xblick.weights` with `--downl
 checkout, `<node>` the short name (`yolox`), former places named in `Store(former=...)` (docs/reference/files.md); a
 queryable replies and drops the query at once; drawn results only with `--overlay` (off by default, a start option):
 `<camera>/<node>/overlay`, rgb8, the colour frame's size, stamp, frame id and camera_info, results published first,
-drawn by `xblick.overlay.Overlay` only while subscribed.
+drawn by `xblick.overlay.Overlay` only while subscribed; the session from `session.open_from_args(args)`, which
+declares the program (console script name, its distribution's version, host, whole command line, pid) on the network,
+and `node.Reporter` adds `<camera>/<node>` to it (since 0.5.9: no code of its own, a node gets it with its pin
+raised). The command line is visible on the network: no secret as an argument.
 
 Same pattern in each: a uv project pinned to a version of `xblick` (`pyproject.toml`, `uv.lock`), `tools/setup.sh`
 for `.venv` and checkpoints, a console script `xblick-<name>`, outputs below `<camera>/<node>/`, diagnostics on
