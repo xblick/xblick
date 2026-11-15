@@ -417,7 +417,7 @@ def _report(s: dict, prog: str):
         print(f"{prog}: recording {s['file']}, {s['messages']} messages, {s['bytes'] / 1e6:.1f} MB, "
               f"{s['topics']} topics, {s['dropped']} dropped", flush=True)
     elif s["play"] is not None:
-        print(f"{prog}: {s['state']} at {s['play']['position_s']:.1f} s, {s['play']['sent']} messages", flush=True)
+        print(f"{prog}: {s['state']} {recording.position_text(s['play'])}, {s['play']['sent']} messages", flush=True)
     else:
         print(f"{prog}: idle", flush=True)
 

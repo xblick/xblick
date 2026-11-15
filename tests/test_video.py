@@ -267,3 +267,19 @@ def test_play_takes_a_relative_path_with_a_directory(videos, tmp_path, monkeypat
                      f"tcp/127.0.0.1:{port}"]) == 0
     out = capsys.readouterr().out
     assert f"{tmp_path / 'rec' / 'color.mp4'} -> t/rel/color" in out, out
+
+
+def test_a_looped_playback_says_its_pass(capsys):
+    """xblick play --loop of a 12 s clip, a report every 10 s: the position is within the pass, so the line names the
+    pass (issue #14: 10.0 s, 8.0 s, 6.0 s looked like a position going back)."""
+    from xblick import cli, recording
+
+    for position, passes, sent in ((10.0, 0, 300), (8.0, 1, 601), (6.0, 2, 901)):
+        cli._report({"state": "playing", "play": {"kind": "video", "position_s": position, "passes": passes,
+                                                  "loop": True, "sent": sent}}, "xblick play")
+    assert capsys.readouterr().out.splitlines() == ["xblick play: playing at 10.0 s, pass 1, 300 messages",
+                                                    "xblick play: playing at 8.0 s, pass 2, 601 messages",
+                                                    "xblick play: playing at 6.0 s, pass 3, 901 messages"]
+    # a recording's status has its length; not looped, no pass
+    assert recording.position_text({"position_s": 3.0, "duration_s": 12.0, "passes": 0, "loop": False}) == \
+        "at 3.0 s of 12.0 s"

@@ -1617,7 +1617,9 @@ def _status_line(status: dict) -> str:
     if status.get("state") == "recording":
         return f"{status.get('file')}, {status.get('messages')} messages, {status.get('dropped')} dropped"
     if status.get("play"):
-        return f"at {status['play'].get('position_s', 0):.1f} s, {status['play'].get('sent')} messages"
+        from .recording import position_text
+
+        return f"{position_text(status['play'])}, {status['play'].get('sent')} messages"
     return str(status.get("state", ""))
 
 

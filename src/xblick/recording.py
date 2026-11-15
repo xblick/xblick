@@ -139,6 +139,18 @@ def status_key(name: str) -> str:
     return topics.check_name(f"xblick/{name}/status")
 
 
+def position_text(play: dict) -> str:
+    """Where a playback is, from its status's ``play``: ``at 8.0 s of 12.0 s`` (a recording has its length; a video's
+    status has none), and looped ``, pass 2``. The position is within the pass, so a loop's goes back to 0 at each
+    pass: the pass (counted from 1) says how far it went."""
+    text = f"at {play.get('position_s', 0.0):.1f} s"
+    if play.get("duration_s"):
+        text += f" of {play['duration_s']:.1f} s"
+    if play.get("loop"):
+        text += f", pass {play.get('passes', 0) + 1}"
+    return text
+
+
 def parse_command(payload: bytes) -> tuple[str, dict]:
     """(command, its options) of a control sample: plain text, or JSON ``{"command": ..., <options>}`` (OPTIONS:
     ``record``'s, ``play``'s with ``files`` required, ``step``'s)."""
