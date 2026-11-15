@@ -42,7 +42,6 @@ import numpy as np
 from . import cam, clean, diagnostics, mps, poses, recording, rerun_bridge, router, survey, topics, view
 from . import session as zsession
 from .camera import CameraPublisher, ImageSubscriber, StaticTransformPublisher, find_streams, wait_for_info
-from .msg import CameraInfo
 from .node import end_on_signals
 from .paths import expand_path
 from .points import PointCloudSubscriber
@@ -196,16 +195,24 @@ def cuda_device_checked(args, prog: str) -> str | None:
         raise SystemExit(f"{prog}: --cuda-device {args.cuda_device}: {error}") from None
 
 
+TEST_CAMERA_VFOV = 60.0  # degrees: the pinhole of xblick test-camera without a calibration or a field of view
+
+
 def _test_camera(args) -> int:
     from .gpu import rings_text
 
     base = topics.stream_base(args.namespace, args.camera, args.stream)
     uuid = cuda_device_checked(args, "xblick test-camera")
+    from .video import VideoError, camera_info_for
+
     w, h = args.size
-    f = 0.5 * h / np.tan(np.radians(args.vfov) / 2)
     # --pose: the frame id names the body frame, the images are in its optical frame
     frame_id = args.frame_id if args.pose is None else args.frame_id + poses.OPTICAL_SUFFIX
-    info = CameraInfo.pinhole(w, h, f, f, (w - 1) / 2, (h - 1) / 2, frame_id=frame_id)
+    try:
+        info, said = camera_info_for(w, h, frame_id, args.camera_info, args.hfov, args.vfov,
+                                     assumed=("vertical", TEST_CAMERA_VFOV))
+    except (VideoError, OSError) as error:
+        raise SystemExit(f"xblick test-camera: {error}") from None
     camera = base.rpartition('/')[0]
     with zsession.open_from_args(args, prog=f"xblick {args.command}") as z:
         _say_if_alone(z, "xblick test-camera")
@@ -217,7 +224,7 @@ def _test_camera(args) -> int:
                 args.frame_id, poses.pose_from(*args.pose), time.time_ns()))
             print(f"xblick test-camera: pose on {topics.tf_static(camera)}: {topics.WORLD} -> {args.frame_id} "
                   f"({' '.join(f'{v:g}' for v in args.pose)}) -> {frame_id}, the images' frame", flush=True)
-        print(f"xblick test-camera: {w}x{h} rgb8 at {args.fps:g} Hz (Ctrl-C to stop)", flush=True)
+        print(f"xblick test-camera: {w}x{h} rgb8 at {args.fps:g} Hz (Ctrl-C to stop); {said}", flush=True)
         print(f"xblick test-camera: {rings_text(uuid, args.cuda_device)}", flush=True)
         print(f"xblick test-camera: publishing the stream {base}", flush=True)
         print(f"xblick test-camera: start a node with --camera {camera} (the camera, not the stream)", flush=True)
@@ -488,7 +495,7 @@ def _recorder(args) -> int:
             if args.command_ == "play":
                 options = {"files": args.files, "rate": args.rate, "loop": args.loop, "prefix": args.prefix,
                            "keys": args.key or [], "cuda_device": args.cuda_device, "pace": args.pace,
-                           "clock": args.clock, **_video_options(args)}
+                           "clock": args.clock, **_video_options(args, here=False)}
             elif args.command_ == "record":
                 options = {k: v for k, v in (("keys", args.key), ("blocking", args.blocking or None),
                                              ("log_time", args.log_time), ("file", args.file)) if v is not None}
@@ -537,40 +544,61 @@ def _play(args) -> int:
 
 
 def _add_video_arguments(p):
-    """xblick play's (and xblick recorder play's) options for videos and image sequences (video.py)."""
-    v = p.add_argument_group("videos", "files that are not MCAP (a video FFmpeg reads, an image directory or glob; "
-                                       "needs xblick[video]): played at once, one stream each, on one clock")
+    """xblick play's (and xblick recorder play's) options for videos and image sequences (video.py). One rule for all
+    (video.SHARED, video.PER_VIDEO): an option of a video is given once per video, in the order of the files, or once
+    for all videos (not the names and poses), or not at all; another count ends the command with one line."""
+    v = p.add_argument_group(
+        "videos", "files that are not MCAP (a video FFmpeg reads, an image directory or glob; needs xblick[video]): "
+                  "played at once, one stream each, on one clock. Each option below is given once per video, in the "
+                  "order of the files, or once for all videos (not --stream, --camera, --frame-id, --pose: once per "
+                  "video), or not at all; another count is refused")
     v.add_argument("--stream", action="append", metavar="BASE",
-                   help="the stream base of a video, e.g. cam/rc_visard/left (repeat: one per video, in their "
-                        "order)")
-    v.add_argument("--camera", default=None, help="one video: its stream is <camera>/color (instead of --stream)")
+                   help="the stream base of a video, e.g. cam/rc_visard/left (once per video)")
+    v.add_argument("--camera", action="append", default=None,
+                   help="instead of --stream: the video's stream is <camera>/color (once per video)")
     v.add_argument("--offset-ms", action="append", type=float, metavar="MS",
-                   help="a video's stamps and send times moved by this much (repeat: one per video, or none)")
+                   help="a video's stamps and send times moved by this much (default 0)")
     v.add_argument("--camera-info", action="append", metavar="FILE",
-                   help="a video's ROS calibration file, of its size (repeat: one per video, or none)")
+                   help="a video's ROS calibration file (camera_calibration's YAML), of the size it plays at; every "
+                        "field published as the file has it")
     v.add_argument("--frame-id", action="append", metavar="ID",
-                   help="a video's frame id (repeat: one per video, or none; default: the base, / as _)")
-    v.add_argument("--size", default=None, metavar="WxH", help="the frames scaled to this size")
-    v.add_argument("--scale", type=float, default=None, help="the frames scaled by this factor")
-    v.add_argument("--start", type=float, default=None, metavar="S", help="from this second of the videos")
-    v.add_argument("--end", type=float, default=None, metavar="S", help="up to this second of the videos")
-    v.add_argument("--fps", type=float, default=None,
-                   help="the frames' times from this rate, not the files' (image sequences: needed)")
-    v.add_argument("--hfov", type=float, default=None, metavar="DEG",
-                   help="without --camera-info: a pinhole of this horizontal field of view (default 60)")
-    v.add_argument("--vfov", type=float, default=None, metavar="DEG", help="... or of this vertical one")
+                   help="a video's frame id (once per video; default: the base, / as _); with --pose the body frame's")
+    v.add_argument("--pose", action="append", type=float, nargs=6, default=None,
+                   metavar=("X", "Y", "Z", "YAW", "PITCH", "ROLL"),
+                   help="a video's fixed pose in the room, as xblick cam --pose: its body frame in world (metres, "
+                        "degrees), published once on <camera>/tf_static and answered to later subscribers, the images "
+                        "then in <frame id>_optical (once per video; default: no pose)")
+    v.add_argument("--size", action="append", default=None, metavar="WxH", help="the frames scaled to this size")
+    v.add_argument("--scale", action="append", type=float, default=None, help="the frames scaled by this factor")
+    v.add_argument("--start", type=float, default=None, metavar="S", help="from this second of the videos (for all)")
+    v.add_argument("--end", type=float, default=None, metavar="S", help="up to this second of the videos (for all)")
+    v.add_argument("--fps", action="append", type=float, default=None,
+                   help="the frames' times from this rate, not the file's (image sequences: needed)")
+    v.add_argument("--hfov", action="append", type=float, default=None, metavar="DEG",
+                   help="without --camera-info: a pinhole of this horizontal field of view (with none of --camera-info, "
+                        "--hfov, --vfov: an assumed horizontal field of view of 60 degrees, said in the start line)")
+    v.add_argument("--vfov", action="append", type=float, default=None, metavar="DEG",
+                   help="... or of this vertical one")
 
 
-def _video_options(args) -> dict:
-    """The video options given (none: an empty dict, which an MCAP playback takes)."""
+def _video_options(args, here: bool = True) -> dict:
+    """The video options given (none: an empty dict, which an MCAP playback takes). ``here``: calibration files
+    relative to the working directory (xblick play), else to the node's directory (xblick recorder play)."""
     from .video import parse_size
 
     if args.camera and args.stream:
         raise SystemExit("xblick play: --camera or --stream, not both")
-    streams = [f"{args.camera}/color"] if args.camera else args.stream
-    options = {"streams": streams, "offsets_ms": args.offset_ms, "camera_infos": args.camera_info,
-               "frame_ids": args.frame_id, "size": parse_size(args.size) if args.size else None, "scale": args.scale,
-               "start": args.start, "end": args.end, "fps": args.fps, "hfov": args.hfov, "vfov": args.vfov}
+    streams = [f"{c}/color" for c in args.camera] if args.camera else args.stream
+    infos = args.camera_info
+    if infos and here:
+        infos = [str(expand_path(f).absolute()) for f in infos]
+    try:
+        sizes = [parse_size(s) for s in args.size] if args.size else None
+    except ValueError as error:
+        raise SystemExit(f"xblick play: --size: {error}") from None
+    options = {"streams": streams, "offsets_ms": args.offset_ms, "camera_infos": infos, "frame_ids": args.frame_id,
+               "poses": args.pose, "size": sizes, "scale": args.scale, "start": args.start, "end": args.end,
+               "fps": args.fps, "hfov": args.hfov, "vfov": args.vfov}
     return {k: v for k, v in options.items() if v is not None}
 
 
@@ -703,7 +731,13 @@ def build_parser(prog: str = "xblick") -> argparse.ArgumentParser:
                                                          "(default: %(default)s)")
     poses.add_pose_argument(p)
     p.add_argument("--size", type=int, nargs=2, default=(640, 480), metavar=("W", "H"))
-    p.add_argument("--vfov", type=float, default=60.0, help="vertical field of view in degrees")
+    p.add_argument("--camera-info", default=None, metavar="FILE",
+                   help="a ROS calibration file (camera_calibration's YAML) of --size, published as the file has it")
+    p.add_argument("--hfov", type=float, default=None, metavar="DEG",
+                   help="without --camera-info: a pinhole of this horizontal field of view")
+    p.add_argument("--vfov", type=float, default=None, metavar="DEG",
+                   help="... or of this vertical one (with none of the three: an assumed vertical field of view of "
+                        f"{TEST_CAMERA_VFOV:g} degrees, said in the start line)")
     p.add_argument("--fps", type=float, default=15.0)
     add_cuda_device(p)
     zsession.add_arguments(p)

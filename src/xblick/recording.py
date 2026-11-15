@@ -98,7 +98,10 @@ STATUS_VERSION = 3
 REPLY_VERSION = 1  # of a request's reply
 COMMANDS = ("record", "stop", "play", "pause", "resume", "step")
 RECORD_OPTIONS = ("keys", "blocking", "log_time", "file", "ready_timeout")
-PLAY_OPTIONS = ("files", "rate", "loop", "prefix", "keys", "cuda_device", "pace", "clock")
+# a video playback's options (video.VideoPlayer, video.SHARED and PER_VIDEO): xblick recorder play sends them too
+VIDEO_OPTIONS = ("streams", "offsets_ms", "camera_infos", "frame_ids", "poses", "size", "scale", "start", "end",
+                 "fps", "hfov", "vfov")
+PLAY_OPTIONS = ("files", "rate", "loop", "prefix", "keys", "cuda_device", "pace", "clock") + VIDEO_OPTIONS
 STEP_OPTIONS = ("frames", "until_ns", "key")
 OPTIONS = {"record": RECORD_OPTIONS, "play": PLAY_OPTIONS, "step": STEP_OPTIONS}
 LOG_TIMES = ("receive", "header")
@@ -783,7 +786,11 @@ class Recorder:
             if mcap_given:
                 raise ValueError(f"{', '.join(mcap_given)}: for MCAP recordings, these are videos")
             if not streams:
-                raise ValueError("videos need their stream bases (streams; --stream, or --camera for one video)")
+                raise ValueError("videos need their stream bases (streams; --stream, or --camera, once per video)")
+            infos = video.get("camera_infos")
+            if infos:  # as the files: relative to the node's directory
+                infos = [infos] if isinstance(infos, str) else infos
+                video["camera_infos"] = [str(f) if Path(f).is_absolute() else str(self.directory / f) for f in infos]
         with self._play_lock:
             if _gate is not None:  # a command's deadline, just before it acts (``_execute``)
                 _gate()

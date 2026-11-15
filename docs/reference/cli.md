@@ -147,7 +147,7 @@ extra `xblick[cam]`. See the [guide](../guides/cam.md).
 | `--format FORMAT` | FFmpeg's input format, for example `lavfi`. The default is `video4linux2` for `/dev/...` and the protocol for a URL. |
 | `--size WxH`, `--fps FPS`, `--pixel-format FORMAT` | the mode to ask the camera for. The camera must deliver it. `--pixel-format` is for V4L2 only. |
 | `--camera-info FILE` | a ROS calibration file of the delivered size |
-| `--hfov DEG`, `--vfov DEG` | without `--camera-info`: the field of view of the assumed pinhole camera (default 60 degrees horizontal) |
+| `--hfov DEG`, `--vfov DEG` | without `--camera-info`: the field of view of the pinhole camera. With none of the three: an assumed horizontal field of view of 60 degrees, said in the start line. |
 | `--frame-id ID` | the frame id. The default is the stream with `_` in place of `/`. With `--pose` it names the body frame, and the images are in `<ID>_optical`. |
 | `--pose X Y Z YAW PITCH ROLL` | the camera's fixed pose in the room: its body frame (x forward, y left, z up) in `world`, in metres and degrees. A positive pitch looks down. It is published once on `<camera>/tf_static` with the step to the optical frame, and answered to later subscribers. Example, a webcam on a monitor 1.5 m high: `--pose 0 0 1.5 0 10 0`. |
 | `--timeout S` | end with an error when no frame comes for this long (default 5). With `--reconnect`: open the camera again. |
@@ -168,7 +168,8 @@ Publishes a moving test pattern on `test/camera/color`.
 | `--namespace`, `--camera`, `--stream` | `test`, `camera`, `color` |
 | `--size W H` | 640 480 |
 | `--fps` | 15 |
-| `--vfov` | the vertical field of view in degrees for the camera info |
+| `--camera-info FILE` | none: a ROS calibration file of `--size`, read as by `xblick cam` |
+| `--hfov`, `--vfov` | without `--camera-info`: the field of view of the pinhole camera. With none of the three: an assumed vertical field of view of 60 degrees, said in the start line. |
 | `--frame-id` | `TestCamera`: the frame id of the images. With `--pose` the body frame's, and the images are in `<ID>_optical`. |
 | `--pose X Y Z YAW PITCH ROLL` | none: the camera's fixed pose in the room, as `xblick cam --pose` |
 | `--cuda-device N` | none: the frames also in a CUDA ring on GPU `N`, as `xblick cam --cuda-device` |
@@ -239,19 +240,22 @@ sequences, one stream each, on one clock.
 | `--exit` | end when the playback has ended |
 | `--report S` | seconds between the status lines |
 
-Options for videos:
+Options for videos. Give each once per video, in the order of the files, or once for all videos, or not at all.
+`--stream`, `--camera`, `--frame-id` and `--pose` are only once per video. `play` refuses another count with one
+line. See [videos](../guides/video.md#options).
 
 | Option | Meaning |
 | --- | --- |
-| `--stream BASE` | the stream of a video, for example `cam/rc_visard/left`. Repeat it, one per video. |
-| `--camera CAMERA` | for one video: its stream is `<camera>/color` |
-| `--camera-info FILE` | the ROS calibration file of a video, for its size |
-| `--hfov DEG`, `--vfov DEG` | without `--camera-info`: a pinhole camera with this field of view |
-| `--frame-id ID` | the frame id of a video |
+| `--stream BASE` | the stream of a video, for example `cam/stereo/left` |
+| `--camera CAMERA` | in place of `--stream`: the stream `<camera>/color` |
+| `--camera-info FILE` | the ROS calibration file of a video, of the size it plays at, published as the file has it |
+| `--hfov DEG`, `--vfov DEG` | without `--camera-info`: a pinhole camera with this field of view. With none of the three: an assumed horizontal field of view of 60 degrees, said in the start line. |
+| `--frame-id ID` | the frame id of a video. With `--pose` the body frame's, and the images are in `<ID>_optical`. |
+| `--pose X Y Z YAW PITCH ROLL` | the fixed pose of a video's camera, as `xblick cam --pose`, on `<camera>/tf_static` |
 | `--offset-ms MS` | move the stamps and send times of a video by this time |
 | `--size WxH`, `--scale S` | scale the frames |
-| `--start S`, `--end S` | play only this part of the videos |
 | `--fps FPS` | take the frame times from this rate. The default is the times in the file. |
+| `--start S`, `--end S` | play only this part of the videos (for all videos) |
 
 ## GPU sharing
 

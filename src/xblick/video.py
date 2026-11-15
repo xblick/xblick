@@ -9,6 +9,10 @@ divided by the rate, plus its stream's offset (``--offset-ms``), and it is sent 
 streams start again together once the longest has ended, the stamps moved on by that length: they keep growing.
 Pausing holds the clock (the stamps after it go on from the wall time of the resume).
 
+Each option of a video (SHARED, PER_VIDEO) is given once per video in file order, or once for all, or not at all;
+names, frame ids and poses only once per video. A video's calibration file (CameraInfo.read_file) is published as
+it is; a video with ``--pose`` has its fixed pose on its camera's ``tf_static``, as ``xblick cam --pose``.
+
 Decoding is PyAV's (FFmpeg inside its wheels), the extra ``xblick[video]``; image sequences (a directory or a
 glob of PNG/JPEG files) are read with Pillow. A colour video becomes ``rgb8``, a grey one ``mono8``, a 16-bit grey one
 (e.g. FFV1 ``gray16le`` in Matroska: depth in mm) ``16UC1``.
@@ -27,6 +31,7 @@ from pathlib import Path
 import numpy as np
 import zenoh
 
+from . import topics
 from .camera import CameraPublisher
 from .codecs import JPEG, RVL
 from .diagnostics import DiagnosticsPublisher
@@ -209,13 +214,17 @@ def open_source(given: str, **options):
 
 
 def camera_info_for(width: int, height: int, frame_id: str, calibration: Path | None, hfov: float | None,
-                    vfov: float | None) -> tuple[CameraInfo, str]:
-    """The stream's CameraInfo: from a ROS calibration file (its size the stream's), else a pinhole of ``hfov`` or
-    ``vfov`` degrees (default DEFAULT_HFOV); and how it came about, for the log."""
+                    vfov: float | None, assumed: tuple[str, float] = ("horizontal", DEFAULT_HFOV)
+                    ) -> tuple[CameraInfo, str]:
+    """The stream's CameraInfo and how it came about, for the start line. From a ROS calibration file
+    (CameraInfo.read_file: every field as the file has it; its size must be the stream's: no scaling), else a pinhole
+    of ``hfov`` or ``vfov`` degrees, else, with nothing given, a pinhole of the ``assumed`` field of view (``horizontal``
+    or ``vertical``, degrees; a fixed default, said so in the start line). A pinhole has its principal point in the
+    centre and no distortion."""
     if calibration is not None:
         if hfov is not None or vfov is not None:
             raise VideoError("--camera-info or --hfov/--vfov, not both")
-        info = CameraInfo.from_yaml(Path(calibration).read_text())
+        info = CameraInfo.read_file(calibration)
         if (info.width, info.height) != (width, height):
             raise VideoError(f"{calibration}: a calibration of {info.width}x{info.height}, the stream is "
                              f"{width}x{height} (--size {info.width}x{info.height}, or a calibration of that size)")
@@ -223,15 +232,40 @@ def camera_info_for(width: int, height: int, frame_id: str, calibration: Path | 
         return info, f"camera_info from {calibration}"
     if hfov is not None and vfov is not None:
         raise VideoError("--hfov or --vfov, not both")
-    if vfov is not None:
-        f, said = 0.5 * height / math.tan(math.radians(vfov) / 2), f"{vfov:g} deg vertical"
+    if hfov is None and vfov is None:
+        axis, degrees = assumed
+        said = (f"no calibration given: camera_info from an assumed {axis} field of view of {degrees:g} degrees (a "
+                f"pinhole, principal point in the centre, no distortion; give --camera-info, --hfov or --vfov)")
     else:
-        degrees = hfov if hfov is not None else DEFAULT_HFOV
-        f, said = 0.5 * width / math.tan(math.radians(degrees) / 2), f"{degrees:g} deg horizontal"
-    if not f > 0 or not math.isfinite(f):
-        raise VideoError("a field of view between 0 and 180 degrees")
+        axis, degrees = ("vertical", vfov) if vfov is not None else ("horizontal", hfov)
+        said = f"camera_info from --{axis[0]}fov {degrees:g}: a pinhole, principal point in the centre, no distortion"
+    if not 0 < degrees < 180:
+        raise VideoError(f"a field of view of {degrees:g} degrees: between 0 and 180")
+    f = 0.5 * (height if axis == "vertical" else width) / math.tan(math.radians(degrees) / 2)
     info = CameraInfo.pinhole(width, height, f, f, (width - 1) / 2, (height - 1) / 2, frame_id=frame_id)
-    return info, f"camera_info ASSUMED: a pinhole of {said} field of view (give --camera-info for a calibration)"
+    return info, said
+
+
+# xblick play's options of videos (VideoPlayer's keywords, the CLI's options): given once per video, in the order of
+# the files, or once for all videos where that is meaningful (SHARED), or not at all. Names and poses (PER_VIDEO) are
+# a video's own: never once for several. --start and --end are the playback's: once for all.
+SHARED = {"offsets_ms": "--offset-ms", "camera_infos": "--camera-info", "size": "--size", "scale": "--scale",
+          "fps": "--fps", "hfov": "--hfov", "vfov": "--vfov"}
+PER_VIDEO = {"streams": "--stream", "frame_ids": "--frame-id", "poses": "--pose"}
+
+
+def per_video(option: str, given, n: int, shared: bool) -> list:
+    """``given`` (None, one value, or a list) as one value per video: n given, or one given for all (``shared``
+    only), or none (n times None). Any other count is a VideoError of one line."""
+    if given is None or (isinstance(given, (list, tuple)) and len(given) == 0):
+        return [None] * n
+    values = list(given) if isinstance(given, (list, tuple)) else [given]
+    if len(values) == n:
+        return values
+    if len(values) == 1 and shared:
+        return values * n
+    allowed = "once per video, in their order, " + ("or once for all, " if shared else "") + "or not at all"
+    raise VideoError(f"{len(values)} {option} for {n} video(s): {allowed}")
 
 
 def camera_of(base: str) -> str:
@@ -261,29 +295,42 @@ class _Stream:
 
 class VideoPlayer(Paced):
     """Plays videos at once, one stream each (``streams``: their bases, in the order of ``files``), on one clock
-    (module docstring). ``offsets_ms``, ``camera_infos``, ``frame_ids``: per stream, in file order (or none of them);
-    ``size``/``scale``, ``start``/``end`` (s), ``fps`` (instead of the files' times), ``hfov``/``vfov``: for all.
-    :meth:`run` blocks until the end (with ``loop`` until :meth:`end`)."""
+    (module docstring). Every option of a video follows one rule (SHARED, PER_VIDEO, :func:`per_video`): a list with
+    one value per video in file order, or one value for all (``offsets_ms``, ``camera_infos``, ``size``, ``scale``,
+    ``fps``, ``hfov``, ``vfov``), or nothing. ``frame_ids`` and ``poses`` (X Y Z YAW PITCH ROLL, poses.pose_from) only
+    once per video; ``start``/``end`` (s) for all. A video with a pose has it on its camera's ``tf_static`` (one
+    publisher per camera, with the poses of all its videos), its frame id naming the body frame and its images in the
+    optical frame, as ``xblick cam --pose``. :meth:`run` blocks until the end (with ``loop`` until :meth:`end`)."""
 
     def __init__(self, session: zenoh.Session, files: list[str], streams: list[str], rate: float = 1.0,
                  loop: bool = False, cuda_device: int | None = None, offsets_ms=(), camera_infos=(), frame_ids=(),
-                 size: tuple[int, int] | None = None, scale: float | None = None, start: float | None = None,
-                 end: float | None = None, fps: float | None = None, hfov: float | None = None,
-                 vfov: float | None = None):
+                 size=None, scale=None, start: float | None = None, end: float | None = None, fps=None,
+                 hfov=None, vfov=None, poses=()):
+        from . import poses as posing
+        from .camera import StaticTransformPublisher
+
         super().__init__(rate, "wall")
         n = len(files)
-        if len(streams) != n:
-            raise VideoError(f"{n} video(s) and {len(streams)} --stream: one stream base per video, in their order")
+        if streams is None or len(streams) != n:
+            raise VideoError(f"{n} video(s) and {len(streams or [])} --stream (or --camera): one per video, in their "
+                             f"order")
         if len(set(streams)) != n:
             raise VideoError(f"streams {', '.join(streams)}: each video a stream of its own")
-        for name, given in (("--offset-ms", offsets_ms), ("--camera-info", camera_infos), ("--frame-id", frame_ids)):
-            if given and len(given) != n:
-                raise VideoError(f"{len(given)} {name} for {n} video(s): one per video, in their order, or none")
+        if size is not None and len(size) == 2 and all(isinstance(v, int) for v in size):
+            size = [size]  # one size (W, H) for all
+        given = {"offsets_ms": offsets_ms, "camera_infos": camera_infos, "size": size, "scale": scale, "fps": fps,
+                 "hfov": hfov, "vfov": vfov, "frame_ids": frame_ids, "poses": poses}
+        each = {k: per_video(SHARED.get(k) or PER_VIDEO[k], v, n, k in SHARED) for k, v in given.items()}
+        each["size"] = [tuple(s) if s is not None else None for s in each["size"]]  # a list when sent as JSON
+        for pose in each["poses"]:
+            if pose is not None and len(pose) != 6:
+                raise VideoError(f"--pose: X Y Z YAW PITCH ROLL, six numbers, not {len(pose)}")
         start = start or 0.0
         if start < 0 or (end is not None and end <= start):
             raise VideoError(f"--start {start:g} --end {end}: 0 <= start < end")
-        if fps is not None and not fps > 0:
-            raise VideoError(f"--fps {fps}: > 0")
+        for value in each["fps"]:
+            if value is not None and not value > 0:
+                raise VideoError(f"--fps {value}: > 0")
         self.session, self.files, self.loop = session, list(files), loop
         self.cuda_device = cuda_device
         self.passes = 0
@@ -298,21 +345,37 @@ class VideoPlayer(Paced):
         self._ended_streams: dict[int, set] = {}  # epoch -> streams at their end in it
         self._all_ended = False  # not looped: every stream at its end
         self._diagnostics: dict[str, DiagnosticsPublisher] = {}
+        self._tf_static: list = []
+        transforms: dict[str, list] = {}  # camera -> the fixed transforms of its videos with a pose
+        said_poses = []
         try:
-            for i, (given, base) in enumerate(zip(files, streams)):
-                source = open_source(str(given), start=start, end=end, size=size, scale=scale, fps=fps)
-                frame_id = frame_ids[i] if frame_ids else base.replace("/", "_")
-                info, said = camera_info_for(source.width, source.height, frame_id,
-                                             camera_infos[i] if camera_infos else None, hfov, vfov)
+            for i, (given_file, base) in enumerate(zip(files, streams)):
+                source = open_source(str(given_file), start=start, end=end, size=each["size"][i],
+                                     scale=each["scale"][i], fps=each["fps"][i])
                 camera = camera_of(base)
+                frame_id = each["frame_ids"][i] or base.replace("/", "_")
+                pose = each["poses"][i]
+                if pose is not None:  # the frame id names the body frame; the images are in its optical frame
+                    body, frame_id = frame_id, frame_id + posing.OPTICAL_SUFFIX
+                    mine = transforms.setdefault(camera, [])
+                    if any(t.child_frame_id == body for t in mine):
+                        raise VideoError(f"--pose: two videos of {camera} with the body frame {body!r}: give each "
+                                         "its own --frame-id")
+                    mine += posing.fixed_camera_transforms(body, posing.pose_from(*pose), time.time_ns())
+                    said_poses.append(f"xblick play: pose on {topics.tf_static(camera)}: {topics.WORLD} -> {body} "
+                                      f"({' '.join(f'{v:g}' for v in pose)}) -> {frame_id}, the images' frame")
+                info, said = camera_info_for(source.width, source.height, frame_id, each["camera_infos"][i],
+                                             each["hfov"][i], each["vfov"][i])
                 publisher = CameraPublisher(session, base, encoding=source.encoding, frame_id=frame_id,
                                             camera_info=info, source="video",
                                             codec=RVL if source.encoding == "16UC1" else JPEG,
                                             cuda_device=cuda_device)
-                offset_ns = round((offsets_ms[i] if offsets_ms else 0.0) * 1e6)
+                offset_ns = round((each["offsets_ms"][i] or 0.0) * 1e6)
                 self._streams.append(_Stream(source, base, offset_ns, publisher, said))
                 if camera not in self._diagnostics:
                     self._diagnostics[camera] = DiagnosticsPublisher(session, camera, "play")
+            for camera, fixed in transforms.items():
+                self._tf_static.append(StaticTransformPublisher(session, camera, fixed))
         except BaseException:
             self.close()
             raise
@@ -321,6 +384,8 @@ class VideoPlayer(Paced):
                   f"{s.source.encoding} at {s.source.fps:g} frames/s" + (f", offset {s.offset_ns / 1e6:g} ms"
                                                                        if s.offset_ns else "") + f"; {s.said}",
                   flush=True)
+        for line in said_poses:
+            print(line, flush=True)
 
     # ----------------------------------------------------------------------------------------------- state
 
@@ -553,3 +618,5 @@ class VideoPlayer(Paced):
             s.publisher.close()
         for diagnostics in self._diagnostics.values():
             diagnostics.close()
+        for tf_static in getattr(self, "_tf_static", ()):
+            tf_static.close()

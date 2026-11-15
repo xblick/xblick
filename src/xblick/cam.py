@@ -594,9 +594,12 @@ def add_arguments(parser: argparse.ArgumentParser):
     parser.add_argument("--pixel-format", default=None, metavar="FORMAT",
                         help="V4L2: ask the device for this input format, e.g. mjpeg or yuyv422 (default: its own)")
     parser.add_argument("--camera-info", default=None, metavar="FILE",
-                        help="a ROS calibration file of the delivered size (default: a pinhole, --hfov)")
+                        help="a ROS calibration file (camera_calibration's YAML) of the delivered size, published as "
+                             "the file has it (default: a pinhole, --hfov)")
     parser.add_argument("--hfov", type=float, default=None, metavar="DEG",
-                        help="without --camera-info: a pinhole of this horizontal field of view (default 60)")
+                        help="without --camera-info: a pinhole of this horizontal field of view (with none of "
+                             "--camera-info, --hfov, --vfov: an assumed horizontal field of view of 60 degrees, said "
+                             "in the start line)")
     parser.add_argument("--vfov", type=float, default=None, metavar="DEG", help="... or of this vertical one")
     parser.add_argument("--frame-id", default=None, metavar="ID",
                         help="the frame id (default: the base, / as _); with --pose the body frame's")

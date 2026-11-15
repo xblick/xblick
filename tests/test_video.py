@@ -119,9 +119,9 @@ def test_an_image_sequence_and_what_is_refused(sessions, videos, tmp_path):  # n
     try:
         with pytest.raises(ValueError, match="give --fps"):
             recorder.play([frames], streams=["t/seq/color"])
-        with pytest.raises(ValueError, match="one stream base per video"):
+        with pytest.raises(ValueError, match="and 1 --stream .or --camera.: one per video"):
             recorder.play([color_mp4, color_mp4], streams=["t/a/color"])
-        with pytest.raises(ValueError, match="one per video"):
+        with pytest.raises(ValueError, match="2 --offset-ms for 1 video.*once per video"):
             recorder.play([color_mp4], streams=["t/a/color"], offsets_ms=[1.0, 2.0])
         with pytest.raises(ValueError, match="for MCAP recordings, these are videos"):
             recorder.play([color_mp4], streams=["t/a/color"], keys=["x/*"])
@@ -283,3 +283,148 @@ def test_a_looped_playback_says_its_pass(capsys):
     # a recording's status has its length; not looped, no pass
     assert recording.position_text({"position_s": 3.0, "duration_s": 12.0, "passes": 0, "loop": False}) == \
         "at 3.0 s of 12.0 s"
+
+
+def write_frames(directory, n, value=0):
+    """An image sequence of ``n`` frames (W x H, rgb): frame i has the red value + i * 20."""
+    from PIL import Image
+
+    directory.mkdir()
+    for i in range(n):
+        Image.fromarray(np.full((H, W, 3), value + i * 20, np.uint8)).save(directory / f"{i:03d}.png")
+    return directory
+
+
+# a rectified stereo pair's calibration as ROS's camera_calibration writes it (ost.yaml: lists over several lines)
+STEREO_YAML = """image_width: 64
+image_height: 48
+camera_name: {name}
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [50.5, 0., 31.25, 0., 50.75, 23.5,
+         0., 0., 1.]
+distortion_model: plumb_bob
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [-0.125, 0.0625, 0.001, -0.002, 0.]
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data: [0.9998, 0.0175, 0., -0.0175, 0.9998, 0., 0., 0., 1.]
+projection_matrix:
+  rows: 3
+  cols: 4
+  data: [48., 0., 32.5, {tx}, 0., 48., 24.25, 0., 0., 0., 1., 0.]
+"""
+
+
+def test_a_stereo_pair_from_two_videos(sessions, tmp_path):  # noqa: F811
+    """Two videos as cam/stereo/left and right, each with its calibration file and pose: the camera_info arrives
+    exactly as the files have it (the baseline in the right P), in the optical frames; both poses on the one
+    cam/stereo/tf_static (TransformBuffer: the right optical frame 0.12 m along the left one's x); frames of equal
+    times have equal stamps."""
+    from xblick.msg import CameraInfo
+    from xblick.poses import TransformBuffer
+
+    a, b = sessions
+    left, right = write_frames(tmp_path / "left", 4), write_frames(tmp_path / "right", 4, 5)
+    files = {}
+    for name, tx in (("left", 0.0), ("right", -48.0 * 0.12)):
+        files[name] = tmp_path / f"{name}.yaml"
+        files[name].write_text(STEREO_YAML.format(name=name, tx=tx))
+    recorder = recording.Recorder(a, tmp_path, name="video_stereo")
+    subs = {n: ImageSubscriber(b, f"t/stereo/{n}", transport="raw", camera_info=True) for n in ("left", "right")}
+    histories = {n: FrameHistory(s, 20) for n, s in subs.items()}
+    transforms = TransformBuffer(b, "t/stereo")
+    try:
+        recorder.play([str(left), str(right)], streams=["t/stereo/left", "t/stereo/right"], fps=10.0,
+                      camera_infos=[str(files["left"]), str(files["right"])],
+                      poses=[[0, 0, 1, 0, 0, 0], [0, -0.12, 1, 0, 0, 0]], loop=True)
+        for n in ("left", "right"):
+            wait_until(lambda n=n: subs[n].camera_info is not None and len(histories[n].stamps()) >= 4)
+            got, want = subs[n].camera_info, CameraInfo.read_file(files[n])
+            assert got.header.frame_id == f"t_stereo_{n}_optical" and got.distortion_model == "plumb_bob"
+            for field in ("k", "d", "r", "p"):
+                np.testing.assert_array_equal(getattr(got, field), getattr(want, field))
+        assert subs["right"].camera_info.p[3] == pytest.approx(-48.0 * 0.12)  # P[3] = -f b
+        assert set(histories["left"].stamps()) & set(histories["right"].stamps())  # equal times, equal stamps
+        stamp = max(histories["left"].stamps())
+        pose = transforms.lookup("t_stereo_left_optical", "t_stereo_right_optical", stamp, 5.0)
+        np.testing.assert_allclose(pose[:3, 3], [0.12, 0, 0], atol=1e-9)
+        np.testing.assert_allclose(pose[:3, :3], np.eye(3), atol=1e-9)
+        world = transforms.lookup("world", "t_stereo_left", stamp, 1.0)
+        np.testing.assert_allclose(world[:3, 3], [0, 0, 1], atol=1e-9)
+    finally:
+        transforms.close()
+        for h in histories.values():
+            h.close()
+        recorder.close()
+    recorder.check()
+
+
+def test_different_rates_and_lengths_looped(sessions, tmp_path):  # noqa: F811
+    """Two image sequences with a rate each (--fps once per video): 10 frames at 10 frames/s and 3 at 5 frames/s.
+    The short one's frames have exactly the stamps of the long one's frames of equal time; it sends nothing after
+    its end until the long one has ended; looped, both start again together, the stamps on by the long one's 1.0 s."""
+    a, b = sessions
+    long, short = write_frames(tmp_path / "long", 10), write_frames(tmp_path / "short", 3)
+    recorder = recording.Recorder(a, tmp_path, name="video_rates")
+    histories = {n: FrameHistory(ImageSubscriber(b, f"t/rates/{n}", transport="raw"), 50) for n in ("long", "short")}
+    try:
+        recorder.play([str(long), str(short)], streams=["t/rates/long", "t/rates/short"], fps=[10.0, 5.0], loop=True)
+        wait_until(lambda: len(histories["short"].stamps()) >= 6, timeout=10.0)
+        longs, shorts = sorted(histories["long"].stamps()), sorted(histories["short"].stamps())
+        first = longs[0]
+        assert [s - first for s in shorts[:6]] == [0, 200 * MS, 400 * MS, 1000 * MS, 1200 * MS, 1400 * MS]
+        assert set(shorts[:6]) <= set(longs)
+    finally:
+        for h in histories.values():
+            h.close()
+        recorder.close()
+    recorder.check()
+
+
+def test_the_per_video_rule(sessions, tmp_path, capsys):  # noqa: F811
+    """One rule for every option of a video: once per video, or once for all (not names, frame ids, poses), or not
+    at all; another count is refused with one line before anything plays. The CLI: --camera once per video."""
+    from xblick import cli
+    from xblick.video import camera_info_for
+
+    a, _ = sessions
+    seqs = [str(write_frames(tmp_path / f"v{i}", 2)) for i in range(3)]
+    streams = ["t/r/a", "t/r/b", "t/r/c"]
+    recorder = recording.Recorder(a, tmp_path, name="video_rule")
+    try:
+        for options, refused in (({"poses": [[0, 0, 1, 0, 0, 0]]}, "1 --pose for 3 video"),
+                                 ({"frame_ids": ["x"]}, "1 --frame-id for 3 video"),
+                                 ({"offsets_ms": [1.0, 2.0]}, "2 --offset-ms for 3 video"),
+                                 ({"fps": [10.0, 5.0]}, "2 --fps for 3 video")):
+            with pytest.raises(ValueError, match=refused):
+                recorder.play(seqs, streams=streams, **{"fps": 10.0, **options})
+        with pytest.raises(ValueError, match="2 video.* and 1 --stream"):
+            recorder.play(seqs[:2], streams=streams[:1], fps=10.0)
+        with pytest.raises(ValueError, match="give each its own --frame-id"):
+            recorder.play(seqs[:2], streams=["t/r/a", "t/r/b"], fps=10.0, frame_ids=["same", "same"],
+                          poses=[[0, 0, 0, 0, 0, 0]] * 2)
+        player = recorder.play(seqs, streams=streams, fps=10.0, offsets_ms=5.0, hfov=[50.0, 60.0, 70.0])
+        assert [s["offset_ms"] for s in player.status()["streams"]] == [5.0, 5.0, 5.0]
+    finally:
+        recorder.close()
+    out = capsys.readouterr().out
+    assert "camera_info from --hfov 70" in out
+    port = free_port()
+    with pytest.raises(SystemExit, match="3 video.* and 2 --stream .or --camera."):
+        cli.main(["play", *seqs, "--camera", "t/x", "--camera", "t/y", "--fps", "10", "--listen",
+                  f"tcp/127.0.0.1:{port}"])
+    # nothing given: an assumed field of view, said plainly; the test camera's is vertical
+    info, said = camera_info_for(64, 48, "f", None, None, None)
+    assert said.startswith("no calibration given: camera_info from an assumed horizontal field of view of 60 degrees")
+    assert info.k[0] == pytest.approx(32 / np.tan(np.radians(30)))
+    info, said = camera_info_for(64, 48, "f", None, None, None, assumed=("vertical", 60.0))
+    assert "assumed vertical field of view of 60 degrees" in said and info.k[0] == pytest.approx(24 / np.tan(np.radians(30)))
+    # xblick recorder play sends the video options to a running node, which takes them
+    command, options = recording.parse_command(b'{"command": "play", "files": ["a.mp4"], "streams": ["t/a/color"], '
+                                               b'"poses": [[0, 0, 1, 0, 0, 0]], "camera_infos": ["a.yaml"]}')
+    assert command == "play" and options["poses"] == [[0, 0, 1, 0, 0, 0]]

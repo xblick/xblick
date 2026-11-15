@@ -194,11 +194,13 @@ record with the source `cam`, and diagnostics.
 ## Camera info
 
 Give the calibration of the camera with `--camera-info FILE`, a ROS calibration file as `camera_calibration` writes
-it. Its size must be the delivered size, and `xblick cam` refuses another.
+it. Its size must be the delivered size, and `xblick cam` refuses another. The `camera_info` carries every field as
+the file has it. The reader is the one of `xblick play`, described in [videos](video.md#options).
 
 Without `--camera-info`, `xblick cam` assumes a pinhole camera, as `xblick play` does for a video. Its horizontal
 field of view is 60 degrees, the principal point is the centre of the image, and the distortion is zero.
-`--hfov DEG` or `--vfov DEG` sets another field of view. The command writes `camera_info ASSUMED` to its log. A node
+`--hfov DEG` or `--vfov DEG` sets another field of view. The start line then says `no calibration given: camera_info
+from an assumed horizontal field of view of 60 degrees`. A node
 that measures in 3D gives wrong results with an assumed calibration.
 
 The frame id is `--frame-id`, by default the name of the stream with `_` in place of `/`.
