@@ -649,7 +649,7 @@ def test_cuda_device_offers_a_gpu_ring_with_the_host_rings_pixels():
                       f"tcp/127.0.0.1:{port}"])
     session = open_session(connect=[f"tcp/127.0.0.1:{port}"])
     try:
-        lines = _lines_until(process, "rings:")
+        lines = _lines_until(process, "rings:")  # (before the stream's lines, as test-camera)
         assert f"rings: shm (host memory) and cuda (GPU 0, {_core.cuda_device_uuid(0)[:8]})" in lines[-1], lines
         wait_until(lambda: query_info(session, base, timeout=0.5), timeout=10.0)
         (record,) = query_info(session, base, timeout=1.0)

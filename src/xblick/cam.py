@@ -327,10 +327,9 @@ class LiveCamera:
               f"{said}", flush=True)
         # on lines of their own, one after the other: the stream, and the camera to copy into a node's start
         # (nodes take the camera explicitly; a node given the stream ends with camera.StreamGivenAsCamera)
-        print(f"{self.prog}: publishing the stream {self.base}", flush=True)
         uuid = device_uuid(self.cuda_device) if self.cuda_device is not None else None
-        print(f"{self.prog}: {rings_text(uuid, self.cuda_device)}",
-              flush=True)
+        print(f"{self.prog}: {rings_text(uuid, self.cuda_device)}", flush=True)  # before the two lines below
+        print(f"{self.prog}: publishing the stream {self.base}", flush=True)
         print(f"{self.prog}: start a node with --camera {self.camera} (the camera, not the stream)", flush=True)
         self._ready.set()
 
