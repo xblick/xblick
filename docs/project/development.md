@@ -18,6 +18,10 @@ There, run `uv sync --reinstall-package xblick` after a change in `cpp/`.
 
 ## Build the C++ library
 
+`tools/setup.sh` first asks everything (CUDA toolkit and point cloud node, Python environment, build and tests), then
+runs these steps without asking: zenoh-c and zenoh-cpp go into `.zenoh/` of the checkout. It prints its cmake command.
+By hand:
+
 ```bash
 tools/install_zenoh.sh /opt/zenoh       # zenoh-c and zenoh-cpp 1.10
 cmake -S . -B build/cpp -G Ninja -DCMAKE_PREFIX_PATH=/opt/zenoh \

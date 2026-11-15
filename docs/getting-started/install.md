@@ -50,7 +50,8 @@ xblick = { git = "https://github.com/xblick/xblick.git", rev = "<tag or commit>"
 
 ## C++
 
-1. Install zenoh-c and zenoh-cpp 1.10. The script `tools/install_zenoh.sh <prefix>` installs both.
+1. Install zenoh-c and zenoh-cpp 1.10. The script `tools/install_zenoh.sh <prefix>` installs both. In a checkout,
+   `tools/setup.sh` asks everything first, then downloads zenoh into `.zenoh/`, configures, builds and tests.
 2. Build and install Durchblick with CMake.
 3. Use it in your project:
 
