@@ -71,8 +71,9 @@ A partner stream pairs its samples with the frames of a primary stream, as Pytho
 
 ```cpp
 xblick::ImageSubscriber depth(session, "test/camera/depth", {.keep_recent = 8});
-// max_offset_ns: 5 ms; std::nullopt for half the partner's measured period
-if (auto stamp = xblick::partner_of(depth.recent_stamps(), color_frame.stamp_ns(), 5'000'000))
+// max_offset_ns: kPairMaxOffsetNs (20 ms, as Python's default); 0 for equal stamps; std::nullopt for half the
+// partner's measured period
+if (auto stamp = xblick::partner_of(depth.recent_stamps(), color_frame.stamp_ns(), xblick::kPairMaxOffsetNs))
     if (auto frame = depth.at(*stamp, std::chrono::nanoseconds(0)))
         use(color_frame, *frame);
 ```

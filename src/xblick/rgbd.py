@@ -20,7 +20,7 @@ import numpy as np
 from .camera import ImageSubscriber
 from .detections import DetectionSubscriber
 from . import tensors
-from .history import FrameHistory, PartnerHistory, StampedHistory
+from .history import PAIR_MAX_OFFSET_NS, FrameHistory, PartnerHistory, StampedHistory
 
 KEYS = ("color", "depth", "segmenter")
 
@@ -184,14 +184,15 @@ class RGBDInputs:
     """A camera's streams (colour, depth; with a segmenter its instances and detections), paired by stamp: the colour
     stream is the primary one, taken frame by frame (FrameHistory); depth and instances are its partners
     (PartnerHistory), their frames read only when a colour frame is paired with them: the depth nearest within
-    ``max_offset_ns`` (None, the default: half the depth's frame period; 0: the same stamp), the instances of the
-    same stamp. ``max_hz`` (a node's
+    ``max_offset_ns`` (``history.PAIR_MAX_OFFSET_NS``, 20 ms, by default; 0: the same stamp; ``history.HALF_PERIOD``:
+    half the depth's measured frame period), the instances of the same stamp. ``max_hz`` (a node's
     ``--max-hz``): at most so many colour frames a second, the newest (the others not read, nor their partners'); a
     pair is never lost to it. The detections are small and all kept. ``take`` reads a frame's streams together: call
     it when you take a frame (``newest_complete``), before working on it (FramePreparer does)."""
 
     def __init__(self, session, spec: CameraSpec, history: int, local: str, wake: threading.Event,
-                 max_hz: float | None = None, max_offset_ns: int | None = None, device=None):
+                 max_hz: float | None = None, max_offset_ns: int | None = PAIR_MAX_OFFSET_NS,
+                 device=None):
         self.spec = spec
         keys = spec.keys
         self.readers = {"color": FrameHistory(ImageSubscriber(session, keys["color"], transport="auto",

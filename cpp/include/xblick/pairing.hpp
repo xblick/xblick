@@ -18,6 +18,12 @@
 
 namespace xblick
 {
+    // The default maximum offset of a partner sample from its primary frame, 20 ms (Python's
+    // history.PAIR_MAX_OFFSET_NS). It covers the Azure Kinect's colour and depth of one capture (up to 17 ms apart with
+    // auto exposure) and pairs no neighbouring frame of a 30 or 15 Hz partner. It is fixed: half a measured period
+    // (max_offset_ns empty below) is 16.7 ms at 30 Hz, too small for that camera, and unknown before two samples.
+    inline constexpr std::int64_t kPairMaxOffsetNs = 20'000'000;
+
     // The partner's frame period: the median step of the kept stamps, each stamp counted once (of an even number of
     // steps the larger middle one). Empty before two different stamps.
     std::optional<std::int64_t> partner_period_ns(const std::vector<std::int64_t>& kept);
@@ -28,8 +34,8 @@ namespace xblick
 
     // The stamp of the partner sample of the primary frame stamped stamp_ns, of the kept stamps (in arrival order;
     // of two equally near the first): the nearest, at most max_offset_ns away, once no nearer one can still come.
-    // Empty if there is none (yet). max_offset_ns empty: half the measured period (empty while it is unmeasured);
-    // 0 asks for equal stamps. Throws std::invalid_argument for a negative max_offset_ns.
+    // Empty if there is none (yet). max_offset_ns: usually kPairMaxOffsetNs; 0 asks for equal stamps; empty: half the
+    // measured period (empty while it is unmeasured), only when asked for (Python's history.HALF_PERIOD). Throws std::invalid_argument for a negative max_offset_ns.
     std::optional<std::int64_t> partner_of(const std::vector<std::int64_t>& kept, std::int64_t stamp_ns,
                                            std::optional<std::int64_t> max_offset_ns);
 }

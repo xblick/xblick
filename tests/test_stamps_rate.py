@@ -163,7 +163,7 @@ def test_max_hz_takes_the_newest_and_decodes_no_other(sessions, monkeypatch, tra
 
 @pytest.mark.parametrize("offset_ms", [0, 15])
 @pytest.mark.parametrize("max_hz", [30, 20])
-@pytest.mark.parametrize("max_offset_ms", [20, None])  # None: half the depth's period, measured
+@pytest.mark.parametrize("max_offset_ms", [20, None])  # None: history.HALF_PERIOD, half the depth's period, measured
 def test_rgbd_inputs_limit_the_pair(sessions, max_hz, offset_ms, max_offset_ms):  # noqa: F811
     """A 30 Hz camera whose depth is stamped 15 ms after its colour (measured on a camera: 11-17 ms), or as its colour:
     with max_hz only the colour is limited, each colour frame taken finds its depth (none lost to the limit), and the

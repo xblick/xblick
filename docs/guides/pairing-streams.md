@@ -124,14 +124,20 @@ nearer only if it comes more than half a step early. `PartnerHistory` therefore 
 the smallest step before the primary stamp at once. A camera of a stereo pair that stamps slightly earlier pairs
 without a wait. A node that skips camera frames is not steady, because its next sample may be the very next camera
 frame. For such a partner, and until the partner has two samples, `PartnerHistory` waits for a later sample. The rule
-is the same for the default offset and for an explicit one.
+is the same for every offset.
+
+The maximum offset is `history.PAIR_MAX_OFFSET_NS` by default, 20 ms (C++ `xblick::kPairMaxOffsetNs`). It covers
+the Azure Kinect's colour and depth of one capture, which lie up to 17 ms apart with auto exposure. It pairs no
+neighbouring frame of a 30 or 15 Hz partner. A value of 0 requires equal stamps. `history.HALF_PERIOD` asks for half
+the partner's measured frame period. That offset changes with the rate and with dropped frames, and it is unknown
+until two samples came. At 30 Hz it is 16.7 ms, which is too small for the Azure Kinect.
 
 In C++ the pieces are `SubscriberOptions::keep_recent`, `ImageSubscriber::recent_stamps` and `ImageSubscriber::at`.
 `partner_of` in `xblick/pairing.hpp` chooses the stamp. `PartnerHistory` calls the same function, so Python and
 C++ pair alike.
 
-`RGBDInputs` works this way, with colour as the primary stream. Its `max_offset_ns` for the depth is None by
-default, which pairs within half the depth's measured period. A value of 0 requires equal stamps. A segmenter's
+`RGBDInputs` works this way, with colour as the primary stream. Its `max_offset_ns` for the depth has the same
+default, `PAIR_MAX_OFFSET_NS`. A segmenter's
 instances always pair by equal stamps. The point cloud node works this way with depth as the primary stream.
 
 **Counters.** The `overwritten` counter of a plain subscriber counts the frames that were replaced before you took

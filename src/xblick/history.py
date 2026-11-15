@@ -122,6 +122,14 @@ LOST_HINT = ("the partner frames are read too late: take a frame and its partner
              "(PartnerHistory.wait, RGBDInputs.take), or give the publisher more ring slots (Durchblick's default 32; "
              "a camera node's slots setting)")
 
+# The default largest offset of a partner sample from its primary frame (C++ kPairMaxOffsetNs, pairing.hpp): 20 ms
+# covers the Azure Kinect's colour and depth of one capture (up to 17 ms apart with auto exposure) and pairs no
+# neighbouring frame of a 30 or 15 Hz partner.
+PAIR_MAX_OFFSET_NS: int = _core.PAIR_MAX_OFFSET_NS
+# max_offset_ns asked for by name: half the partner's frame period, measured from its kept samples (None while fewer
+# than two came). Never a default: it changes with the camera's rate and with dropped frames.
+HALF_PERIOD = None
+
 
 class PartnerHistory:
     """The frames of a partner stream (``subscriber``, an ImageSubscriber), paired with a primary stream's frames by
@@ -129,10 +137,9 @@ class PartnerHistory:
     shared-memory or CUDA ring) only when a primary frame is paired with it (``at``, ``wait``; ``has`` whether there is
     one), each once. ``on_put`` is called after each sample (wakes the node: the partner may come after the primary).
 
-    The partner of a primary frame is the nearest sample within ``max_offset_ns``. None (the default): within half the
-    partner's frame period, measured from its kept samples, so any steady stream pairs every primary frame with its
-    nearest sample and a missing one is not replaced by its neighbour; an explicit value overrides that, 0 asks for
-    equal stamps.
+    The partner of a primary frame is the nearest sample within ``max_offset_ns``: ``PAIR_MAX_OFFSET_NS`` (20 ms) by
+    default, 0 for equal stamps. ``HALF_PERIOD`` asks for half the partner's frame period, measured from its kept
+    samples: none before two samples came, and it changes with the rate and with dropped frames.
 
     A sample over shm or CUDA only names a slot of the publisher's ring, which it overwrites ``slots`` frames later
     (32 by default: about a second at 30 Hz). Read a primary frame's partners when you take the primary frame, not
@@ -141,10 +148,11 @@ class PartnerHistory:
 
     LOG_EVERY_S = 10.0
 
-    def __init__(self, subscriber, size: int, max_offset_ns: int | None = None,
+    def __init__(self, subscriber, size: int, max_offset_ns: int | None = PAIR_MAX_OFFSET_NS,
                  on_put: Callable[[], None] | None = None):
-        if max_offset_ns is not None and max_offset_ns < 0:
-            raise ValueError(f"max_offset_ns {max_offset_ns}: not negative (None: half the partner's frame period)")
+        if max_offset_ns is not HALF_PERIOD and max_offset_ns < 0:
+            raise ValueError(f"max_offset_ns {max_offset_ns}: not negative (HALF_PERIOD: half the partner's frame "
+                             "period)")
         self.subscriber = subscriber
         self.size = size
         self.max_offset_ns = max_offset_ns
@@ -177,8 +185,9 @@ class PartnerHistory:
         return _core.partner_period_ns(self.subscriber.recent_stamps())
 
     def offset_ns(self) -> int | None:
-        """The largest offset that pairs: ``max_offset_ns``, or half the measured period (None while unmeasured)."""
-        if self.max_offset_ns is not None:
+        """The largest offset that pairs: ``max_offset_ns``, or with HALF_PERIOD half the measured period (None while
+        unmeasured)."""
+        if self.max_offset_ns is not HALF_PERIOD:
             return self.max_offset_ns
         period = self.period_ns()
         return None if period is None else period // 2
@@ -192,7 +201,7 @@ class PartnerHistory:
         distance before it. A steady partner (the steps of its kept samples within a tenth of their median) sends its
         next sample about one step after the newest kept, so it can be nearer only by coming more than half a step
         early. A nearest sample at most a quarter of the smallest step before ``stamp_ns`` (a camera of a pair that
-        stamps a little earlier) is therefore taken at once, with the measured offset and with an explicit one. A
+        stamps a little earlier) is therefore taken at once, with a fixed offset and with HALF_PERIOD. A
         partner that is not steady (a node that skips camera frames) or has fewer than two samples waits for a later
         sample."""
         return _core.partner_of(self.subscriber.recent_stamps(), stamp_ns, self.max_offset_ns)

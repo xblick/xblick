@@ -153,6 +153,7 @@ NB_MODULE(_core, m)
           }, "width"_a, "height"_a, "k"_a, "distortion_model"_a, "d"_a, "r"_a, "p"_a, "x"_a, "y"_a,
           "writes the rectification map of the camera (rectify.hpp) into x and y (float32, height x width)");
     // pairing by stamp (pairing.hpp): history.PartnerHistory pairs with these
+    m.attr("PAIR_MAX_OFFSET_NS") = xblick::kPairMaxOffsetNs;
     m.def("partner_period_ns", &xblick::partner_period_ns, "kept"_a,
           "the median step of the kept stamps, each once; None before two different stamps");
     m.def("partner_of", [](const std::vector<std::int64_t>& kept, std::int64_t stamp_ns,

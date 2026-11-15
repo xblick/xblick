@@ -12,7 +12,7 @@ from xblick import _core, topics
 from xblick import camera as camera_module
 from xblick.camera import CameraPublisher, ImageSubscriber
 from xblick.encodings import EncodingError
-from xblick.history import PartnerHistory
+from xblick.history import HALF_PERIOD, PAIR_MAX_OFFSET_NS, PartnerHistory
 from xblick.msg import CameraInfo
 from xblick.session import close as close_session
 from xblick.session import open_session, replies
@@ -136,12 +136,12 @@ def test_a_partner_counts_none_overwritten(sessions):
 
 def test_a_partner_read_too_late_is_lost_and_logged(sessions, caplog):
     """Over shm a partner sample only names a ring slot: read after the publisher reused the slot (a ring of 4, 10
-    frames later), it is lost, counted in ``lost`` and logged with the fix; a recent one reads. The offset is measured:
-    half the partner's period pairs each stamp with its nearest frame, and a stamp between two missing frames has
-    none."""
+    frames later), it is lost, counted in ``lost`` and logged with the fix; a recent one reads. The offset is measured
+    (HALF_PERIOD, asked for by name): half the partner's period pairs each stamp with its nearest frame, and a stamp
+    between two missing frames has none."""
     a, b = sessions
     publisher = CameraPublisher(a, BASE, encoding="rgb8", frame_id="cam", slots=4)
-    partner = PartnerHistory(ImageSubscriber(b, BASE, transport="shm"), 30)
+    partner = PartnerHistory(ImageSubscriber(b, BASE, transport="shm"), 30, max_offset_ns=HALF_PERIOD)
     wait_until(lambda: publisher.subscribed)
     t0, period = 1_000 * 1_000_000_000, 33_000_000
     for i in range(10):
@@ -166,7 +166,7 @@ def test_a_partner_stamped_a_little_earlier_is_taken_at_once(sessions):
     may come)."""
     a, b = sessions
     publisher = CameraPublisher(a, BASE, encoding="rgb8", frame_id="cam")
-    measured = PartnerHistory(ImageSubscriber(b, BASE, transport="shm"), 30)
+    measured = PartnerHistory(ImageSubscriber(b, BASE, transport="shm"), 30, max_offset_ns=HALF_PERIOD)
     explicit = PartnerHistory(ImageSubscriber(b, BASE, transport="shm"), 30, max_offset_ns=5_000_000)
     wait_until(lambda: publisher.subscribed)
     t0, period, early = 1_000 * 1_000_000_000, 66_666_667, 240_000
@@ -229,6 +229,22 @@ def test_the_partner_rule(kept, max_offset_ns, stamp, partner):
     frames may send the primary frame's own sample next: it waits."""
     history = PartnerHistory(KeptStamps(kept), 30, max_offset_ns=max_offset_ns)
     assert history.partner_of(stamp) == partner
+
+
+def test_the_default_offset_is_fixed():
+    """The default largest offset is 20 ms, one constant in C++ and Python, the same for RGBDInputs: never a measured
+    one (#16). With one sample kept, or a 30 Hz partner, it is 20 ms all the same."""
+    import inspect
+
+    from xblick.rgbd import RGBDInputs
+
+    assert PAIR_MAX_OFFSET_NS == _core.PAIR_MAX_OFFSET_NS == 20 * MS
+    assert inspect.signature(RGBDInputs).parameters["max_offset_ns"].default == PAIR_MAX_OFFSET_NS
+    for kept in ([160 * MS], [i * CAMERA for i in range(5)]):
+        assert PartnerHistory(KeptStamps(kept), 30).offset_ns() == 20 * MS
+    # asked for by name: half a 30 Hz partner's period, below the Azure Kinect's colour-depth difference of 17 ms
+    assert PartnerHistory(KeptStamps([i * CAMERA for i in range(5)]), 30, HALF_PERIOD).offset_ns() < 17 * MS
+    assert PartnerHistory(KeptStamps([160 * MS]), 30, HALF_PERIOD).offset_ns() is None
 
 
 def test_the_partner_period():
