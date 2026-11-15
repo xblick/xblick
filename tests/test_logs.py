@@ -48,7 +48,8 @@ def test_describe_and_waiting(sessions):  # noqa: F811
     depth = CameraPublisher(a, "robot/camera/depth_to_color", encoding="16UC1", frame_id="cam",
                             camera_info=info, codec="png")
     wait_until(lambda: depth.subscribed)
-    depth.publish(np.ones((48, 64), np.uint16), stamp_ns=2)  # another stamp than the colour's
+    # a stamp 1 s from the colour's: beyond the default offset (history.PAIR_MAX_OFFSET_NS, 20 ms)
+    depth.publish(np.ones((48, 64), np.uint16), stamp_ns=1_000_000_001)
     wait_until(lambda: "no colour frame has its partners" in inputs.waiting())
     inputs.close()
     color.close()
