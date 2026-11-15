@@ -10,9 +10,14 @@ Between two columns every box that sends has one vertical lane (a bus) that bran
 edge enters its box on a row of its own, with a short label (the transport or the key) before the arrow. A horizontal
 line crosses another edge's lane as a line over it (``─``), and lines of one edge join with box-drawing junctions.
 
+Boxes can stand in groups (``GraphGroup``: one per router): each group a band of rows of its own below a line with its
+label, the groups in their given order; an edge between boxes of two groups crosses the bands. The links between the
+groups (routers linked to each other) are lines on the left that join the groups' label lines.
+
 The widget (``GraphView``) selects a session with the arrow keys or a click and colours its edges (out green, in
 cyan); the mouse over an edge or a box names it in the view's detail line (``hovered``), and ``describe`` tells the
-caller what to show.
+caller what to show. The view moves with shift and the arrow keys or by dragging with the mouse; ``0`` (or Home)
+returns to the whole graph's start, its top left.
 """
 
 from __future__ import annotations
@@ -23,7 +28,7 @@ from typing import ClassVar
 from rich.style import Style
 from rich.text import Text
 from textual.binding import Binding
-from textual.events import Click, Leave, MouseMove
+from textual.events import Click, Leave, MouseDown, MouseMove, MouseUp
 from textual.geometry import Region, Size
 from textual.message import Message
 from textual.reactive import reactive
@@ -32,7 +37,7 @@ from textual.widget import Widget
 N, E, S, W = 1, 2, 4, 8  # the directions a line leaves a cell in
 LINES = {N | S: "│", E | W: "─", N | E: "└", N | W: "┘", S | E: "┌", S | W: "┐", N | S | E: "├", N | S | W: "┤",
          E | W | S: "┬", E | W | N: "┴", N | E | S | W: "┼", N: "│", S: "│", E: "─", W: "─"}
-LABEL = 15  # the room for an edge's label before its arrow
+LABEL = 26  # the room for an edge's label before its arrow: topic, how it is taken, rate
 MIN_BOX, MAX_BOX = 18, 34  # a box's width
 LANE = 2  # columns per lane
 
@@ -53,6 +58,15 @@ class GraphEdge:
     source: str
     target: str
     label: str = ""
+
+
+@dataclasses.dataclass
+class GraphGroup:
+    """Boxes drawn together below a line with ``label`` (a router's id and host)."""
+
+    id: str
+    label: str
+    members: list[str] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -92,27 +106,31 @@ class Drawing:
     boxes: dict[str, Region] = dataclasses.field(default_factory=dict)
     layer_of: dict[str, int] = dataclasses.field(default_factory=dict)
     reversed: set[int] = dataclasses.field(default_factory=set)  # edges drawn against the flow
+    group_rows: dict[str, int] = dataclasses.field(default_factory=dict)  # a group -> the row of its label line
 
 
 def _layers(ids: list[str], edges: list[GraphEdge]) -> tuple[dict[str, int], set[int]]:
     """The column of every box (the longest path from a box nothing sends to) and the edges reversed to break the
-    cycles (depth-first search: an edge back to a box on the search's path)."""
-    out: dict[str, list[tuple[str, int]]] = {i: [] for i in ids}
+    cycles (depth-first search: an edge back to a box on the search's path). The search starts at the boxes nothing
+    sends to and follows the boxes' given order, so that the same graph gets the same drawing whatever its ids."""
+    rank = {i: n for n, i in enumerate(ids)}
+    out: dict[str, list[tuple[int, str, int]]] = {i: [] for i in ids}
+    fed = {e.target for e in edges}
     for n, e in enumerate(edges):
-        out[e.source].append((e.target, n))
+        out[e.source].append((rank[e.target], e.target, n))
     state: dict[str, int] = {}
     back: set[int] = set()
 
     def visit(u: str):
         state[u] = 1
-        for v, n in sorted(out[u]):
+        for _, v, n in sorted(out[u]):
             if state.get(v) == 1:
                 back.add(n)
             elif v not in state:
                 visit(v)
         state[u] = 2
 
-    for i in ids:
+    for i in [i for i in ids if i not in fed] + ids:
         if i not in state:
             visit(i)
     preds: dict[str, list[str]] = {i: [] for i in ids}
@@ -132,11 +150,22 @@ def _layers(ids: list[str], edges: list[GraphEdge]) -> tuple[dict[str, int], set
     return layer, back
 
 
-def layout(nodes: list[GraphNode], edges: list[GraphEdge]) -> Drawing:
-    """The drawing of ``nodes`` and ``edges`` (edges of a box to itself and of unknown boxes are left out)."""
+def layout(nodes: list[GraphNode], edges: list[GraphEdge], groups: list[GraphGroup] | None = None,
+           links: list[tuple[str, str]] = ()) -> Drawing:
+    """The drawing of ``nodes`` and ``edges`` (edges of a box to itself and of unknown boxes are left out); with
+    ``groups`` the boxes in bands, one per group (a box in none: in a last band without a label), and ``links``
+    between groups (their ids) as lines on the left."""
     known = {n.id: n for n in nodes}
     edges = [e for e in edges if e.source in known and e.target in known and e.source != e.target]
-    ids = [n.id for n in nodes]
+    groups = [g for g in (groups or [])]
+    group_of = {m: g.id for g in groups for m in g.members if m in known}
+    if groups and any(n.id not in group_of for n in nodes):
+        groups.append(GraphGroup("\0rest", ""))
+        group_of.update({n.id: "\0rest" for n in nodes if n.id not in group_of})
+    if not groups:
+        groups, group_of = [GraphGroup("\0all", "")], {n.id: "\0all" for n in nodes}
+    order = [g.id for g in groups]
+    ids = sorted((n.id for n in nodes), key=lambda i: order.index(group_of[i]))  # stable: the given order within
     layer, back = _layers(ids, edges)
     drawing = Drawing(layer_of=dict(layer), reversed=set(back))
     elements: dict[str, _Element] = {}
@@ -150,11 +179,12 @@ def layout(nodes: list[GraphNode], edges: list[GraphEdge]) -> Drawing:
         for step in range(layer[a] + 1, layer[b]):
             dummy = f"\0{k}\0{step}"
             elements[dummy] = _Element(dummy, step, dummy=True)
+            group_of[dummy] = group_of[a]  # a line through the columns between, in its source's band
             chain.append(dummy)
         chain.append(b)
         segments.extend(_Segment(k, left, right) for left, right in zip(chain, chain[1:]))
     count = max((el.layer for el in elements.values()), default=-1) + 1
-    columns = _order(elements, segments, count, ids)
+    columns = _order(elements, segments, count, ids, {i: order.index(g) for i, g in group_of.items()})
     # heights: a row per edge entering on the left, at least two of text
     entering: dict[str, list[int]] = {i: [] for i in elements}
     for s, seg in enumerate(segments):
@@ -163,7 +193,8 @@ def layout(nodes: list[GraphNode], edges: list[GraphEdge]) -> Drawing:
         if not el.dummy:
             text = len(known[el.id].lines)
             el.height = max(text, len(entering[el.id]), 2) + 2
-    tallest = _rows(elements, segments, columns)
+    labelled = len(groups) > 1 or bool(groups[0].label)
+    tallest, label_rows = _rows(elements, segments, columns, group_of, order, labelled)
     for el in elements.values():
         el.out_row = el.y if el.dummy else el.y + el.height // 2
         if el.dummy:
@@ -183,7 +214,10 @@ def layout(nodes: list[GraphNode], edges: list[GraphEdge]) -> Drawing:
                 elements[i].width = width
         x += width
         gaps.append(x)
-        x += 2 + LANE * len(senders[c]) + LABEL + 2 if c < count - 1 else 0
+        # the labels' room: the longest label entering the next column (at most LABEL)
+        room = max((min(len(edges[seg.edge].label), LABEL) for seg in segments
+                    if elements[seg.right].layer == c + 1 and not elements[seg.right].dummy), default=0)
+        x += 2 + LANE * len(senders[c]) + room + 2 if c < count - 1 else 0
     drawing.width, drawing.height = x, tallest
     # lines: lanes first, then the horizontals over them
     lane_x = {}
@@ -214,8 +248,41 @@ def layout(nodes: list[GraphNode], edges: list[GraphEdge]) -> Drawing:
         if not el.dummy:
             _box(drawing, el, known[el.id], bool(entering[el.id]) or any(s.left == el.id for s in segments),
                  any(s.left == el.id for s in segments))
+    if labelled:
+        for g in groups:
+            y = label_rows[g.id]
+            drawing.group_rows[g.id] = y
+            text = f"┄ {g.label or 'without a router'} " + "┄" * max(drawing.width, 8)
+            for n, ch in enumerate(text[:max(drawing.width, len(g.label) + 4)]):
+                drawing.glyphs[(n, y)] = (ch, "group", g.id)
+            drawing.width = max(drawing.width, len(g.label) + 4)
     _compact(drawing)
+    _links(drawing, [(a, b) for a, b in links if a in drawing.group_rows and b in drawing.group_rows])
     return drawing
+
+
+def _links(drawing: Drawing, links: list[tuple[str, str]]):
+    """The links between groups as lines on the left: everything moves right, each link a lane of its own that
+    joins the two groups' label lines."""
+    if not links:
+        return
+    margin = LANE * len(links) + 1
+    drawing.bits = {(x + margin, y): b for (x, y), b in drawing.bits.items()}
+    drawing.edges_at = {(x + margin, y): e for (x, y), e in drawing.edges_at.items()}
+    drawing.glyphs = {(x + margin, y): g for (x, y), g in drawing.glyphs.items()}
+    drawing.boxes = {i: r.translate((margin, 0)) for i, r in drawing.boxes.items()}
+    drawing.width += margin
+    bits: dict[tuple[int, int], int] = {}
+    for k, (a, b) in enumerate(links):
+        x = LANE * k
+        y0, y1 = sorted((drawing.group_rows[a], drawing.group_rows[b]))
+        for y in range(y0, y1 + 1):
+            bits[(x, y)] = bits.get((x, y), 0) | (N if y > y0 else 0) | (S if y < y1 else 0)
+        for y in (y0, y1):
+            for xx in range(x, margin):
+                bits[(xx, y)] = bits.get((xx, y), 0) | (W if xx > x else 0) | E
+    for (x, y), b in bits.items():
+        drawing.glyphs[(x, y)] = (LINES.get(b, " "), "link", None)
 
 
 def _compact(drawing: Drawing):
@@ -243,13 +310,16 @@ def _compact(drawing: Drawing):
     drawing.edges_at = {(x, y - shift[y]): e for (x, y), e in drawing.edges_at.items() if y not in drop}
     drawing.glyphs = {(x, y - shift[y]): g for (x, y), g in drawing.glyphs.items()}
     drawing.boxes = {i: Region(r.x, r.y - shift[r.y], r.width, r.height) for i, r in drawing.boxes.items()}
+    drawing.group_rows = {g: y - shift[y] for g, y in drawing.group_rows.items()}
     drawing.height -= len(gone)
 
 
-def _rows(elements: dict[str, _Element], segments: list[_Segment], columns: list[list[str]]) -> int:
+def _rows(elements: dict[str, _Element], segments: list[_Segment], columns: list[list[str]], group_of: dict[str, str],
+          order: list[str], labelled: bool) -> tuple[int, dict[str, int]]:
     """The elements' rows (``y``), in each column's order with a row between: sweeps to and fro move each element
-    to the mean row of its neighbours' ports, as far as the order lets it, which keeps the lines straight. Returns
-    the drawing's height."""
+    to the mean row of its neighbours' ports, as far as the order lets it, which keeps the lines straight. Group by
+    group (``order``), each in a band below the last (with a row for its label when ``labelled``). Returns the
+    drawing's height and each group's label row."""
     left: dict[str, list[str]] = {i: [] for i in elements}
     right: dict[str, list[str]] = {i: [] for i in elements}
     for seg in segments:
@@ -259,26 +329,33 @@ def _rows(elements: dict[str, _Element], segments: list[_Segment], columns: list
     def port(el: _Element) -> int:  # the row of an element's ports, from its top
         return 0 if el.dummy else el.height // 2
 
-    for col in columns:  # stacked first
-        y = 0
-        for i in col:
-            elements[i].y = y
-            y += elements[i].height + 1
-    for sweep in range(6):
-        order = range(len(columns)) if sweep % 2 == 0 else range(len(columns) - 1, -1, -1)
-        neighbours = left if sweep % 2 == 0 else right
-        for c in order:
-            y = 0
-            for i in columns[c]:
-                el = elements[i]
-                near = [elements[j].y + port(elements[j]) for j in neighbours[i]]
-                wanted = round(sum(near) / len(near)) - port(el) if near else el.y
-                el.y = max(wanted, y)
-                y = el.y + el.height + 1
-    top = min((el.y for el in elements.values()), default=0)
-    for el in elements.values():
-        el.y -= top
-    return max((el.y + el.height for el in elements.values()), default=0)
+    label_rows: dict[str, int] = {}
+    bottom = 0
+    for n, g in enumerate(order):
+        top = bottom + (1 if n else 0)  # a row between two bands
+        if labelled:
+            label_rows[g] = top
+            top += 1
+        band = [[i for i in col if group_of[i] == g] for col in columns]
+        for col in band:  # stacked first
+            y = top
+            for i in col:
+                elements[i].y = y
+                y += elements[i].height + 1
+        for sweep in range(6):
+            sweep_order = range(len(band)) if sweep % 2 == 0 else range(len(band) - 1, -1, -1)
+            neighbours = left if sweep % 2 == 0 else right
+            for c in sweep_order:
+                y = top
+                for i in band[c]:
+                    el = elements[i]
+                    near = [elements[j].y + port(elements[j]) for j in neighbours[i] if group_of[j] == g]
+                    wanted = round(sum(near) / len(near)) - port(el) if near else el.y
+                    el.y = max(wanted, y)
+                    y = el.y + el.height + 1
+        members = [elements[i] for col in band for i in col]
+        bottom = max([el.y + el.height for el in members] + [top])
+    return bottom, label_rows
 
 
 def _lanes(elements: dict[str, _Element], segments: list[_Segment], column: int) -> list[str]:
@@ -302,12 +379,14 @@ def _lanes(elements: dict[str, _Element], segments: list[_Segment], column: int)
     return ordered
 
 
-def _order(elements: dict[str, _Element], segments: list[_Segment], count: int, ids: list[str]) -> list[list[str]]:
+def _order(elements: dict[str, _Element], segments: list[_Segment], count: int, ids: list[str],
+           band: dict[str, int]) -> list[list[str]]:
     """The elements of each column in an order with few crossings: the mean position of the neighbours, sweeps down
-    and up (barycentre heuristic); the first order is the boxes' given order."""
+    and up (barycentre heuristic), within each band (``band``: element -> its group's place); the first order is the
+    boxes' given order."""
     rank = {i: n for n, i in enumerate(ids)}
-    columns = [sorted((i for i, el in elements.items() if el.layer == c), key=lambda i: (rank.get(i, len(rank)), i))
-               for c in range(count)]
+    columns = [sorted((i for i, el in elements.items() if el.layer == c),
+                      key=lambda i: (band[i], rank.get(i, len(rank)), i)) for c in range(count)]
     left: dict[str, list[str]] = {i: [] for i in elements}
     right: dict[str, list[str]] = {i: [] for i in elements}
     for seg in segments:
@@ -325,7 +404,7 @@ def _order(elements: dict[str, _Element], segments: list[_Segment], count: int, 
                 ps = [position[j] for j in neighbours[i] if j in position]
                 return sum(ps) / len(ps) if ps else n
 
-            columns[c] = [i for _, _, i in sorted((centre(i, n), n, i) for n, i in enumerate(columns[c]))]
+            columns[c] = [i for _, _, _, i in sorted((band[i], centre(i, n), n, i) for n, i in enumerate(columns[c]))]
     return columns
 
 
@@ -394,7 +473,13 @@ class GraphView(Widget, can_focus=True):
     BINDINGS: ClassVar = [Binding("up", "move(0, -1)", "Up", show=False),
                           Binding("down", "move(0, 1)", "Down", show=False),
                           Binding("left", "move(-1, 0)", "Left", show=False),
-                          Binding("right", "move(1, 0)", "Right", show=False)]
+                          Binding("right", "move(1, 0)", "Right", show=False),
+                          Binding("shift+up", "pan(0, -1)", "Move the view", show=False),
+                          Binding("shift+down", "pan(0, 1)", "Move the view", show=False),
+                          Binding("shift+left", "pan(-1, 0)", "Move the view", show=False),
+                          Binding("shift+right", "pan(1, 0)", "Move the view", show=False),
+                          Binding("0,home", "whole", "Whole graph", show=False)]
+    PAN = (8, 4)  # columns, rows per shift+arrow
     selected: reactive[str | None] = reactive(None)
     hovered: reactive[tuple[str, object] | None] = reactive(None)  # ("node", id) or ("edges", {edge numbers})
 
@@ -412,18 +497,24 @@ class GraphView(Widget, can_focus=True):
         super().__init__(**kwargs)
         self.nodes: list[GraphNode] = []
         self.edges: list[GraphEdge] = []
+        self.groups: list[GraphGroup] = []
         self.drawing = Drawing()
         self._signature = None
+        self._drag: tuple[int, int, float, float] | None = None  # where a drag began: screen x, y, scroll x, y
+        self._dragged = False
 
-    def show(self, nodes: list[GraphNode], edges: list[GraphEdge]):
-        """Draws ``nodes`` and ``edges`` anew if they changed; the selection stays while its box does."""
+    def show(self, nodes: list[GraphNode], edges: list[GraphEdge], groups: list[GraphGroup] | None = None,
+             links: list[tuple[str, str]] = ()):
+        """Draws ``nodes`` and ``edges`` (in ``groups``, with ``links`` between them: ``layout``) anew if they
+        changed; the selection stays while its box does."""
         signature = (tuple((n.id, n.title, tuple(n.lines)) for n in nodes),
-                     tuple((e.source, e.target, e.label) for e in edges))
+                     tuple((e.source, e.target, e.label) for e in edges),
+                     tuple((g.id, g.label, tuple(g.members)) for g in groups or ()), tuple(links))
         if signature == self._signature:
             return
         self._signature = signature
-        self.nodes, self.edges = nodes, edges
-        self.drawing = layout(nodes, edges)
+        self.nodes, self.edges, self.groups = nodes, edges, list(groups or [])
+        self.drawing = layout(nodes, edges, groups, links)
         if self.selected not in self.drawing.boxes:
             self.selected = next(iter(sorted(self.drawing.boxes, key=self._place)), None)
         if self.hovered is not None and self.hovered[0] == "node" and self.hovered[1] not in self.drawing.boxes:
@@ -481,6 +572,34 @@ class GraphView(Widget, can_focus=True):
             self.selected = min(there, key=lambda b: abs(boxes[b].y + boxes[b].height // 2
                                                         - here.y - here.height // 2))
 
+    def _scroller(self):
+        parent = self.parent
+        return parent if parent is not None and hasattr(parent, "scroll_to") else None
+
+    def action_pan(self, dx: int, dy: int):
+        """Moves the view by PAN columns or rows."""
+        scroller = self._scroller()
+        if scroller is not None:
+            scroller.scroll_relative(dx * self.PAN[0], dy * self.PAN[1], animate=False)
+
+    def action_whole(self):
+        """Back to the whole graph: its start (top left) in view."""
+        scroller = self._scroller()
+        if scroller is not None:
+            scroller.scroll_to(0, 0, animate=False)
+
+    def on_mouse_down(self, event: MouseDown):
+        scroller = self._scroller()
+        if scroller is not None and event.button == 1:
+            self._drag = (event.screen_x, event.screen_y, scroller.scroll_x, scroller.scroll_y)
+            self._dragged = False
+            self.capture_mouse()
+
+    def on_mouse_up(self, event: MouseUp):
+        if self._drag is not None:
+            self._drag = None
+            self.release_mouse()
+
     def _at(self, x: int, y: int) -> tuple[str, object] | None:
         for node, region in self.drawing.boxes.items():
             if region.contains(x, y):
@@ -492,6 +611,14 @@ class GraphView(Widget, can_focus=True):
         return ("edges", frozenset(edges)) if edges else None
 
     def on_mouse_move(self, event: MouseMove):
+        scroller = self._scroller()
+        if self._drag is not None and scroller is not None and event.button == 1:
+            x0, y0, sx, sy = self._drag
+            dx, dy = event.screen_x - x0, event.screen_y - y0
+            if dx or dy:
+                self._dragged = True
+                scroller.scroll_to(sx - dx, sy - dy, animate=False)
+            return
         what = self._at(event.x, event.y)
         if what != self.hovered:
             self.hovered = what
@@ -500,6 +627,10 @@ class GraphView(Widget, can_focus=True):
         self.hovered = None
 
     def on_click(self, event: Click):
+        if self._dragged:  # the end of a drag that moved the view, not a choice
+            self._dragged = False
+            self.focus()
+            return
         what = self._at(event.x, event.y)
         if what is not None and what[0] == "node":
             self.selected = what[1]
@@ -529,7 +660,12 @@ class GraphView(Widget, can_focus=True):
                 glyph = d.glyphs.get((x, y))
                 if glyph is not None:
                     ch, kind, owner = glyph
-                    if kind in ("arrow", "label"):
+                    if kind == "group" and ch == "┄" and (x, y) in d.bits:  # an edge crossing the line: the edge
+                        row.append(LINES.get(d.bits[(x, y)], " "), edge_style(d.edges_at[(x, y)]))
+                        continue
+                    if kind in ("group", "link"):
+                        style = Style(color="blue", bold=kind == "group")
+                    elif kind in ("arrow", "label"):
                         style = edge_style({owner})
                         if kind == "label" and not ({owner} & (hovered_edges | out_edges | in_edges)):
                             style = Style(dim=True, italic=True)

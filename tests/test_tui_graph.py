@@ -5,7 +5,7 @@ import pytest
 
 from xblick import tui
 from xblick.session import endpoint
-from xblick.tui_graph import LINES, GraphEdge, GraphNode, GraphView, layout
+from xblick.tui_graph import LINES, GraphEdge, GraphGroup, GraphNode, GraphView, layout
 
 
 @pytest.mark.parametrize("typed, wanted", [
@@ -113,3 +113,80 @@ def test_hovering_an_edge_and_moving_the_selection():
     assert view.selected == "s"
     view.action_move(-1, 0)
     assert view.selected == "k"
+
+
+def many(n: int) -> tuple[list[GraphNode], list[GraphEdge], list[GraphGroup]]:
+    """Two routers' groups: a camera on each, ``n`` nodes in all that take a camera's frames, one of them across."""
+    nodes = [GraphNode("cam-a", "a/camera", ["xblick cam"]), GraphNode("cam-b", "b/camera", ["xblick cam"])]
+    edges = []
+    groups = [GraphGroup("ra", "router aaaaaaaa  pc-a", ["cam-a"]),
+              GraphGroup("rb", "router bbbbbbbb  pc-b", ["cam-b"])]
+    for k in range(n - 2):
+        side = "ab"[k % 2]
+        nodes.append(GraphNode(f"n{k}", f"{side}/camera/node{k}", [f"xblick-node{k}"]))
+        edges.append(GraphEdge(f"cam-{side}", f"n{k}", "shm"))
+        groups[k % 2].members.append(f"n{k}")
+    edges.append(GraphEdge("cam-a", "n1", "tcp-compressed"))  # across the routers
+    edges += [GraphEdge(f"n{k}", f"n{k + 2}", "detections") for k in range(0, 6, 2)]  # a chain: four columns
+    return nodes, edges, groups
+
+
+@pytest.mark.parametrize("n", [20, 40])
+def test_many_nodes_on_two_routers_stand_in_their_bands(n):
+    """Every box in its group's band below the group's line, no two boxes on each other, the link on the left."""
+    nodes, edges, groups = many(n)
+    d = layout(nodes, edges, groups, [("ra", "rb")])
+    assert len(d.boxes) == n and d.group_rows["ra"] < d.group_rows["rb"]
+    for g in groups:
+        nxt = min((y for other, y in d.group_rows.items() if y > d.group_rows[g.id]), default=d.height)
+        for m in g.members:
+            box = d.boxes[m]
+            assert d.group_rows[g.id] < box.y and box.bottom <= nxt, (m, box, d.group_rows)
+    regions = list(d.boxes.values())
+    assert not any(a.overlaps(b) for i, a in enumerate(regions) for b in regions[i + 1:])
+    assert all(r.x >= 2 for r in regions)  # the link's lane on the left
+    assert d.glyphs[(0, d.group_rows["ra"])][1] == "link" and d.glyphs[(0, d.group_rows["rb"])][1] == "link"
+    drawn = GraphView()
+    drawn.show(nodes, edges, groups, [("ra", "rb")])
+    text = drawn.render().plain
+    assert "┄ router aaaaaaaa  pc-a" in text and "┄ router bbbbbbbb  pc-b" in text
+
+
+def test_the_view_moves_and_returns_to_the_whole_graph():
+    """Too large for the terminal: shift and the arrow keys move the view, 0 returns to its start; the arrow keys
+    still choose boxes."""
+    from textual.app import App
+    from textual.containers import VerticalScroll
+
+    nodes, edges, groups = many(40)
+
+    class One(App):
+        CSS = "#s { height: 1fr; overflow-x: auto; }"
+
+        def compose(self):
+            with VerticalScroll(id="s"):
+                yield GraphView(id="g")
+
+        def on_mount(self):
+            self.query_one(GraphView).show(nodes, edges, groups, [("ra", "rb")])
+            self.query_one(GraphView).focus()
+
+    async def main():
+        app = One()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause(0.2)
+            scroll, graph = app.query_one("#s"), app.query_one(GraphView)
+            assert graph.drawing.height > 24 and graph.drawing.width > 80
+            await pilot.press("shift+down", "shift+down", "shift+right")
+            await pilot.pause(0.2)
+            assert scroll.scroll_y == 2 * GraphView.PAN[1] and scroll.scroll_x == GraphView.PAN[0]
+            await pilot.press("0")
+            await pilot.pause(0.2)
+            assert (scroll.scroll_x, scroll.scroll_y) == (0, 0)
+            first = graph.selected
+            await pilot.press("down")
+            assert graph.selected != first
+
+    import asyncio
+
+    asyncio.run(main())
