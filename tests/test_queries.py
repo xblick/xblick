@@ -784,7 +784,7 @@ def test_the_target_and_its_deadline_on_the_nodes_clock():
             self.attachment = None if record is None else zenoh.ZBytes(json.dumps(record).encode())
 
     now = zs.command_clock_ns()
-    for ahead in (0, 5 * 10**12, -3 * 10**12):
+    for ahead in (0, 5 * 10**12, -(now // 2)):  # behind by half this boot: a clock reading is never negative
         to = zs.target_of(Answer({zs.COMMAND_FIELD: 1, "zid": "ab12", "clock_ns": now + ahead, "checked": []}), now)
         assert to == CommandTarget("ab12", ahead)
         before = zs.command_clock_ns()
