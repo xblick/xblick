@@ -682,8 +682,9 @@ def test_without_anything_on_this_pc_the_connect_dialog_opens_on_the_address(fak
     app = tui.XblickApp(presets=tui.Presets(tmp_path / "presets.json"), discover_every=0.5)
 
     async def test(pilot):
+        # (a query, not query_one: the screen is pushed some frames before its widgets are composed)
         await until(pilot, lambda: isinstance(app.screen, tui.ConnectScreen)
-                    and app.focused is app.screen.query_one("#connect-endpoints"))
+                    and app.focused in app.screen.query("#connect-endpoints"))
         await pilot.press(*fake.endpoint.removeprefix("tcp/"), "enter")
         await until(pilot, lambda: app.discovery.network is not None and len(app.discovery.network.routers) == 1)
         assert app.connection == tui.Connection(connect=[fake.endpoint], mode="client")

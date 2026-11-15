@@ -81,12 +81,15 @@ def shown_keys(keys, name: str = "") -> list[str]:
 
 
 def fit(items: list[str], width: int, what: str = "topics") -> str:
-    """``items`` joined by ``, ``, or their count when that does not fit ``width``; ``–`` for none."""
+    """``items`` joined by ``, ``, or their count when that does not fit ``width`` (one item: its end); ``–`` for
+    none."""
     if not items:
         return DASH
     text = ", ".join(items)
     if len(text) <= width:
         return text
+    if len(items) == 1:  # its end says most (the stream)
+        return "…" + text[len(text) - width + 1:] if width > 1 else text[:width]
     count = f"{len(items)} {what if len(items) > 1 else what.rstrip('s')}"
     return count if len(count) <= width else cut(count, width)
 
@@ -104,10 +107,11 @@ def name_of(network: survey.Network, zid: str) -> str:
     node = network.nodes.get(zid)
     if node is None or node.whatami == "router":
         return DASH
-    label = node.label
-    if label.startswith("subscribes ") or label.endswith(" keys") or label == "nothing declared":
-        return DASH
-    return label
+    # what its own keys share: published and answered, without the keys every node shares (diagnostics,
+    # parameter_events) and without liveliness tokens (a reader's want tokens stand below the streams it reads)
+    own = {k for k in node.publishes | node.queryables
+           if not declaration.zid_of(k) and k.rsplit("/", 1)[-1] not in LEFT_OUT}
+    return survey.common_prefix(own) or DASH
 
 
 def program_of(network: survey.Network, zid: str, router_host: str = "", own_host: str = "") -> str:

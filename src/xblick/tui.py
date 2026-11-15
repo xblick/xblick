@@ -946,8 +946,9 @@ class XblickApp(App):
             for zid in set(network.nodes) | set(network.programs):
                 program = network.program(zid)
                 node = network.nodes.get(zid)
-                labels[zid] = (program.name or program.program) if program is not None else (
-                    node.label if node is not None else _short(zid))
+                name = tui_nodes.name_of(network, zid)
+                labels[zid] = (name if name != tui_nodes.DASH else program.program if program is not None
+                               else node.label if node is not None else _short(zid))
         labels[own] = "this interface"
         return labels
 
