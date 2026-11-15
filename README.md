@@ -1,6 +1,6 @@
 # Durchblick
 
-[![PyPI](https://img.shields.io/pypi/v/xblick)](https://pypi.org/project/xblick/) [![Python](https://img.shields.io/pypi/pyversions/xblick)](https://pypi.org/project/xblick/) [![CI](https://github.com/xblick/xblick/actions/workflows/ci.yml/badge.svg)](https://github.com/xblick/xblick/actions/workflows/ci.yml) [![licence](https://img.shields.io/badge/licence-Apache--2.0-blue)](https://github.com/xblick/xblick/blob/main/LICENSE) [![platform](https://img.shields.io/badge/platform-Linux%20x86__64-lightgrey)](https://github.com/xblick/xblick/blob/main/docs/getting-started/install.md) [![Zenoh](https://img.shields.io/badge/Zenoh-1.10-informational)](https://zenoh.io)
+[![release](https://img.shields.io/github/v/release/xblick/xblick?label=release)](https://github.com/xblick/xblick/releases/latest) [![PyPI](https://img.shields.io/pypi/v/xblick)](https://pypi.org/project/xblick/) [![Python](https://img.shields.io/pypi/pyversions/xblick)](https://pypi.org/project/xblick/) [![CI](https://github.com/xblick/xblick/actions/workflows/ci.yml/badge.svg)](https://github.com/xblick/xblick/actions/workflows/ci.yml) [![licence](https://img.shields.io/badge/licence-Apache--2.0-blue)](https://github.com/xblick/xblick/blob/main/LICENSE) [![platform](https://img.shields.io/badge/platform-Linux%20x86__64-lightgrey)](https://github.com/xblick/xblick/blob/main/docs/getting-started/install.md) [![Zenoh](https://img.shields.io/badge/Zenoh-1.10-informational)](https://zenoh.io)
 
 Durchblick is a middleware for camera streams and perception results. It moves frames between programs in shared
 memory and in GPU memory, and it uses the message types of ROS 2 without needing ROS.
@@ -142,7 +142,7 @@ Coding agents read [AGENTS.md](https://github.com/xblick/xblick/blob/main/AGENTS
 
 ## Status
 
-Version 0.5.13. Durchblick is in active development, and a new minor version can change the protocol. All
+Version 0.5.14. Durchblick is in active development, and a new minor version can change the protocol. All
 programs of one setup speak the same protocol. We now released that version.
 The [changelog](https://github.com/xblick/xblick/blob/main/CHANGELOG.md) states which versions do. Programs of
 0.5 do not work with programs of 0.3 or 0.4. The nodes are tested in simulation and on recordings. Tests on robots

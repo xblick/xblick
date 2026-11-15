@@ -11,6 +11,29 @@ Each version below is a heading with its release notes: one summary sentence, th
 (and Known limit), one line on compatibility. `tools/release_notes.sh <version>` prints a version's notes for its
 GitHub release. The rule is in [Development](docs/project/development.md#release-notes).
 
+## 0.5.14
+
+`xblick play` gives each of any number of videos its own camera, calibration and pose, so that two videos make a
+calibrated stereo pair, and all three camera commands say plainly when they assume a calibration.
+
+### Added
+
+- `xblick play --pose X Y Z YAW PITCH ROLL`, once per video: the video's fixed pose on `<camera>/tf_static`, as `xblick cam --pose`.
+- `xblick test-camera --camera-info FILE` and `--hfov`: the same calibration reader as `xblick cam` and `xblick play`.
+- The video guide's section "A stereo pair from two videos".
+
+### Changed
+
+- One rule for every option of a video: once per video, once for all, or not at all; another count is refused at the start. `--camera`, `--fps`, `--size`, `--scale`, `--hfov` and `--vfov` now also take one value per video.
+- Without a calibration, `xblick play`, `xblick cam` and `xblick test-camera` say in their start line which field of view they assume (unchanged: 60 degrees horizontal, the test camera 60 degrees vertical).
+- The README's first shield shows the latest GitHub release.
+
+### Fixed
+
+- `xblick recorder play` with options of videos was refused by the play node.
+
+Compatible with 0.5.13: nothing on the wire changes.
+
 ## 0.5.13
 
 A command names the node it is meant for and carries the deadline at which its caller stops waiting; Durchblick's parameter servers and record and play node refuse it when it is meant for another node or late.
