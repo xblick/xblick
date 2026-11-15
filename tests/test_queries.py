@@ -346,6 +346,13 @@ def test_two_nodes_on_one_key_get_no_command(network):
     try:
         time.sleep(0.5)
         with network.new_session() as s:
+            # a session just opened links to the serving sessions one after the other: its read before a command
+            # may see one node only (the documented limit). Wait until it sees both nodes of every key.
+            deadline = time.monotonic() + 10.0
+            for key in ("t/two/node/list_parameters", f"{M}/list_controllers", "xblick/rec/status"):
+                while len([r for r in replies(s, key, 1.0) if r.ok]) < 2:
+                    assert time.monotonic() < deadline, f"the new session sees fewer than 2 nodes at {key}"
+                    time.sleep(0.1)
             with pytest.raises(RuntimeError, match="not sent: 2 nodes answer t/two/node/list_parameters"):
                 ParameterClient(s, "t/two/node", 2.0).set({"x": 1.0})
             for call in (lambda m: m.create("arms", "Impedance", {}), lambda m: m.switch(activate=["arms"]),
