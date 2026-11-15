@@ -46,7 +46,10 @@ from xblick.session import close as close_session
 
 REPO = Path(__file__).resolve().parents[1]
 CAMERA = "robot/camera"
-HOST = _core.host_id()  # the rings' keys name the host
+# the rings' keys name the host by its boot id: a made-up one, so that no screenshot shows this PC's; the publishers
+# and readers of this process take it too (they ask _core.host_id), so their keys and descriptors agree
+HOST = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
+_core.host_id = lambda: HOST
 SIZE = (150, 42)  # columns, rows of the screenshots
 FONT = Path("/usr/share/fonts/truetype/dejavu")
 IDENTITY = {"host": "robot-pc", "command": ["xblick"]}  # the made-up host and command line of the next declaration
