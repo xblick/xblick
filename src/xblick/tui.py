@@ -989,8 +989,9 @@ class XblickApp(App):
             traffic.update(self.detail.snapshot())
         labels = short_names(self._labels())
         own = str(self.session.info.zid()) if self.session else ""
-        subscriptions = ([(n.zid, zenoh.KeyExpr(s)) for n in network.nodes.values() if n.zid != own
-                          for s in n.subscribes] if network else [])
+        # a router subscribes in the admin space for the sessions behind it, which stand here themselves
+        subscriptions = ([(n.zid, zenoh.KeyExpr(s)) for n in network.nodes.values()
+                          if n.zid != own and n.zid not in network.routers for s in n.subscribes] if network else [])
         now = time.time_ns()
         keys = set(publishers) | set(traffic)
 

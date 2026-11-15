@@ -513,14 +513,15 @@ class GraphView(Widget, can_focus=True):
         if signature == self._signature:
             return
         self._signature = signature
+        same_edges = [(e.source, e.target) for e in self.edges] == [(e.source, e.target) for e in edges]
         self.nodes, self.edges, self.groups = nodes, edges, list(groups or [])
         self.drawing = layout(nodes, edges, groups, links)
         if self.selected not in self.drawing.boxes:
             self.selected = next(iter(sorted(self.drawing.boxes, key=self._place)), None)
         if self.hovered is not None and self.hovered[0] == "node" and self.hovered[1] not in self.drawing.boxes:
             self.hovered = None
-        elif self.hovered is not None and self.hovered[0] == "edges":
-            self.hovered = None  # edges are numbered anew
+        elif self.hovered is not None and self.hovered[0] == "edges" and not same_edges:
+            self.hovered = None  # edges are numbered anew (the same edges with new labels, rates: kept)
         self.refresh(layout=True)
 
     def _place(self, node: str) -> tuple[int, int]:
