@@ -326,12 +326,13 @@ class Command:
                 lines.append(self.process.stdout.readline())
             return lines
         end = time.monotonic() + timeout
-        while text not in self.out:
+        # the whole line: the text may come before the rest of its line
+        while text not in self.out or "\n" not in self.out[self.out.index(text):]:
             assert time.monotonic() < end, self.out
             if select.select([self.master], [], [], 0.2)[0]:
                 self.out += os.read(self.master, 4096).decode(errors="replace").replace("\r\n", "\n")
         cut = self.out.index(text) + len(text)
-        cut = self.out.find("\n", cut) + 1 or len(self.out)
+        cut = self.out.find("\n", cut) + 1
         shown, self.out = self.out[:cut], self.out[cut:]
         return shown.splitlines(keepends=True)
 
@@ -620,6 +621,7 @@ def stop(t) -> tuple[int, str, bool]:
 
 def test_the_list_groups_by_namespace_and_camera(listing, tmp_path):
     t = listing()
+    t.wait(lambda: "▸ u" in t.frame())  # the title is drawn a little before the lines below it
     frame = t.frame()
     assert "❯ ▸ t" in frame and "▸ u" in frame, frame
     assert "t/view/quiet" not in frame and "quiet" not in frame  # found only when expanded
