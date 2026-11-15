@@ -63,7 +63,7 @@ class Terminal:
             self.wait("Zenoh connection")
         self.type(endpoint.removeprefix("tcp/"))
         self.press("Enter")
-        self.wait("router(s)")
+        self.wait(regex=r"\d+ routers?, \d+ nodes?")
 
     def state(self) -> dict:
         return json.loads(self("--json", "sessions", "show", self.session))["sessions"][0]
@@ -98,7 +98,9 @@ def test_blick_in_a_real_terminal(fake, terminal, tmp_path, size):  # noqa: F811
     # connect through the dialog, as a user does: the address, client mode (the default there), Enter
     terminal.connect(fake.endpoint)
     lines = terminal.screen().splitlines()
-    assert "Durchblick" in lines[0] and "--zenoh-mode client --connect" in lines[1], lines[:3]
+    # the status line: the router connected to and its address (narrow: on the next lines)
+    assert "Durchblick" in lines[0] and "connected to router" in lines[1], lines[:4]
+    assert fake.endpoint in "".join(line.strip() for line in lines[1:4]), lines[:4]
 
     # m measures: rates in the table, the status line says so
     terminal.press("m")
@@ -128,8 +130,10 @@ def test_blick_in_a_real_terminal(fake, terminal, tmp_path, size):  # noqa: F811
     terminal.press("2")
     terminal.wait(f"{CAMERA}/tracker")
     terminal.wait("waiting: frames")
-    terminal.press("Enter")  # the first session's detail (rows by zid: a router or a session)
-    terminal.wait(regex=r"router v1\.|address tcp/")
+    terminal.press("Enter")  # the first row's detail: the router's (its group's head)
+    terminal.wait("listens on tcp/")
+    terminal.press("ArrowDown", "ArrowDown", "ArrowDown")  # below its links and the column names: a node
+    terminal.wait(regex=r"program \S+ \S+  \(Durchblick ")
 
     terminal.press("3")
     terminal.wait("tcp-compressed")  # the edge's label, before its arrow
@@ -147,7 +151,7 @@ def test_blick_in_a_real_terminal(fake, terminal, tmp_path, size):  # noqa: F811
     terminal("resize", "--cols", "250", "--rows", "70", terminal.session)
     terminal.wait(f"xblick rerun --spawn {BASE} --zenoh-mode client --connect {fake.endpoint}")
     assert "terminal too small" not in terminal.screen()
-    assert "--zenoh-mode client --connect" in terminal.screen().splitlines()[1]
+    assert "connected to router" in terminal.screen().splitlines()[1]
 
     terminal.press("1")
     terminal.press("q")  # ends cleanly: exit code 0, no traceback on the screen

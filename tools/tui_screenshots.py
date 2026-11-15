@@ -3,10 +3,12 @@
     uv run python tools/tui_screenshots.py              # docs/media/tui/*.png
     uv run python tools/tui_screenshots.py --out DIR    # elsewhere
 
-The network runs in this process, each "program" a Zenoh session of its own on a router with the admin space on (as
-zenohd): an Azure Kinect (color and depth, frames from a pattern), SAM 3 taking the color images by shm, FoundationPose
-taking color, depth and SAM 3's instances, TAPNext and SAM 3 taking each other's results (a cycle), a robot state
-bridge, a recorder and a viewer as a client taking compressed images. SAM 3 offers some of xblick-sam3's
+The network runs in this process, each "program" a Zenoh session of its own, declared as the program it stands for
+(its host and command line made up too), on two routers with the admin space on: ``robot-pc`` (as xblick router,
+its record in its metadata) and ``laptop`` (as zenohd), linked. On robot-pc: an Azure Kinect (color and depth, frames
+from a pattern), SAM 3 taking the color images by shm, FoundationPose taking color, depth and SAM 3's instances,
+TAPNext and SAM 3 taking each other's results (a cycle), a robot state bridge of a program before 0.5.9 (it declares
+nothing) and a recorder; on laptop a viewer as a client taking compressed images. SAM 3 offers some of xblick-sam3's
 parameters, with its names, defaults and live ones (its options as declare_options makes them). Only the camera sends images; the nodes send
 their results and diagnostics as small JSON. Nothing of a real node runs.
 
@@ -33,7 +35,7 @@ from pathlib import Path
 import numpy as np
 import zenoh
 
-from xblick import tui
+from xblick import declaration, router, tui
 from xblick.camera import CameraPublisher
 from xblick.diagnostics import DiagnosticsPublisher
 from xblick.msg import CameraInfo
@@ -47,6 +49,16 @@ CAMERA = "robot/camera"
 HOST = _core.host_id()  # the rings' keys name the host
 SIZE = (150, 42)  # columns, rows of the screenshots
 FONT = Path("/usr/share/fonts/truetype/dejavu")
+IDENTITY = {"host": "robot-pc", "command": ["xblick"]}  # the made-up host and command line of the next declaration
+_record = declaration.program_record
+
+
+def made_up_record(program: str, version: str | None) -> dict:
+    """A program's record with the made-up host and command line (IDENTITY), not this PC's."""
+    return {**_record(program, version), "host": IDENTITY["host"], "command": list(IDENTITY["command"])}
+
+
+declaration.program_record = made_up_record
 
 
 def free_port() -> int:
@@ -61,19 +73,23 @@ class DemoNetwork:
     """The made-up network (see the module's docstring)."""
 
     def __init__(self):
-        port = free_port()
+        port, laptop_port = free_port(), free_port()
         self.endpoint = f"tcp/127.0.0.1:{port}"
-        config = zenoh.Config()
+        self.laptop = f"tcp/127.0.0.1:{laptop_port}"
+        IDENTITY.update(host="robot-pc", command=["xblick", "router"])
+        self.routers = [router.open_router([self.endpoint])]
+        config = zenoh.Config()  # as zenohd: no record of its own
         config.insert_json5("mode", '"router"')
-        config.insert_json5("listen/endpoints", json.dumps([self.endpoint]))
+        config.insert_json5("listen/endpoints", json.dumps([self.laptop]))
+        config.insert_json5("connect/endpoints", json.dumps([self.endpoint]))
         config.insert_json5("scouting/multicast/enabled", "false")
         config.insert_json5("adminspace/enabled", "true")
-        self.router = Session(zenoh.open(config))
+        self.routers.append(Session(zenoh.open(config)))
         self.sessions, self.closers = [], []
         self._stop = threading.Event()
         self._threads = []
 
-        kinect = self._session()
+        kinect = self._session("xblick-azure-kinect", ["xblick-azure-kinect", "--camera", CAMERA, "--fps", "30"])
         info = CameraInfo.pinhole(64, 48, 50.0, 50.0, 31.5, 23.5, frame_id="azurekinect_color")
         color = CameraPublisher(kinect, f"{CAMERA}/color", encoding="rgb8", frame_id="azurekinect_color",
                                 camera_info=info, source="demo")
@@ -114,7 +130,7 @@ class DemoNetwork:
         self.params.declare("max_hz", 30.0, read_only=True, description="--max-hz: at most this many frames a second")
         self.params.check_overrides()
         self.closers.append(self.params.close)
-        bridge = self._session()
+        bridge = self._session(None, [])  # a program before 0.5.9: it declares nothing
         robot = [bridge.declare_publisher(k) for k in ("robot/joint_states", "robot/tf",
                                                          "robot/controller/arms/status")]
 
@@ -126,7 +142,8 @@ class DemoNetwork:
                 time.sleep(0.01)
 
         self._thread(state)
-        recorder = self._session()
+        recorder = self._session("xblick record", ["xblick", "record", "--dir", "/data/robot"])
+        declaration.add_name(recorder, "recorder")
         status = recorder.declare_queryable(
             "xblick/recorder/status",
             lambda q: q.reply("xblick/recorder/status", json.dumps(
@@ -134,15 +151,22 @@ class DemoNetwork:
                  "dropped": 0}), encoding=zenoh.Encoding.APPLICATION_JSON))
         recorder_subs = [recorder.declare_subscriber(k, lambda s: None) for k in ("robot/joint_states", "robot/tf")]
         self.closers += [status.undeclare, *[s.undeclare for s in recorder_subs]]
-        viewer = self._session(client=True)
+        viewer = self._session("xblick view", ["xblick", "view", f"{CAMERA}/color", "--connect", "robot-pc"],
+                               client=True, host="laptop", endpoint=self.laptop)
         viewer_subs = [viewer.declare_subscriber(k, lambda s: None)
-                       for k in (f"{CAMERA}/color/image_raw/compressed", f"{CAMERA}/sam3/instances",
-                                 f"{CAMERA}/foundationpose/tf")]
+                       for k in (f"{CAMERA}/color/image_raw/compressed", f"{CAMERA}/sam3/instances")]
         self.closers += [s.undeclare for s in viewer_subs]
 
-    def _session(self, client: bool = False):
-        session = (open_session(connect=[self.endpoint], mode="client") if client else
-                   open_session(connect=[self.endpoint], listen=["127.0.0.1:0"]))
+    def _session(self, program: str | None, command: list[str], client: bool = False, host: str = "robot-pc",
+                 endpoint: str | None = None):
+        """A program's session (``program`` None: one that declares nothing), declared with ``host`` and
+        ``command``."""
+        IDENTITY.update(host=host, command=command)
+        endpoint = endpoint or self.endpoint
+        options = dict(program=program, declare=program is not None)
+        session = (open_session(connect=[endpoint], mode="client", **options) if client else
+                   open_session(connect=[endpoint], listen=["127.0.0.1:0"], **options))
+        IDENTITY.update(host="robot-pc", command=["xblick"])  # the interface's own, opened later
         self.sessions.append(session)
         return session
 
@@ -153,7 +177,8 @@ class DemoNetwork:
 
     def _node(self, name: str, takes: list[str], gives: list[str], rate: float):
         """A vision node: subscribes to ``takes``, publishes ``<camera>/<name>/<give>`` and its diagnostics."""
-        session = self._session()
+        session = self._session(f"xblick-{name}", [f"xblick-{name}", "--camera", CAMERA])
+        declaration.add_name(session, f"{CAMERA}/{name}")  # as node.Reporter does
         subscribers = [session.declare_subscriber(k, lambda s: None) for k in takes]
         publishers = [session.declare_publisher(f"{CAMERA}/{name}/{g}") for g in gives]
         diag = DiagnosticsPublisher(session, CAMERA, name)
@@ -179,7 +204,7 @@ class DemoNetwork:
             thread.join()
         for close in self.closers:
             close()
-        for session in [*self.sessions, self.router]:
+        for session in [*self.sessions, *self.routers[::-1]]:
             close_session(session)
 
 
@@ -228,7 +253,8 @@ async def capture(network: DemoNetwork, out: Path):
         shots.append(path)
 
     async with app.run_test(size=SIZE) as pilot:
-        await until(pilot, lambda: app.discovery.network is not None and len(app.discovery.network.nodes) >= 9)
+        await until(pilot, lambda: app.discovery.network is not None and len(app.discovery.network.nodes) >= 10
+                    and len(app.discovery.network.programs) >= 7 and len(app.discovery.network.routers) == 2)
         await until(pilot, lambda: len(app.query_one("#graph").edges) >= 9)
         await pilot.press("m")  # rates, sizes and ages of every topic
         await pilot.pause(3.5)
@@ -237,20 +263,25 @@ async def capture(network: DemoNetwork, out: Path):
         await until(pilot, lambda: app.detail.last(f"{CAMERA}/color/image_raw/compressed") is not None)
         await pilot.pause(1.5)
         save("topic-detail")
-        await pilot.press("escape", "m")
+        await pilot.press("escape")  # still measuring: the rates on the graph's lines
         await pilot.press("3")
         graph = app.query_one("#graph")
         sam3 = str(network.sam3.info.zid())
         graph.selected = sam3
         await pilot.pause(0.5)
         save("graph")
-        edge = next(k for k, e in enumerate(graph.edges) if e.target == sam3 and e.label == "shm")
+        edge = next(k for k, e in enumerate(graph.edges) if e.target == sam3 and e.label.startswith("color shm"))
         graph.hovered = ("edges", frozenset({edge}))
         await pilot.pause(0.5)
         save("graph-edge")
         graph.hovered = None
+        await pilot.press("m")  # measuring ends
         await pilot.press("2")
         await pilot.pause(1.0)
+        table = app.query_one("#node-table")
+        sam3_row = [k.value for k in table.rows].index(f"node\t{sam3}")
+        table.move_cursor(row=sam3_row)  # its detail below
+        await pilot.pause(0.5)
         save("nodes")
         await pilot.press("4")
         await pilot.pause(1.0)

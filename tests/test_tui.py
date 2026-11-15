@@ -21,7 +21,7 @@ import zenoh
 from rich.console import Console
 from test_camera import free_port, pattern, wait_until
 
-from xblick import cli, survey, topics, tui
+from xblick import cli, declaration, survey, topics, tui
 from xblick.camera import CameraPublisher
 from xblick.diagnostics import DiagnosticsPublisher
 from xblick.msg import CameraInfo
@@ -34,11 +34,13 @@ HOST = "0c9a1f6e-5b0d-4a52-9d3e-7f1b2c3d4e5f"  # a host id, as the rings' keys c
 GPU = "7" * 32  # a GPU's UUID
 
 
-def open_router(port: int) -> zenoh.Session:
-    """A Zenoh router as zenohd runs one: admin space on (zenohd enables it, a library session does not)."""
+def open_router(port: int, connect: list[int] = ()) -> zenoh.Session:
+    """A Zenoh router as zenohd runs one: admin space on (zenohd enables it, a library session does not), linked to
+    the routers on the ports ``connect``."""
     config = zenoh.Config()
     config.insert_json5("mode", '"router"')
     config.insert_json5("listen/endpoints", json.dumps([f"tcp/127.0.0.1:{port}"]))
+    config.insert_json5("connect/endpoints", json.dumps([f"tcp/127.0.0.1:{p}" for p in connect]))
     config.insert_json5("scouting/multicast/enabled", "false")
     config.insert_json5("adminspace/enabled", "true")
     return Session(zenoh.open(config))
@@ -52,8 +54,9 @@ class FakeNetwork:
         self.port = free_port()
         self.router = open_router(self.port)
         self.endpoint = f"tcp/127.0.0.1:{self.port}"
-        self.camera_session = open_session(connect=[self.endpoint], listen=["127.0.0.1:0"])
-        self.node_session = open_session(connect=[self.endpoint], listen=["127.0.0.1:0"])
+        self.camera_session = open_session(connect=[self.endpoint], listen=["127.0.0.1:0"], program="fake-camera")
+        self.node_session = open_session(connect=[self.endpoint], listen=["127.0.0.1:0"], program="fake-tracker")
+        declaration.add_name(self.node_session, f"{CAMERA}/tracker")  # as node.Reporter does
         info = CameraInfo.pinhole(64, 48, 50.0, 50.0, 31.5, 23.5, frame_id="fake_color")
         self.camera = CameraPublisher(self.camera_session, BASE, encoding="rgb8", frame_id="fake_color",
                                       camera_info=info, source="test")
@@ -315,6 +318,10 @@ def topic_row(app, key: str) -> str:
     return " | ".join(str(c) for c in table.get_row(row.path))
 
 
+def _short(zid: str) -> str:
+    return zid[:8]
+
+
 def run_app(app, test, size=(160, 50)):
     async def main():
         async with app.run_test(size=size) as pilot:
@@ -334,27 +341,36 @@ def test_app_shows_topics_nodes_reports_and_graph(fake, tmp_path):
         rows = cells(app, "#topic-table")
         assert rows[0].startswith(f"▾ {CAMERA}/ |  |  |"), rows[0]
         stream = next(r for r in rows if "▾ color/" in r)
-        assert f"| {BASE} |" in stream, stream  # the camera session, named after its keys
+        assert f"| {CAMERA} |" in stream, stream  # the camera session, by the name it declared
         assert topic_row(app, f"{BASE}/camera_info").split(" | ")[2] == ""
         await until(pilot, lambda: any("tracker" in row and "WARN" in row for row in cells(app, "#report-table")))
         assert any("fakecam" in row and "OK" in row for row in cells(app, "#report-table"))
         # each report names its session (the diagnostics attachment's zid)
         await until(pilot, lambda: any(r.startswith(f"{CAMERA}/diagnostics | tracker |") and f"| {CAMERA}/tracker ("
                                        in r for r in cells(app, "#report-table")))
-        app._selected_node = str(fake.node_session.info.zid())
+        app._selected_node = "node\t" + str(fake.node_session.info.zid())
         app._show_node_detail()
         node_detail = text_of(app, "#node-detail")
         assert f"{CAMERA}/diagnostics tracker WARN: waiting: frames" in node_detail and "fakecam OK" not in node_detail
-        rows = cells(app, "#node-table")
-        assert any(row.startswith(f"{CAMERA}/tracker |") for row in rows)
-        assert any(row.startswith("this interface |") for row in rows)
-        assert any("router" in row for row in rows)
+        assert "program fake-tracker" in node_detail and "command: " in node_detail
+        # one group: the router's lines, the column names, the nodes; every row a node with its name and program
+        await until(pilot, lambda: sum("| fake-" in r for r in cells(app, "#node-table")) == 2)
+        rows = [r.replace(" | ", "") for r in cells(app, "#node-table")]
+        router = _short(str(fake.router.info.zid()))
+        assert rows[0].startswith(f" router {router}") and "this interface's router" in rows[0], rows
+        assert rows[1].startswith(" links: none") and rows[2].split() == list(tui.tui_nodes.COLUMNS)
+        tracker = next(r for r in rows if "fake-tracker" in r)
+        assert tracker.split()[:3] == [f"{CAMERA}/tracker", "fake-tracker", "peer"], tracker
+        assert tracker.split()[3:] == [f"{BASE}", "boxes,", "tracks"], tracker  # reads; publishes by name
+        camera = next(r for r in rows if "fake-camera" in r)
+        assert camera.split()[0] == CAMERA and camera.split()[-1] == "color", camera
+        assert any("(this interface)" in r for r in rows)
         status = text_of(app, "#status")
-        assert "1 router(s)" in status and "1 stream(s)" in status
+        assert f"connected to router {router}" in status and "1 router, 3 nodes, 1 stream" in status, status
 
         # how the camera's representations are taken: the tracker's compressed images over its TCP link
         await until(pilot, lambda: "| tcp-compressed×1 |" in topic_row(app, f"{BASE}/image_raw/compressed"))
-        assert f"| {CAMERA}/tracker |" in topic_row(app, f"{BASE}/image_raw/compressed")  # its subscriber
+        assert "| tracker |" in topic_row(app, f"{BASE}/image_raw/compressed")  # its subscriber
 
         # a topic's detail: its publisher, its subscriber, its decoded message
         app._select_topic(f"{BASE}/camera_info")
@@ -387,9 +403,12 @@ def test_app_shows_topics_nodes_reports_and_graph(fake, tmp_path):
         camera, node = str(fake.camera_session.info.zid()), str(fake.node_session.info.zid())
         await until(pilot, lambda: any(e.source == camera and e.target == node for e in graph.edges))
         edge = next(k for k, e in enumerate(graph.edges) if e.source == camera and e.target == node)
-        assert graph.edges[edge].label == "tcp-compressed"
+        assert graph.edges[edge].label == "color tcp-compressed"  # the topic and how it is taken
         drawn = graph.render().plain
-        assert CAMERA in drawn and "tcp-compressed▶" in drawn.replace("─", "")
+        assert CAMERA in drawn and "color tcp-compressed▶" in drawn.replace("─", "")
+        # a box: name, program, and what nobody takes; the reports go to the detail
+        box = next(n for n in graph.nodes if n.id == node)
+        assert box.lines == ["fake-tracker", "▷ boxes", "▷ tracks"], box.lines
         # the mouse over the edge names its key and how it is taken; a selected session what it sends and takes
         graph.hovered = ("edges", frozenset({edge}))
         await pilot.pause(0.2)
@@ -397,7 +416,14 @@ def test_app_shows_topics_nodes_reports_and_graph(fake, tmp_path):
         graph.hovered = None
         graph.selected = node
         await pilot.pause(0.2)
-        assert f"takes from {BASE}: {BASE}/image_raw/compressed [tcp-compressed]" in text_of(app, "#graph-detail")
+        assert f"takes from {CAMERA}: {BASE}/image_raw/compressed [tcp-compressed]" in text_of(app, "#graph-detail")
+        # one band: the router's
+        assert f"┄ router {_short(str(fake.router.info.zid()))}" in drawn
+        # while m measures: each line with its topic's rate as this interface receives it
+        await pilot.press("m")
+        await until(pilot, lambda: re.fullmatch(r"color( tcp-compressed)? \d+\.\d/s", next(
+            e.label for e in graph.edges if e.source == camera and e.target == node)))
+        await pilot.press("m")
 
     run_app(app, test)
 
@@ -536,7 +562,7 @@ def test_app_fits_the_terminal(fake, tmp_path, size):
         screen = app.screen
         assert screen.virtual_size.height <= screen.size.height, "the screen scrolls"
         status = app.query_one("#status")
-        assert status.region.y == 1 and on_screen(status) and "router(s)" in text_of(app, "#status")
+        assert status.region.y == 1 and on_screen(status) and "1 router," in text_of(app, "#status")
         table = app.query_one("#topic-table")
         longest = max(len(r.label) for r in app._topic_rows.values())
         # the column's auto width follows its rows on a later refresh (slow runners measured it before)
@@ -695,3 +721,134 @@ def test_the_interface_ends_while_its_session_is_still_opening(monkeypatch, tmp_
     release.set()
     opener[0].join(10.0)
     assert not opener[0].is_alive() and opened[0].is_closed()
+
+
+# ------------------------------------------------------------------------------------------ several routers
+
+
+class Mesh:
+    """Three routers, A (as xblick router: its record in its metadata) - B - C, and with ``mesh`` also C - A; a camera
+    on A, a node on C, a program that declares nothing on B (Durchblick before 0.5.9) and a program linked directly to
+    the interface, no router knowing it."""
+
+    def __init__(self, mesh: bool):
+        from xblick import router
+
+        self.ports = [free_port() for _ in range(4)]
+        a, b, c, direct = self.ports
+        self.routers = [router.open_router([f"tcp/127.0.0.1:{a}"]), open_router(b, [a]),
+                        open_router(c, [b] + ([a] if mesh else []))]
+        self.sessions = [open_session(connect=[f"tcp/127.0.0.1:{a}"], listen=["127.0.0.1:0"], program="cam-program"),
+                         open_session(connect=[f"tcp/127.0.0.1:{c}"], listen=["127.0.0.1:0"], program="det-program"),
+                         open_session(connect=[f"tcp/127.0.0.1:{b}"], listen=["127.0.0.1:0"], declare=False),
+                         open_session(listen=[f"tcp/127.0.0.1:{direct}"], program="direct-program", local_router=False)]
+        self.camera = CameraPublisher(self.sessions[0], "t/cam/color", encoding="rgb8", frame_id="f", source="test")
+        declaration.add_name(self.sessions[1], "t/cam/det")
+        self.declared = [self.sessions[1].declare_publisher("t/cam/det/boxes"),
+                         self.sessions[1].declare_subscriber("t/cam/color/image_raw/compressed", lambda s: None),
+                         self.sessions[2].declare_publisher("old/thing/x")]
+
+    def zid(self, n: int, router: bool = False) -> str:
+        return str((self.routers if router else self.sessions)[n].info.zid())
+
+    def connection(self) -> tui.Connection:
+        return tui.Connection(connect=[f"tcp/127.0.0.1:{self.ports[0]}", f"tcp/127.0.0.1:{self.ports[3]}"],
+                              listen=["127.0.0.1:0"])
+
+    def close(self):
+        for d in self.declared:
+            d.undeclare()
+        self.camera.close()
+        for s in self.sessions + self.routers[::-1]:
+            close_session(s)
+
+
+@pytest.mark.parametrize("mesh", [False, True])
+def test_admin_space_gives_each_routers_links(mesh):
+    """Each router's record names the routers it is linked to directly: a chain and a mesh of three; the hops from
+    the first; the record of xblick router in its metadata, a foreign router's host from its locators (none here:
+    loopback)."""
+    m = Mesh(mesh)
+    try:
+        a, b, c = (m.zid(n, router=True) for n in range(3))
+        with open_session(connect=[f"tcp/127.0.0.1:{m.ports[0]}"], listen=["127.0.0.1:0"]) as z:
+            wait_until(lambda: len(survey.query_network(z, 1.0).routers) == 3, timeout=10)
+            network = survey.query_network(z, 1.0)
+        want = {frozenset((a, b)), frozenset((b, c))} | ({frozenset((a, c))} if mesh else set())
+        assert network.links() == want
+        assert set(network.routers[b].links) == {a, c} and all(" <-> " in x for x in network.routers[b].links[a])
+        assert network.hops([a]) == {a: 0, b: 1, c: 1 if mesh else 2}
+        assert network.routers[a].program.program == "xblick router" and network.routers[a].host
+        assert network.routers[b].program is None and network.routers[b].host == ""
+        assert [r for r, _ in network.groups([a])] == ([a, b, c] if not mesh else sorted([b, c], key=lambda r: r)
+                                                         and [a] + sorted([b, c]))
+    finally:
+        m.close()
+
+
+def test_nodes_tab_by_router_with_links_details_and_graph(tmp_path):
+    """Grouped by router, nearest first, each head the router, its links and the column names in the headers'
+    colour; a program that declares nothing shows -, one linked directly stands without a router; the detail of a
+    node and of a router; the graph's bands."""
+    m = Mesh(False)
+    app = tui.XblickApp(m.connection(), tui.Presets(tmp_path / "presets.json"), discover_every=0.5)
+    a, b, c = (m.zid(n, router=True) for n in range(3))
+
+    def rows():
+        return [r.replace(" | ", "") for r in cells(app, "#node-table")]
+
+    async def test(pilot):
+        await until(pilot, lambda: sum(r.lstrip().startswith("router ") for r in rows()) == 3
+                    and any("det-program" in r for r in rows()) and any("direct-program" in r for r in rows())
+                    and any("old/thing" in r for r in rows()), timeout=20)
+        lines = rows()
+        heads = [n for n, r in enumerate(lines) if r.lstrip().startswith("router ") or "without a router" in r]
+        assert [lines[n].split()[1] for n in heads[:3]] == [_short(a), _short(b), _short(c)], lines
+        assert "this interface's router" in lines[heads[0]] and "xblick router" in lines[heads[0]]
+        assert "1 hop away" in lines[heads[1]] and "2 hops away" in lines[heads[2]]
+        assert lines[heads[1] + 1].startswith(f" links: {_short(a)} (") and _short(c) in lines[heads[1] + 1]
+        assert "without a router" in lines[heads[3]]
+        group_of = {}
+        for n, line in enumerate(lines):
+            group_of[n] = max(h for h in heads if h <= n)
+        det = next(n for n, r in enumerate(lines) if "det-program" in r)
+        old = next(n for n, r in enumerate(lines) if "old/thing" in r)
+        direct = next(n for n, r in enumerate(lines) if "direct-program" in r)
+        cam = next(n for n, r in enumerate(lines) if "cam-program" in r)
+        assert (group_of[cam], group_of[old], group_of[det], group_of[direct]) == tuple(heads), lines
+        assert lines[det].split()[:2] == ["t/cam/det", "det-program"] and lines[det].split()[3:] == ["t/cam/color",
+                                                                                                     "boxes"]
+        assert lines[old].split()[1] == "–", lines[old]  # declares nothing
+        # the heads in the colour of the table headers, the nodes not
+        table = app.query_one("#node-table")
+        head = table.get_component_rich_style("datatable--header")
+        keys = [k.value for k in table.rows]
+        assert table.get_row(keys[heads[0]])[0].style == head and table.get_row(keys[heads[0] + 2])[0].style == head
+        assert table.get_row(keys[det])[0].style != head
+        # the detail of a node and of a router
+        app._selected_node = keys[det]
+        app._show_node_detail()
+        detail = text_of(app, "#node-detail")
+        assert "program det-program" in detail and "t/cam/det/boxes" in detail and f"router {_short(c)}" in detail
+        assert m.zid(1) in detail and "started " in detail and "process " in detail
+        app._selected_node = keys[old]
+        app._show_node_detail()
+        assert "it declares nothing" in text_of(app, "#node-detail")
+        app._selected_node = keys[heads[1]]
+        app._show_node_detail()
+        detail = text_of(app, "#node-detail")
+        assert f"router {b}" in detail and f"{_short(a)} (" in detail and " <-> " in detail
+        # the graph: a band per router, labelled, the links on the left
+        graph = app.query_one("#graph")
+        await until(pilot, lambda: len(graph.drawing.group_rows) == 4)
+        drawn = graph.render().plain
+        assert all(f"┄ router {_short(r)}" in drawn for r in (a, b, c)) and "┄ without a router" in drawn
+        title = next(n.title for n in graph.nodes if n.id == m.zid(1))
+        assert title == "det"  # its name, short below the camera's
+        # every node in the status line's count: three routers, five nodes (the interface too)
+        assert "3 routers, 5 nodes, 1 stream" in text_of(app, "#status")
+
+    try:
+        run_app(app, test)
+    finally:
+        m.close()

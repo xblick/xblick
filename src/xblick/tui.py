@@ -6,8 +6,9 @@ Zenoh session that shows what runs, for any node: nothing in it knows of a parti
 * **Topics**: every key a session publishes (from the routers' admin space), and with ``m`` the traffic of all of
   them (rate, size, type, last stamp: subscribing to everything, as ``xblick list --traffic``, which makes the
   publishers produce every representation). Enter on a topic subscribes to it alone and shows its last message.
-* **Nodes**: the sessions (one per program) with what they declared, named after their keys; the routers; the
-  reports on ``<camera>/diagnostics`` and the record and play nodes' status; liveliness tokens.
+* **Nodes**: every program (one session each) by router (tui_nodes.py): its name, program, kind, what it reads and
+  publishes, from what it declared (declaration.py) and the routers' admin space; the routers with their links; the
+  reports on ``<camera>/diagnostics`` and the record and play node's status. A row selected: its detail.
 * **Graph**: the sessions as boxes and the data between them as arrows (tui_graph.py); a session selected (arrow
   keys, a click) or the mouse over an edge names the keys, how they are taken and what the session reports.
 * **Rerun**: streams, results and options of ``xblick rerun``, as presets with a name; launched as a child
@@ -29,6 +30,7 @@ import json
 import os
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -39,6 +41,7 @@ from typing import ClassVar
 import zenoh
 from rich.console import Group
 from rich.pretty import Pretty
+from rich.table import Table
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
@@ -49,19 +52,22 @@ from textual.widgets import (Button, DataTable, Footer, Header, Input, Label, Ra
 from textual.widgets.selection_list import Selection
 from textual.worker import get_current_worker
 
-from . import diagnostics, parameters, survey, topics
+from . import declaration, diagnostics, parameters, survey, topics, tui_nodes
 from . import session as zsession
 from .camera import find_streams
 from .paths import config_dir, expand_path
-from .tui_graph import GraphEdge, GraphNode, GraphView
+from .tui_graph import LABEL, GraphEdge, GraphGroup, GraphNode, GraphView
 from .tui_parameters import ParametersPane
 
 PRESETS_VERSION = 1
 UNREACHABLE_S = 5.0  # a peer without a link to it for so long is not reachable from here
 MIN_SIZE = (80, 24)  # columns, rows: below it the interface says so instead of a broken layout
 WIDE = 120  # from this width the Rerun tab's lists stand side by side
-GRAPH_HELP = Text("arrow keys or a click: a session and its edges (out green, in cyan); the mouse over an edge or a "
-                  "box: its keys and how they are taken; ▶ data flows into a box, ◀ out of it (a cycle)", style="dim")
+GRAPH_HELP = Text("arrow keys or a click: a node and its edges (out green, in cyan); the mouse over an edge or a "
+                  "box: its keys and how they are taken; ▶ data flows into a box, ◀ out of it (a cycle); a line: one "
+                  "topic, how it is taken and, while m measures, its messages/s as this interface receives them; ▷ in "
+                  "a box: a topic nobody takes; one band per router, its links on the left; shift+arrows or a drag: "
+                  "move the view, 0: back to its start", style="dim")
 RERUN_KINDS = {"bases": "image", "clouds": "points", "detections": "detections", "segmentations": "labels",
                "trajectories": "poses"}
 
@@ -149,7 +155,8 @@ class Connection:
         return " ".join(self.arguments())
 
     def open(self) -> zenoh.Session:
-        return zsession.open_session(connect=self.connect, listen=self.listen, mode=self.mode, config_file=self.config)
+        return zsession.open_session(connect=self.connect, listen=self.listen, mode=self.mode, config_file=self.config,
+                                     program="xblick")
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -475,8 +482,10 @@ class Discovery:
     streams: list[tuple[str, dict]] = dataclasses.field(default_factory=list)
     tokens: list[str] = dataclasses.field(default_factory=list)
     statuses: dict[str, dict] = dataclasses.field(default_factory=dict)  # xblick/.../status -> its JSON
+    program_errors: list[str] = dataclasses.field(default_factory=list)  # replies that were no program record
     error: str | None = None
     unreachable: list[str] = dataclasses.field(default_factory=list)  # peers this peer has no link to (zids)
+    origins: list[str] = dataclasses.field(default_factory=list)  # the routers this interface is linked to (zids)
 
 
 def statuses(session: zenoh.Session, timeout: float = 0.5) -> dict[str, dict]:
@@ -561,7 +570,8 @@ class XblickApp(App):
         self._reports_lock = threading.Lock()
         self._report_errors: list[str] = []
         self._diagnostics_subscriber = None
-        self._selected_node: str | None = None
+        self._programs_subscriber = None  # the declarations' tokens: a program came or went, look again at once
+        self._selected_node: str | None = None  # a row key of the Nodes tab (node\t<zid>, router\t<zid>)
         self._collapsed: set[str] = set()
         self._topic_rows: dict[str, TopicRow] = {}  # the Topics tab's folded prefixes (ending with /)
         self._graph_hovered = None  # what the mouse is over in the graph
@@ -589,10 +599,12 @@ class XblickApp(App):
                         yield Static("Enter on a topic: its publishers, subscribers and last message",
                                      id="topic-detail")
                 with TabPane("Nodes", id="tab-nodes"):
-                    yield DataTable(id="node-table", cursor_type="row")
+                    # no padding of its own: a group's head is one band of the headers' colour (tui_nodes.py)
+                    yield DataTable(id="node-table", cursor_type="row", show_header=False, cell_padding=0,
+                                    cursor_background_priority="css")
                     yield DataTable(id="report-table", cursor_type="row")
                     with VerticalScroll(classes="detail"):
-                        yield Static("Enter on a session: what it declared and reports", id="node-detail")
+                        yield Static("a node or a router: what it declared and reports", id="node-detail")
                 with TabPane("Graph", id="tab-graph"):
                     with VerticalScroll(id="graph-scroll"):
                         yield GraphView(id="graph")
@@ -643,9 +655,8 @@ class XblickApp(App):
                            ("age at receive ms", "age"), ("type", "type"), ("stamp", "stamp")):
             topics_table.add_column(label, key=key)
         nodes = self.query_one("#node-table", DataTable)
-        for label, key in (("session", "label"), ("kind", "kind"), ("zid", "zid"), ("address", "address"),
-                           ("pub", "pub"), ("sub", "sub"), ("query", "query"), ("router", "router")):
-            nodes.add_column(label, key=key)
+        for key in tui_nodes.COLUMNS:
+            nodes.add_column(key, key=key)
         reports = self.query_one("#report-table", DataTable)
         for label, key in (("topic", "topic"), ("name", "name"), ("level", "level"), ("message", "message"),
                            ("age s", "age"), ("session", "session")):
@@ -742,6 +753,8 @@ class XblickApp(App):
         with self._reports_lock:
             self._reports.clear()
         self._diagnostics_subscriber = session.declare_subscriber("**/" + topics.DIAGNOSTICS, self._on_diagnostics)
+        self._programs_subscriber = session.liveliness().declare_subscriber(
+            declaration.ALL, lambda sample: self._discover_now.set())
         self.run_worker(functools.partial(self._discover_thread, session, generation), thread=True,
                         group="discover", exclusive=True)
         self._status()
@@ -758,6 +771,9 @@ class XblickApp(App):
         if self._diagnostics_subscriber is not None:
             self._diagnostics_subscriber.undeclare()
             self._diagnostics_subscriber = None
+        if self._programs_subscriber is not None:
+            self._programs_subscriber.undeclare()
+            self._programs_subscriber = None
         session, self.session = self.session, None
         return session
 
@@ -782,6 +798,8 @@ class XblickApp(App):
             try:
                 found = Discovery(survey.query_network(session, 1.0), find_streams(session, "", 1.0),
                                   survey.liveliness_tokens(session, 0.5), statuses(session, 0.5))
+                found.network.programs, found.program_errors = declaration.query(session, 0.5)
+                found.origins = sorted(str(z) for z in session.info.routers_zid())
                 found.unreachable = self._unreachable(session, found.network, missing_since)
             except Exception as error:  # noqa: BLE001 - shown; discovery goes on
                 if worker.is_cancelled:
@@ -848,16 +866,19 @@ class XblickApp(App):
             status.update(Text(self.error, style="bold red"))
             return
         d = self.discovery
-        line = Text(f"{self.connection.describe()}  zid {_short(str(self.session.info.zid())) if self.session else '-'}"
-                    "  ")
+        line, counts = Text(), Text()
         if d.network is None:
+            line.append(f"{self.connection.describe()}  ")
             line.append("looking..." if d.error is None else "", style="yellow")
         elif not d.network.routers:
-            line.append("no router answered (admin space): sessions and graph unknown; connect to a zenohd router",
+            line.append(f"{self.connection.describe()}  ")
+            line.append("no router answered (admin space): nodes and graph unknown; connect to a router",
                         style="bold yellow")
         else:
-            sessions = sum(1 for n in d.network.nodes.values() if n.whatami != "router")
-            line.append(f"{len(d.network.routers)} router(s), {sessions} session(s), {len(d.streams)} stream(s)")
+            line.append(self._connected_to())
+            nodes = sum(1 for _, members in d.network.groups(d.origins) for _ in members)
+            counts.append(f"{_plural(len(d.network.routers), 'router')}, {_plural(nodes, 'node')}, "
+                          f"{_plural(len(d.streams), 'stream')}")
         if d.error:
             line.append(f"  discovery failed: {d.error}", style="bold red")
         if d.unreachable:
@@ -866,7 +887,23 @@ class XblickApp(App):
                         style="bold yellow")
         if self.meter is not None:
             line.append("  measuring every topic (m: stop)", style="magenta")
-        status.update(line)
+        grid = Table.grid(expand=True)
+        grid.add_column(ratio=1)
+        grid.add_column(justify="right", no_wrap=True)
+        grid.add_row(line, counts)
+        status.update(grid)
+
+    def _connected_to(self) -> str:
+        """``connected to router <id> on <host> (<address>)``: the router this interface is linked to (several: each),
+        and the address it was given (this PC's router: 127.0.0.1:7447)."""
+        network, origins = self.discovery.network, self.discovery.origins
+        address = (f"config {self.connection.config}" if self.connection.config
+                   else " ".join(self.connection.connect) or zsession.ROUTER)
+        if not origins:
+            return f"not linked to a router ({self.connection.describe()})  "
+        routers = ", ".join(f"{_short(z)} on {network.routers[z].host or '–'}" if z in network.routers else _short(z)
+                            for z in origins)
+        return f"connected to router {routers} ({address})  "
 
     # ---------------------------------------------------------------------------------------------- the topics
 
@@ -876,6 +913,7 @@ class XblickApp(App):
             self.meter.close()
             self.meter = None
             self._rates, self._before = {}, None
+            self._show_graph()  # its lines without the rates at once
         elif self.session is None:
             self.notify("not connected", severity="error")
         else:
@@ -900,9 +938,16 @@ class XblickApp(App):
         return [u for key, uses in sorted(self.uses.items()) if key.startswith(base + "/") for u in uses]
 
     def _labels(self) -> dict[str, str]:
+        """A name per session: what it declared (its names, else its program), else what its keys share."""
         network = self.discovery.network
         own = str(self.session.info.zid()) if self.session else ""
-        labels = {zid: node.label for zid, node in network.nodes.items()} if network else {}
+        labels = {}
+        if network is not None:
+            for zid in set(network.nodes) | set(network.programs):
+                program = network.program(zid)
+                node = network.nodes.get(zid)
+                labels[zid] = (program.name or program.program) if program is not None else (
+                    node.label if node is not None else _short(zid))
         labels[own] = "this interface"
         return labels
 
@@ -930,6 +975,8 @@ class XblickApp(App):
         self._show_topics()
         self._show_reports()
         self._show_detail()
+        if self.meter is not None:  # the rates on the graph's lines
+            self._show_graph()
 
     def _show_topics(self):
         """The keys as a tree (``topic_tree``): a row per key and per prefix, a prefix's publishers and subscribers
@@ -989,6 +1036,18 @@ class XblickApp(App):
         elif event.data_table.id == "node-table":
             self._selected_node = event.row_key.value
             self._show_node_detail()
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted):
+        """The Nodes tab's cursor on a node or a router: its detail at once."""
+        if event.data_table.id == "node-table" and event.row_key is not None:
+            kind = str(event.row_key.value).partition("\t")[0]
+            if kind in ("node", "router"):
+                self._selected_node = event.row_key.value
+                self._show_node_detail()
+
+    def on_resize(self, event: events.Resize):
+        if not self._ended():
+            self.call_after_refresh(self._show_nodes)  # the columns follow the width
 
     def _select_topic(self, key: str):
         if self.session is None:
@@ -1051,16 +1110,27 @@ class XblickApp(App):
     # ----------------------------------------------------------------------------------------------- the nodes
 
     def _show_nodes(self):
+        """Every node by router (tui_nodes.node_rows), the columns cut to the table's width."""
+        if self._ended():
+            return
         network = self.discovery.network
         table = self.query_one("#node-table", DataTable)
         rows = {}
-        if network is not None:
-            labels = self._labels()
-            for zid, node in network.nodes.items():
-                rows[zid] = (Text(labels.get(zid, node.label)), node.whatami, _short(zid),
-                             ", ".join(sorted(node.addresses)), str(len(node.publishes)), str(len(node.subscribes)),
-                             str(len(node.queryables)), ", ".join(_short(r) for r in sorted(node.routers)))
-        _sync(table, rows)
+        if network is not None and (network.routers or network.programs):
+            own = str(self.session.info.zid()) if self.session else ""
+            width = max(table.scrollable_content_region.width, self.size.width - 4, sum(tui_nodes.MIN.values()))
+            head = table.get_component_rich_style("datatable--header")
+            found, widths = tui_nodes.node_rows(network, own, self.discovery.origins, width, socket.gethostname())
+            rows = {key: tui_nodes.styled(row, head) for key, row in found.items()}
+            if [c.width for c in table.columns.values()] != widths:  # fixed widths: an auto width never shrinks
+                cursor = table.cursor_row
+                table.clear(columns=True)
+                for key, w in zip(tui_nodes.COLUMNS, widths):
+                    table.add_column(key, key=key, width=w)
+                _sync(table, rows, ordered=True)
+                if rows:
+                    table.move_cursor(row=min(cursor, len(rows) - 1))
+        _sync(table, rows, ordered=True)
         self._show_node_detail()
 
     def _show_reports(self):
@@ -1086,27 +1156,29 @@ class XblickApp(App):
         _sync(table, rows)
 
     def _show_node_detail(self):
-        zid = self._selected_node
+        selected = self._selected_node
         network = self.discovery.network
         widget = self.query_one("#node-detail", Static)
-        if zid is None or network is None:
+        if selected is None or network is None:
             return
-        node = network.nodes.get(zid)
-        if node is None:
+        kind, _, zid = selected.partition("\t")
+        if kind == "router":
+            if zid in network.routers:
+                widget.update(tui_nodes.router_detail(network, zid, self.discovery.origins))
+            else:
+                widget.update(Text(f"router {zid}: gone", style="yellow"))
+            return
+        if zid not in network.nodes and zid not in network.programs:
             widget.update(Text(f"{zid}: gone", style="yellow"))
             return
-        text = Text()
-        text.append(f"{self._labels().get(zid, node.label)}  {node.whatami}  {zid}\n", style="bold")
-        if zid in network.routers:
-            r = network.routers[zid]
-            text.append(f"router {r.version}\nlocators {', '.join(r.locators)}; {r.sessions} sessions\n")
-        if node.addresses:
-            text.append("address " + ", ".join(sorted(node.addresses)) + "\n")
-        for kind, keys in (("publishes", node.publishes), ("subscribes", node.subscribes),
-                           ("answers", node.queryables), ("liveliness tokens", node.tokens)):
-            if keys:
-                text.append(f"{kind}:\n", style="bold")
-                text.append("".join(f"  {k}\n" for k in sorted(keys)))
+        readers: dict[str, list[str]] = {}
+        for _pub, key, sub, _expr in network.connections():
+            readers.setdefault(key, []).append(sub)
+        text = tui_nodes.node_detail(network, zid, readers, self._labels())
+        node = network.nodes.get(zid)
+        if node is None:
+            widget.update(text)
+            return
         with self._reports_lock:
             reports = dict(self._reports)
         own = sorted((c, n, s) for (c, n), (_, s, sender) in reports.items() if sender == zid)
@@ -1143,47 +1215,80 @@ class XblickApp(App):
 
     # ----------------------------------------------------------------------------------------------- the graph
 
-    def _graph_parts(self) -> tuple[list[GraphNode], list[GraphEdge], dict[tuple[str, str], list[tuple[str, str]]]]:
-        """The graph's boxes (sessions but the routers and this interface), its edges (publisher -> subscriber, a
-        label from how the keys are taken), and per edge its keys with how each is taken."""
+    def _graph_parts(self) -> tuple[list[GraphNode], list[GraphEdge], dict[tuple[str, str], list[tuple[str, str]]],
+                                    list[GraphGroup], list[tuple[str, str]]]:
+        """The graph's boxes (nodes but the routers and this interface: titled by their name, else their program; in
+        them the program and the topics nobody takes), its edges (one per topic from its publisher to each reader,
+        labelled with the topic, how it is taken and its rate while measured), per pair of nodes its keys with how each
+        is taken, the boxes' groups (one per router, as the Nodes tab orders them) and the links between routers.
+
+        A rate is the messages per second of the topic's key as this interface receives them: only while ``m``
+        measures every topic (the traffic meter), of the key the reader takes (the highest of a topic's keys). A
+        node's own report (diagnostics) is one rate per node, so it stays in the detail."""
         network = self.discovery.network
         if network is None:
-            return [], [], {}
+            return [], [], {}, [], []
         own = str(self.session.info.zid()) if self.session else ""
         keys: dict[tuple[str, str], list[tuple[str, str]]] = {}
-        for pub, key, sub, _expr in network.connections(leave_out=[own]):
+        topics_of: dict[tuple[str, str, str], list[tuple[str, str]]] = {}  # (pub, sub, topic) -> (key, taken)
+        names = {zid: tui_nodes.name_of(network, zid) for zid in network.nodes}
+        for pub, key, sub, _expr in network.connections(leave_out=[own, *network.routers]):
             taken = next((u.summary for u in self.uses.get(key, []) if u.consumer == sub), "")
             pair = keys.setdefault((pub, sub), [])
             if (key, taken) not in pair:
                 pair.append((key, taken))
-        with self._reports_lock:
-            reports = dict(self._reports)
+                topic = _topic_name(key, names.get(pub, tui_nodes.DASH))
+                topics_of.setdefault((pub, sub, topic), []).append((key, taken))
         nodes = []
-        short = short_names({z: n.label for z, n in network.nodes.items()})
+        titles = {}
+        for zid in network.nodes:
+            name = tui_nodes.name_of(network, zid)
+            program = network.program(zid)
+            titles[zid] = name if name != tui_nodes.DASH else (program.program if program else _short(zid))
+        short = short_names(titles)
+        groups = []
+        for router, members in network.groups(self.discovery.origins, leave_out=[own]):
+            members = [z for z in members if z in network.nodes]
+            if router is None:
+                groups.append(GraphGroup("\0none", "without a router", members))
+            else:
+                groups.append(GraphGroup(router, f"router {_short(router)}  {network.routers[router].host or '–'}",
+                                    members))
         for n in sorted((n for n in network.nodes.values() if n.zid != own and n.whatami != "router"),
-                        key=lambda n: (n.label, n.zid)):
-            lines = [f"{n.whatami} {_short(n.zid)}"]
-            for (_camera, name), (_, status, sender) in sorted(reports.items()):
-                if sender == n.zid:
-                    lines.append(f"{diagnostics.level_name(status.level)} {status.message}")
-            if not any(pub == n.zid for pub, _ in keys) and n.publishes:
-                lines.append(f"{len(n.publishes)} keys, nobody takes them")
+                        key=lambda n: (titles[n.zid], n.zid)):
+            program = network.program(n.zid)
+            name = names[n.zid]
+            lines = [program.program if program is not None else "program –"] if name != tui_nodes.DASH else []
+            taken = {topic for (pub, _sub, topic) in topics_of if pub == n.zid}
+            unread = [k for k in sorted(n.publishes) if not declaration.zid_of(k)
+                      and k.rsplit("/", 1)[-1] not in tui_nodes.LEFT_OUT
+                      and _topic_name(k, name) not in taken]
+            by_topic: dict[str, list[str]] = {}
+            for k in unread:
+                by_topic.setdefault(_topic_name(k, name), []).append(k)
+            shown = sorted(by_topic)
+            for topic in shown[:4]:  # what nobody takes, with its rate while measured
+                lines.append(f"▷ {topic}" + _rate_text(max((self._rates.get(k, (0.0, 0))[0] for k in by_topic[topic]),
+                                                           default=0.0), " "))
+            if len(shown) > 4:
+                lines.append(f"▷ {len(shown) - 4} more nobody takes")
             nodes.append(GraphNode(n.zid, short[n.zid], lines))
         edges = []
-        for (pub, sub), pairs in sorted(keys.items()):
+        self._graph_edge_keys = []
+        for (pub, sub, topic), pairs in sorted(topics_of.items()):
             ways = sorted({t for _, t in pairs if t})
-            if len(ways) == 1 and all(t for _, t in pairs):
-                label = ways[0]
-            elif len(pairs) == 1:
-                label = pairs[0][0].rsplit("/", 1)[-1]
-            else:
-                label = f"{len(pairs)} keys"
+            hz = max((self._rates.get(k, (0.0, 0))[0] for k, _ in pairs), default=0.0)
+            label = " ".join([topic, *ways[:1]]) + _rate_text(hz, " ")
+            if len(label) > LABEL:  # the topic and its rate first: how it is taken is in the detail
+                label = topic + _rate_text(hz, " ")
             edges.append(GraphEdge(pub, sub, label))
-        return nodes, edges, keys
+            self._graph_edge_keys.append(pairs)
+        links = sorted(tuple(sorted(link)) for link in network.links() if link <= set(network.routers))
+        return nodes, edges, keys, groups, links
 
     def _show_graph(self):
-        nodes, edges, self._graph_keys = self._graph_parts()
-        self.query_one("#graph", GraphView).show(nodes, edges)
+        nodes, edges, self._graph_keys, groups, links = self._graph_parts()
+        self.query_one("#graph", GraphView).show(nodes, edges, groups, links)
         self._show_graph_detail()
 
     def on_graph_view_selected(self, event: GraphView.Selected):
@@ -1211,8 +1316,10 @@ class XblickApp(App):
                 e = graph.edges[k]
                 text.append(f"{labels.get(e.source, _short(e.source))} -> {labels.get(e.target, _short(e.target))}\n",
                             style="bold yellow")
-                text.append("".join(f"  {key}" + (f"  [{taken}]" if taken else "") + "\n"
-                                    for key, taken in keys.get((e.source, e.target), [])))
+                edge_keys = getattr(self, "_graph_edge_keys", [])
+                text.append("".join(f"  {key}" + (f"  [{taken}]" if taken else "")
+                                    + _rate_text(self._rates.get(key, (0.0, 0))[0], "  ") + "\n"
+                                    for key, taken in (edge_keys[k] if k < len(edge_keys) else [])))
             widget.update(text)
             return
         zid = what[1]
@@ -1220,7 +1327,17 @@ class XblickApp(App):
         if node is None:
             widget.update(GRAPH_HELP)
             return
-        text.append(f"{labels.get(zid, node.title)}  ({', '.join(node.lines)})\n", style="bold magenta")
+        network = self.discovery.network
+        n = network.nodes.get(zid) if network is not None else None
+        program = network.program(zid) if network is not None else None
+        text.append(f"{labels.get(zid, node.title)}  ({program.program if program else 'program –'}, "
+                    f"{n.whatami if n else '–'} {_short(zid)})\n", style="bold magenta")
+        with self._reports_lock:
+            reports = dict(self._reports)
+        for (camera, name), (_, status, sender) in sorted(reports.items()):
+            if sender == zid:  # its own rate, one per node: in the detail, not on its topics' lines
+                text.append(f"  reports {name} on {topics.diagnostics(camera)}: {diagnostics.level_name(status.level)} "
+                            f"{status.message}\n")
         for (pub, sub), pairs in sorted(keys.items()):
             if pub == zid:
                 text.append(f"  sends to {labels.get(sub, _short(sub))}: ", style="green")
@@ -1441,6 +1558,26 @@ class XblickApp(App):
         session = self._close_session()
         for s in ([session] if session is not None else []) + handed:
             zsession.close(s)
+
+
+def _topic_name(key: str, name: str) -> str:
+    """A key as the graph names its topic: its stream (``color`` of ``.../color/image_raw/shm/<host>``), below the
+    publisher's name relative to it, else the stream's or key's last two tokens."""
+    base = tui_nodes.stream_base(key)
+    if name != tui_nodes.DASH and base.startswith(name + "/"):
+        return base[len(name) + 1:]
+    return "/".join(base.split("/")[-2:])
+
+
+def _rate_text(hz: float, before: str = "") -> str:
+    """``12.4/s`` (messages per second as this interface receives them), empty without a measured rate."""
+    if not hz:
+        return ""
+    return f"{before}{hz:.1f}/s" if hz < 100 else f"{before}{hz:.0f}/s"
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}{'' if n == 1 else 's'}"
 
 
 def _ms(value: float) -> str:
