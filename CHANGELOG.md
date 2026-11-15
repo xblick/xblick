@@ -11,6 +11,27 @@ Each version below is a heading with its release notes: one summary sentence, th
 (and Known limit), one line on compatibility. `tools/release_notes.sh <version>` prints a version's notes for its
 GitHub release. The rule is in [Development](docs/project/development.md#release-notes).
 
+## 0.5.13
+
+A command names the node it is meant for and carries the deadline at which its caller stops waiting, and receivers of 0.5.13 refuse it when it is meant for another node or late.
+
+### Fixed
+- **A parameter set or a record and play command whose deadline has passed when the node comes to execute it is refused, so that a busy node no longer executes it after the caller's `NoAnswer`; the caller raises `Expired` (#1) ([node and deadline](docs/reference/python-api.md#node-and-deadline)).**
+- **A command names the session that answered the read before it, and a second node of 0.5.13 on the key that the read missed refuses it: only the named node executes it (#2).**
+
+### Added
+- The deadline is converted into the receiver's clock with the clock reading in its answer to the read: the clocks of two PCs need not agree.
+- `xblick.session.CommandQuery`, `answer_attachment` and `refuse` (C++ `xblick::CommandQuery`) for receivers of commands outside Durchblick, such as a robot's controller manager or torque-step server.
+- `ParameterClient.last_checked` and `ControllerManager.last_checked` (C++ `ParameterClient::last_checked()`, `xblick-cpp-probe --set`: `checked`): the receiver confirmed that it checked node and deadline.
+
+### Changed
+- `NoAnswer` after a command with a deadline says that a receiver which checks the deadline no longer begins the command.
+
+### Known limit
+- A receiver that does not check, because it is older than 0.5.13 or its own code does not use `CommandQuery`, executes a command as before, also after `NoAnswer`. The caller learns whether the receiver checked only from its answer.
+
+Works with programs of 0.5.0 and later: node and deadline travel in attachments that older programs ignore, and a command to an older receiver carries none.
+
 ## 0.5.12
 
 `xblick clean` finds the rings that killed publishers left in `/dev/shm` and removes them, judged by each ring's creator and never by its name.
