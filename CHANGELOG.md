@@ -11,6 +11,25 @@ Each version below is a heading with its release notes: one summary sentence, th
 (and Known limit), one line on compatibility. `tools/release_notes.sh <version>` prints a version's notes for its
 GitHub release. The rule is in [Development](docs/project/development.md#release-notes).
 
+## 0.5.9
+
+Every program declares itself on the network, the terminal interface's Nodes and Graph tabs show programs and names by router, and `xblick cam` offers a GPU ring.
+
+### Added
+- Every command, node and C++ tool on the library declares its program: name, version, Durchblick's version, camera or node names, host, whole command line, process id and start time, on `xblick/sessions/<zid>/program` ([protocol](docs/concepts/protocol.md#every-program-declares-itself)). Nodes get it through `open_from_args` and `node.Reporter` without a change. The command line is visible to everything on the network.
+- `xblick router` carries the same record in its Zenoh metadata.
+- Python `declaration.add_name`, `declaration.query`, `open_session(program=, declare=)`; C++ `SessionOptions::version`, `SessionOptions::declare`, `Options::version`, `xblick::add_name`.
+- `xblick cam --cuda-device N` and `xblick test-camera --cuda-device N`: the frames also in a CUDA ring on that GPU; a GPU that cannot be used ends the command ([guide](docs/guides/cam.md#frames-on-the-gpu)).
+- Graph tab: the view moves with shift and the arrow keys or a mouse drag; `0` returns to its start.
+
+### Changed
+- Nodes tab: one row per node (cameras, nodes, tools, the interface), grouped by router, the nearest first; each group's head names the router, its host, its distance in hops and its links, then the columns name, program, kind, reads, publishes. A program that declares nothing shows `–` ([guide](docs/guides/tui.md#nodes)).
+- Nodes tab detail: the command line, host, process, start time, versions, every key read, published (with its readers) and answered; a router's links with their addresses.
+- Graph tab: one band per router with its links; a box shows the node's name and program and the topics nobody takes; each line is one topic with how it is taken and, while `m` measures, its rate as this interface receives it. The nodes' own reports moved to the detail.
+- The status line names the router the interface is connected to and counts routers, nodes and streams.
+
+Works with programs of 0.5.0 and later: older programs neither send nor need the declaration and show `–`.
+
 ## 0.5.8
 
 `xblick view` opens the browser by default, and `xblick cam` and `xblick view` without arguments show a list to choose from.
