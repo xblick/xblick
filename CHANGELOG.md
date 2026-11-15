@@ -11,6 +11,25 @@ Each version below is a heading with its release notes: one summary sentence, th
 (and Known limit), one line on compatibility. `tools/release_notes.sh <version>` prints a version's notes for its
 GitHub release. The rule is in [Development](docs/project/development.md#release-notes).
 
+## 0.5.12
+
+`xblick clean` finds the rings that killed publishers left in `/dev/shm` and removes them, judged by each ring's creator and never by its name.
+
+### Added
+- A ring records its creator (process id and start time) and the time of its last frame in reserved bytes of its header, and its creator holds a lock on the ring file while it lives ([rings left behind](docs/concepts/rings.md#rings-left-behind)).
+
+### Changed
+- New command `xblick clean`: lists the rings on this PC with creator, last frame and state; `--remove` removes those whose creator is gone and that no process maps, never one of a living creator or of another user ([command line](docs/reference/cli.md#xblick-clean-rings-)).
+
+### Fixed
+- `xblick rerun` without a selection: a row of the "rates and ages now" table whose publisher ended says "ended" with the time of its last sample (#17).
+- The screenshots of the terminal interface in the documentation showed the host id of the PC that made them (#18).
+
+### Known limit
+- A ring of a program of 0.5.11 or older has no creator record: `xblick clean` lists it as "unknown" and removes it only with `--force` and its name.
+
+Works with programs of 0.5.0 and later; nothing on the wire changed, and older programs ignore the creator record and the lock.
+
 ## 0.5.11
 
 A fixed camera gets its pose in the room, nodes find a camera's pose with one lookup whether it is fixed or moving, and pairing by stamp has a fixed default offset.
