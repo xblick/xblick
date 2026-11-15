@@ -11,6 +11,21 @@ Each version below is a heading with its release notes: one summary sentence, th
 (and Known limit), one line on compatibility. `tools/release_notes.sh <version>` prints a version's notes for its
 GitHub release. The rule is in [Development](docs/project/development.md#release-notes).
 
+## 0.5.11
+
+A fixed camera gets its pose in the room, nodes find a camera's pose with one lookup whether it is fixed or moving, and pairing by stamp has a fixed default offset.
+
+### Added
+- `xblick cam --pose X Y Z YAW PITCH ROLL` publishes a fixed camera's pose in the room once on `<camera>/tf_static`, with the step to its optical frame `<frame id>_optical`, in which the images then are; `xblick test-camera --pose` as well ([guide](docs/guides/cam.md#a-fixed-pose-in-the-room)).
+- `xblick.poses.TransformBuffer`: a transform between a camera's frames at an image's stamp, from its `tf_static` (valid at every stamp) and `tf` (interpolated, never extrapolated); a missing one raises `TransformError` with one line naming the frames ([writing nodes](docs/guides/writing-nodes.md)).
+- `xblick rerun` draws a camera whose `tf_static` places it in `world` at that pose, z up.
+
+### Changed
+- `PartnerHistory` and `RGBDInputs` pair within 20 ms by default (`history.PAIR_MAX_OFFSET_NS`, C++ `kPairMaxOffsetNs`). Half the partner's measured period was the default: 16.7 ms at 30 Hz, below the Azure Kinect's colour-depth stamp difference of up to 17 ms. It is still `history.HALF_PERIOD` (#16).
+- `rgbd.collect_views` finds the camera's pose with `TransformBuffer`, so views of a fixed camera with `--pose` work.
+
+Works with programs of 0.5.0 and later; nothing on the wire changed.
+
 ## 0.5.10
 
 The terminal interface's Rerun tab lists everything `xblick rerun` can show as an entry of its own, and the selection of a running `xblick rerun` changes without touching the viewer's layout.
