@@ -6,7 +6,7 @@
 The network runs in this process, each "program" a Zenoh session of its own, declared as the program it stands for
 (its host and command line made up too), on two routers with the admin space on: ``robot-pc`` (as xblick router,
 its record in its metadata) and ``laptop`` (as zenohd), linked. On robot-pc: an Azure Kinect (color and depth, frames
-from a pattern), SAM 3 taking the color images by shm, FoundationPose taking color, depth and SAM 3's instances,
+from a pattern, its tf_static, its body tracking's bodies), SAM 3 taking the color images by shm, FoundationPose taking color, depth and SAM 3's instances,
 TAPNext and SAM 3 taking each other's results (a cycle), a robot state bridge of a program before 0.5.9 (it declares
 nothing) and a recorder; on laptop a viewer as a client taking compressed images. SAM 3 offers some of xblick-sam3's
 parameters, with its names, defaults and live ones (its options as declare_options makes them). Only the camera sends images; the nodes send
@@ -36,9 +36,9 @@ import numpy as np
 import zenoh
 
 from xblick import declaration, router, tui
-from xblick.camera import CameraPublisher
+from xblick.camera import INFO_VERSION, CameraPublisher, StaticTransformPublisher
 from xblick.diagnostics import DiagnosticsPublisher
-from xblick.msg import CameraInfo
+from xblick.msg import CameraInfo, Header, Transform, TransformStamped, Vector3
 from xblick import _core
 from xblick.parameters import Parameters
 from xblick.session import Session, open_session
@@ -96,7 +96,12 @@ class DemoNetwork:
         depth = CameraPublisher(kinect, f"{CAMERA}/depth_to_color", encoding="mono16", frame_id="azurekinect_color",
                                 camera_info=info, source="demo", codec=None)
         kinect_diag = DiagnosticsPublisher(kinect, CAMERA, "azurekinect")
-        self.closers += [color.close, depth.close, kinect_diag.close]
+        transforms = StaticTransformPublisher(kinect, CAMERA, [TransformStamped(
+            Header(frame_id="azurekinect_depth"), "azurekinect_color", Transform(Vector3(0.032, 0.0, 0.0)))])
+        # its body tracking's results (xblick-k4abt's <camera>/bodies), declared from the camera's session: a
+        # program of its own would widen the graph beyond the screenshot
+        bodies = kinect.declare_publisher(f"{CAMERA}/bodies")
+        self.closers += [color.close, depth.close, kinect_diag.close, transforms.close, bodies.undeclare]
 
         def frames():
             seq = 0
@@ -118,6 +123,12 @@ class DemoNetwork:
                                             f"{CAMERA}/sam3/instances"], gives=["poses", "tf"], rate=8.1)
         self._node("tapnext", takes=[f"{CAMERA}/color/image_raw/shm/{HOST}", f"{CAMERA}/sam3/instances"],
                    gives=["tracks"], rate=29.7)
+        # what the Rerun tab lists: info records as the nodes' publishers answer them (the label image, the poses)
+        self._info(self.sam3, f"{CAMERA}/sam3/instances", {"kind": "image", "labels": True, "encoding": "mono16",
+                                                           "frame_id": "azurekinect_color", "transports":
+                                                           ["raw", "compressed", "shm"]})
+        self._info(self.sam3, f"{CAMERA}/sam3/boxes", {"kind": "detections",
+                                                       "type": "vision_msgs/msg/Detection2DArray"})
         self.params = Parameters(self.sam3, "sam3", CAMERA)
         self.params.declare("threshold", 0.5, range=(0.0, 1.0, 0.01), description="--threshold: the least score of an "
                             "instance")
@@ -169,6 +180,12 @@ class DemoNetwork:
         IDENTITY.update(host="robot-pc", command=["xblick"])  # the interface's own, opened later
         self.sessions.append(session)
         return session
+
+    def _info(self, session, key: str, record: dict):
+        """``<key>/info`` answered with ``record`` (of the info version), as a publisher answers it."""
+        record = {"v": INFO_VERSION, "xblick": _core.__version__, "host": HOST, **record}
+        queryable = session.declare_queryable(f"{key}/info", lambda q: q.reply(f"{key}/info", json.dumps(record)))
+        self.closers.append(queryable.undeclare)
 
     def _thread(self, target):
         thread = threading.Thread(target=target, daemon=True)
@@ -284,6 +301,13 @@ async def capture(network: DemoNetwork, out: Path):
         await pilot.pause(0.5)
         save("nodes")
         await pilot.press("4")
+        tree = app.query_one("#rerun-streams")
+        await until(pilot, lambda: {f"bases\t{CAMERA}/color", f"bodies\t{CAMERA}/bodies",
+                                    f"segmentations\t{CAMERA}/sam3/instances"} <= set(app._rerun_leaves))
+        for entry in (f"bases\t{CAMERA}/color", f"bodies\t{CAMERA}/bodies",
+                      f"segmentations\t{CAMERA}/sam3/instances"):
+            tree.move_cursor(app._rerun_leaves[entry])
+            await pilot.press("space")
         await pilot.pause(1.0)
         save("rerun")
         await pilot.press("5")

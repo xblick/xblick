@@ -267,6 +267,61 @@ def test_pose_topics_for_trajectories():
     assert tui.RerunSelection.from_dict(selection.to_dict()).trajectories == selection.trajectories
 
 
+def kinect_network() -> tuple[list, survey.Network]:
+    """What the Rerun tab is given for an Azure Kinect with body tracking, a segmenter and a camera of the test: info
+    records of the streams and the label image, the admin space's publishers and queryables."""
+    cam, test = "cam/azurekinect", "test/camera"
+    streams = [(f"{cam}/color", {"kind": "image", "encoding": "rgb8", "frame_id": "color", "transports": ["compressed"]}),
+               (f"{cam}/depth_to_color", {"kind": "image", "encoding": "16UC1", "frame_id": "color",
+                                          "transports": ["compressed"]}),
+               (f"{cam}/sam3/instances", {"kind": "image", "labels": True, "encoding": "mono16", "frame_id": "color",
+                                          "transports": ["compressed"]}),
+               (f"{cam}/boxer/boxes", {"kind": "detections", "type": "vision_msgs/msg/Detection2DArray"}),
+               (f"{test}/color", {"kind": "image", "encoding": "rgb8", "frame_id": "t", "transports": ["compressed"]})]
+    network = survey.Network()
+    network.nodes["k" * 32] = survey.Node("k" * 32, "peer", publishes={f"{cam}/k4abt/bodies", f"{cam}/imu",
+                                                                     f"{cam}/diagnostics", f"{cam}/tf"},
+                                          queryables={f"{cam}/tf_static"})
+    return streams, network
+
+
+def test_rerun_entries_tree_and_marks():
+    """Everything the bridge can show as an entry of its own, by camera and node, with a note; the transforms marked
+    with the first entry of their camera and unmarked with its last, unmarked alone into --no-transforms."""
+    streams, network = kinect_network()
+    entries = tui.rerun_entries(streams, network)
+    groups = tui.rerun_groups(entries)
+    assert list(groups) == ["cam/azurekinect", "test/camera"]
+    kinect = {node: [(e.label, e.note) for e in es] for node, es in groups["cam/azurekinect"].items()}
+    assert kinect == {"": [("color", ""), ("depth_to_color", ""), ("tf, tf_static", "places the camera in 3D"),
+                           ("imu", "time series"), ("diagnostics", "a text log and time series"),
+                           ("tf (path)", "poses as a path in the world")],
+                      "boxer": [("boxes", "boxes over the image of their frame")],
+                      "k4abt": [("bodies", "skeletons in 3D and over the images")],
+                      "sam3": [("instances", "drawn over color")]}
+    assert [(e.label, e.note) for e in groups["test/camera"][""]] == [
+        ("color", ""), ("tf, tf_static", "places the camera in 3D, none published now")]
+    assert tui.rerun_counts(entries) == "3 streams, 3 results, 5 more"
+    by = {e.id: e for e in entries}
+    marks = tui.toggle_mark(set(), by["bodies\tcam/azurekinect/k4abt/bodies"], entries)
+    assert marks == {"bodies\tcam/azurekinect/k4abt/bodies", "transforms\tcam/azurekinect"}
+    marks = tui.toggle_mark(marks, by["bases\tcam/azurekinect/color"], entries)
+    marks = tui.toggle_mark(marks, by["transforms\tcam/azurekinect"], entries)  # unmarked by hand
+    chosen, no_transforms = tui.selected_of(marks)
+    assert chosen["bases"] == ["cam/azurekinect/color"] and no_transforms == ["cam/azurekinect"]
+    selection = tui.RerunSelection(**chosen, no_transforms=no_transforms)
+    assert selection.check() == ["--spawn", "cam/azurekinect/color", "--bodies", "cam/azurekinect/k4abt/bodies",
+                                 "--no-transforms", "cam/azurekinect"]
+    assert tui.marks_of(selection) == marks  # a preset brings back the same marks
+    marks = tui.toggle_mark(marks, by["imu\tcam/azurekinect/imu"], entries)  # not placed: the transforms stay out
+    for key in ("bases\tcam/azurekinect/color", "bodies\tcam/azurekinect/k4abt/bodies"):
+        marks = tui.toggle_mark(marks, by[key], entries)
+    assert marks == {"imu\tcam/azurekinect/imu"}
+    assert tui.rerun_entries(streams, None)[-1].note == "places the camera in 3D"  # no admin space: unknown
+    text = tui.entry_text(by["bodies\tcam/azurekinect/k4abt/bodies"], True, "drawn over color", 10).plain
+    assert text == "[x] bodies      drawn over color"
+
+
 def test_presets_save_load_delete(tmp_path, zenoh_config):
     presets = tui.Presets(tmp_path / "presets.json")
     assert presets.load() == {}
@@ -463,22 +518,50 @@ def test_app_reconnects_and_shows_a_failed_connection(fake, tmp_path):
     run_app(app, test)
 
 
+def tree_lines(app) -> list[str]:
+    """The Rerun tab's tree as shown: each node's label, indented by its depth."""
+    lines = []
+
+    def walk(node, depth):
+        for child in node.children:
+            lines.append("  " * depth + str(child.label.plain if hasattr(child.label, "plain") else child.label))
+            walk(child, depth + 1)
+
+    walk(app.query_one("#rerun-streams").root, 0)
+    return lines
+
+
 def test_app_rerun_tab_presets_and_launch(fake, tmp_path):
     pytest.importorskip("rerun")
     app = tui.XblickApp(fake.connection(), tui.Presets(tmp_path / "presets.json"), discover_every=0.5)
     recording = tmp_path / "fake.rrd"
+    extra = f"{CAMERA}/extra"
 
     async def test(pilot):
         await until(pilot, lambda: app.discovery.streams)
-        streams = app.query_one("#rerun-streams")
-        await until(pilot, lambda: streams.option_count == 1)
-        streams.select(f"bases\t{BASE}")
+        app.action_tab("tab-rerun")
+        tree = app.query_one("#rerun-streams")
+        await until(pilot, lambda: f"bases\t{BASE}" in app._rerun_leaves)
+        # the found entries by camera, the count and when above them; the right side its own header
+        header = text_of(app, "#rerun-found")
+        assert "Found on the network: 1 stream, 0 results" in header and re.search(r"updates every \d+ s", header)
+        assert "Options of xblick rerun" in text_of(app, "#rerun-options")
+        lines = tree_lines(app)
+        assert lines[0] == CAMERA and lines[1].startswith("  [ ] color") and "tf, tf_static" in "".join(lines)
+        tree.move_cursor(app._rerun_leaves[f"bases\t{BASE}"])
+        await pilot.press("space")
+        assert app._rerun_marks == {f"bases\t{BASE}", f"transforms\t{CAMERA}"}  # the transforms with it
         app.query_one("#rerun-viewer").value = "save"
         app.query_one("#rerun-viewer-value").value = str(recording)
         app.query_one("#rerun-stale-after").value = "4"
         await pilot.pause(0.2)
         command = text_of(app, "#rerun-command")
         assert command.startswith(f"xblick rerun --save {recording} {BASE} --stale-after 4 --connect")
+        tree.move_cursor(app._rerun_leaves[f"transforms\t{CAMERA}"])
+        await pilot.press("space")  # unmarked by hand: named as left out
+        await pilot.pause(0.2)
+        assert f"--no-transforms {CAMERA}" in text_of(app, "#rerun-command")
+        await pilot.press("space")
 
         # saved, changed, loaded back
         app.query_one("#preset-name").value = "fake"
@@ -491,21 +574,33 @@ def test_app_rerun_tab_presets_and_launch(fake, tmp_path):
         await pilot.pause(0.2)
         assert app.query_one("#rerun-stale-after").value == "4"
 
-        # a preset's stream that is not there is listed as not found, and stays chosen
+        # a preset's entry that is not there is listed as not found, and stays marked
         app.apply(tui.RerunSelection(bases=[BASE], segmentations=[f"{CAMERA}/seg/instances"],
                                      connection=app.connection))
-        assert streams.option_count == 2 and f"segmentations\t{CAMERA}/seg/instances" in streams.selected
+        await pilot.pause(0.2)
+        assert any(line.strip() == "[x] instances  not found" for line in tree_lines(app)), tree_lines(app)
 
-        # launched and stopped: the recording has the camera's frames
+        # launched: the options fixed, the marks live; a stream marked while it runs is bridged at once
         app.apply(app.presets.load()["fake"])
+        publisher = CameraPublisher(fake.camera_session, extra, encoding="rgb8", frame_id="fake_color")
+        await until(pilot, lambda: f"bases\t{extra}" in app._rerun_leaves)
         app.query_one("#rerun-launch").press()
         await pilot.pause(0.2)
-        await until(pilot, lambda: any(line.startswith("bridging") for line in app.rerun_output),
-                    timeout=60)
-        await pilot.pause(2.0)
+        await until(pilot, lambda: any(line.startswith("selection: parameters of xblick/rerun")
+                                       for line in app.rerun_output), timeout=60)
+        assert app.query_one("#rerun-stale-after").disabled and not tree.disabled
+        assert "marks apply at once" in text_of(app, "#rerun-found")
+        tree.move_cursor(app._rerun_leaves[f"bases\t{extra}"])
+        await pilot.press("space")
+        await until(pilot, lambda: f"xblick rerun: now also {extra}" in app.rerun_output, timeout=20)
+        # its publisher ends: marked, it stays in the list as gone, with the time
+        publisher.close()
+        await until(pilot, lambda: any(line.strip().startswith("[x] extra") and "gone since" in line
+                                       for line in tree_lines(app)))
+        await pilot.pause(1.0)
         app.stop_rerun()
         await until(pilot, lambda: "xblick rerun ended, exit code 0" in app.rerun_output)
-        assert recording.stat().st_size > 10_000
+        assert recording.stat().st_size > 10_000 and not app.query_one("#rerun-stale-after").disabled
 
     run_app(app, test)
 
@@ -579,7 +674,7 @@ def test_app_fits_the_terminal(fake, tmp_path, size):
             assert on_screen(app.query_one(widget)), (tab, app.query_one(widget).region)
         app.action_tab("tab-rerun")
         await pilot.pause(0.3)
-        streams, form = app.query_one("#rerun-streams"), app.query_one("#rerun-form")
+        streams, form = app.query_one("#rerun-left"), app.query_one("#rerun-form")
         if width < tui.WIDE:
             assert streams.region.x == form.region.x and streams.region.bottom <= form.region.y
         else:

@@ -11,8 +11,11 @@ Zenoh session that shows what runs, for any node: nothing in it knows of a parti
   reports on ``<camera>/diagnostics`` and the record and play node's status. A row selected: its detail.
 * **Graph**: the sessions as boxes and the data between them as arrows (tui_graph.py); a session selected (arrow
   keys, a click) or the mouse over an edge names the keys, how they are taken and what the session reports.
-* **Rerun**: streams, results and options of ``xblick rerun``, as presets with a name; launched as a child
-  process (stopped with SIGTERM, as its Ctrl-C) on the interface's connection.
+* **Rerun**: everything ``xblick rerun`` can show, an entry each, as a tree by camera and node (``rerun_entries``:
+  info records and the admin space); the marked entries are its selection, a camera's transforms marked with its
+  first entry (``toggle_mark``), a marked entry whose publisher ended shown as gone. Options and marks as presets
+  with a name; launched as a child process (stopped with SIGTERM, as its Ctrl-C) on the interface's connection.
+  While it runs its options are fixed and the marks go to its live parameters (``xblick/<name>``).
 
 The routers' admin space (``survey.query_network``) has the sessions and their declarations; without a router (only
 peers) the interface says so and shows what the streams' info records and the traffic tell.
@@ -45,11 +48,11 @@ from rich.table import Table
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import (Button, DataTable, Footer, Header, Input, Label, RadioButton, RadioSet, RichLog, Select,
-                             SelectionList, Static, TabbedContent, TabPane)
-from textual.widgets.selection_list import Selection
+                             Static, TabbedContent, TabPane, Tree)
 from textual.worker import get_current_worker
 
 from . import declaration, diagnostics, parameters, survey, topics, tui_nodes
@@ -68,8 +71,13 @@ GRAPH_HELP = Text("arrow keys or a click: a node and its edges (out green, in cy
                   "topic, how it is taken and, while m measures, its messages/s as this interface receives them; ▷ in "
                   "a box: a topic nobody takes; one band per router, its links on the left; shift+arrows or a drag: "
                   "move the view, 0: back to its start", style="dim")
-RERUN_KINDS = {"bases": "image", "clouds": "points", "detections": "detections", "segmentations": "labels",
-               "trajectories": "poses"}
+# the kinds of the Rerun tab's entries: those of xblick rerun's selection (rerun_bridge.KINDS), and a camera's
+# transforms (tf_static and tf), which come with what they place unless left out (--no-transforms)
+RERUN_KINDS = ("bases", "clouds", "detections", "segmentations", "trajectories", "bodies", "imu", "diagnostics")
+TRANSFORMS = "transforms"
+PLACED_KINDS = ("bases", "clouds", "detections", "segmentations", "bodies")  # rerun_bridge.PLACED_KINDS
+ENTRY_ORDER = {"bases": 0, "clouds": 1, TRANSFORMS: 2, "imu": 3, "diagnostics": 4, "segmentations": 5,
+               "detections": 6, "bodies": 7, "trajectories": 8}  # within a branch of the tree
 
 
 def _short(zid: str) -> str:
@@ -168,15 +176,30 @@ class Connection:
 
 @dataclasses.dataclass
 class RerunSelection:
-    """What ``xblick rerun`` is to show and how: its streams (``bases``), point clouds, detections, label images,
-    trajectories, options, the viewer (``spawn``, ``serve`` with a port, ``save`` with a file, ``connect-viewer`` with a URL), further
-    arguments, and the Zenoh connection. No streams and no clouds: rerun takes every stream that answers."""
+    """What ``xblick rerun`` is to show and how: its selection (streams as ``bases``, point clouds, detections, label
+    images, trajectories, bodies, IMU, diagnostics, the cameras whose transforms are left out), options, the viewer
+    (``spawn``, ``serve`` with a port, ``save`` with a file, ``connect-viewer`` with a URL), further arguments, and the
+    Zenoh connection. Nothing selected: rerun shows everything it finds."""
+
+    def selected(self) -> dict[str, list[str]]:
+        """The selection by kind (RERUN_KINDS)."""
+        return {kind: list(getattr(self, kind)) for kind in RERUN_KINDS}
+
+    def node_key(self) -> str:
+        """The key of the node it runs as (``xblick/<name>``, ``--name`` among the further arguments)."""
+        from . import cli
+
+        return f"xblick/{cli.parse(['rerun', *self.check()]).name}"
 
     bases: list[str] = dataclasses.field(default_factory=list)
     clouds: list[str] = dataclasses.field(default_factory=list)
     detections: list[str] = dataclasses.field(default_factory=list)
     segmentations: list[str] = dataclasses.field(default_factory=list)
     trajectories: list[str] = dataclasses.field(default_factory=list)
+    bodies: list[str] = dataclasses.field(default_factory=list)
+    imu: list[str] = dataclasses.field(default_factory=list)
+    diagnostics: list[str] = dataclasses.field(default_factory=list)
+    no_transforms: list[str] = dataclasses.field(default_factory=list)  # cameras whose transforms are left out
     prefix: str = ""
     stale_after: float | None = None  # None: rerun's default
     cloud_rate: float | None = None
@@ -196,7 +219,9 @@ class RerunSelection:
         args = [f"--{self.viewer}"] + ([self.viewer_value] if self.viewer_value else [])
         args += list(self.bases)
         for option, keys in (("--detections", self.detections), ("--segmentation", self.segmentations),
-                             ("--points", self.clouds), ("--trajectory", self.trajectories)):
+                             ("--points", self.clouds), ("--trajectory", self.trajectories),
+                             ("--bodies", self.bodies), ("--imu", self.imu), ("--diagnostics", self.diagnostics),
+                             ("--no-transforms", self.no_transforms)):
             for key in keys:
                 args += [option, key]
         if self.prefix:
@@ -474,6 +499,153 @@ def pose_topics(network: survey.Network | None) -> list[str]:
     return sorted(k for k in network.publishers() if k.endswith("/" + topics.TF) and k.count("/") >= 2)
 
 
+@dataclasses.dataclass(frozen=True)
+class RerunEntry:
+    """One thing ``xblick rerun`` can show, as the Rerun tab lists it: its kind (RERUN_KINDS or TRANSFORMS), its key
+    (the topic; for the transforms the camera), where it sits in the tree (camera, node: empty for the camera's own)
+    under its label, and what the viewer makes of it (``note``)."""
+
+    kind: str
+    key: str
+    camera: str
+    node: str
+    label: str
+    note: str = ""
+
+    @property
+    def id(self) -> str:
+        return f"{self.kind}\t{self.key}"
+
+
+def rerun_entry(kind: str, key: str, note: str = "") -> RerunEntry:
+    """An entry of a kind and key, placed by its key: ``<namespace>/<camera>``, then a node's part, then the name."""
+    from .rerun_bridge import camera_of_entry
+
+    if kind == TRANSFORMS:
+        return RerunEntry(kind, key, key, "", "tf, tf_static", note)
+    camera = camera_of_entry(kind, key) if kind != "trajectories" else "/".join(key.split("/")[:2])
+    rest = key[len(camera) + 1:].split("/")
+    label = rest[-1] + (" (path)" if kind == "trajectories" else "")
+    return RerunEntry(kind, key, camera, "/".join(rest[:-1]), label, note)
+
+
+def rerun_entries(streams: list[tuple[str, dict]], network: survey.Network | None) -> list[RerunEntry]:
+    """Everything ``xblick rerun`` can show of what was found: from the info records (``streams``: image and point
+    cloud streams, label images, detections) and from the routers' admin space (``network``: bodies, IMU, diagnostics,
+    poses, the cameras' transforms); a camera's transforms for every camera with something they place. A note says
+    what the viewer makes of each, as far as the records tell (an image's frame, a detection's type)."""
+    from .cli import _bridged
+
+    by_base = dict(streams)
+    found = _bridged(streams)
+    images: dict[str, list[str]] = {}  # camera -> its image streams, colour before 16-bit
+    for base in found["bases"]:
+        images.setdefault(rerun_entry("bases", base).camera, []).append(base)
+    for camera, bases in images.items():
+        bases.sort(key=lambda b: (by_base[b].get("encoding") in ("16UC1", "mono16"), b))
+
+    def over(key: str) -> str:
+        """The image a label image is drawn over: the camera's stream of its frame."""
+        entry = rerun_entry("segmentations", key)
+        frame = by_base[key].get("frame_id")
+        image = next((b for b in images.get(entry.camera, []) if by_base[b].get("frame_id") == frame), None)
+        return f"drawn over {image[len(entry.camera) + 1:]}" if image else "drawn over the image of its frame"
+
+    detections = {"vision_msgs/msg/Detection2DArray": "boxes over the image of their frame",
+                  "vision_msgs/msg/Detection3DArray": "boxes in 3D and over the images",
+                  "vision_msgs/msg/Classification": "a text log"}
+    entries = [rerun_entry("bases", b) for b in found["bases"]]
+    entries += [rerun_entry("clouds", c, "points in 3D") for c in found["clouds"]]
+    entries += [rerun_entry("segmentations", s, over(s)) for s in found["segmentations"]]
+    entries += [rerun_entry("detections", d, detections.get(by_base[d].get("type"), "")) for d in found["detections"]]
+    published = set(network.publishers()) if network is not None else set()
+    answered = {k for n in network.nodes.values() for k in n.queryables} if network is not None else set()
+    for key in sorted(published):
+        if key.count("/") < 2:
+            continue
+        last = key.rpartition("/")[2]
+        if last == "bodies":
+            entries.append(rerun_entry("bodies", key, "skeletons in 3D and over the images"))
+        elif last == topics.IMU:
+            entries.append(rerun_entry("imu", key, "time series"))
+        elif last == topics.DIAGNOSTICS:
+            entries.append(rerun_entry("diagnostics", key, "a text log and time series"))
+    entries += [rerun_entry("trajectories", k, "poses as a path in the world") for k in pose_topics(network)]
+    cameras = sorted({e.camera for e in entries if e.kind in PLACED_KINDS})
+    for camera in cameras:
+        with_any = {topics.tf_static(camera), topics.tf(camera)} & (published | answered)
+        entries.append(rerun_entry(TRANSFORMS, camera, "places the camera in 3D" + (
+            "" if with_any or network is None else ", none published now")))
+    return entries
+
+
+def rerun_counts(entries: list[RerunEntry]) -> str:
+    """``3 streams, 2 results, 4 more topics``: a camera's own streams, the nodes' results, the rest."""
+    streams = sum(1 for e in entries if e.kind in ("bases", "clouds") and not e.node)
+    results = sum(1 for e in entries if e.node or e.kind == "bodies")
+    return f"{_plural(streams, 'stream')}, {_plural(results, 'result')}, {len(entries) - streams - results} more"
+
+
+def rerun_groups(entries: list[RerunEntry]) -> dict[str, dict[str, list[RerunEntry]]]:
+    """The tree: camera -> node ("" first: the camera's own) -> its entries, each sorted."""
+    groups: dict[str, dict[str, list[RerunEntry]]] = {}
+    for e in entries:
+        groups.setdefault(e.camera, {}).setdefault(e.node, []).append(e)
+    return {camera: {node: sorted(group[node], key=lambda e: (ENTRY_ORDER[e.kind], e.label))
+                     for node in sorted(group)} for camera, group in sorted(groups.items())}
+
+
+def toggle_mark(marks: set[str], entry: RerunEntry, entries: list[RerunEntry]) -> set[str]:
+    """The marks after Space on ``entry``: marked or not; a camera's transforms come with the first entry of that
+    camera they place and go with its last, and can be unmarked themselves."""
+    marks = set(marks)
+    placed = {e.id for e in entries if e.camera == entry.camera and e.kind in PLACED_KINDS}
+    transforms = rerun_entry(TRANSFORMS, entry.camera).id
+    if entry.id in marks:
+        marks.discard(entry.id)
+        if entry.kind in PLACED_KINDS and not (marks & placed):
+            marks.discard(transforms)
+    else:
+        if entry.kind in PLACED_KINDS and not (marks & placed):
+            marks.add(transforms)
+        marks.add(entry.id)
+    return marks
+
+
+def marks_of(selection: RerunSelection) -> set[str]:
+    """The marks of a selection (a preset): its entries, and the transforms of every camera of what they place but
+    those left out."""
+    marks = {f"{kind}\t{key}" for kind, keys in selection.selected().items() for key in keys}
+    cameras = {rerun_entry(kind, key).camera for kind, keys in selection.selected().items() if kind in PLACED_KINDS
+               for key in keys}
+    return marks | {rerun_entry(TRANSFORMS, c).id for c in cameras if c not in selection.no_transforms}
+
+
+def selected_of(marks: set[str]) -> tuple[dict[str, list[str]], list[str]]:
+    """(the selection by kind, the cameras whose transforms are left out) of the marks."""
+    chosen: dict[str, list[str]] = {kind: [] for kind in RERUN_KINDS}
+    transforms = set()
+    for mark in sorted(marks):
+        kind, key = mark.split("\t")
+        if kind == TRANSFORMS:
+            transforms.add(key)
+        else:
+            chosen[kind].append(key)
+    cameras = sorted({rerun_entry(kind, key).camera for kind in PLACED_KINDS for key in chosen[kind]})
+    return chosen, [c for c in cameras if c not in transforms]
+
+
+def entry_text(entry: RerunEntry, marked: bool, note: str, width: int, gone: str = "") -> Text:
+    """A leaf of the tree: its mark, its label padded to ``width``, its note (or ``gone``, in red)."""
+    text = Text("[x] " if marked else "[ ] ", style="bold" if marked else "")
+    text.append(entry.label.ljust(width) + "  ")
+    if gone:
+        text.append(gone, style="red")
+    elif note:
+        text.append(note, style="dim")
+    return text
+
+
 @dataclasses.dataclass
 class Discovery:
     """One look at the network (in the discovery thread)."""
@@ -486,6 +658,8 @@ class Discovery:
     error: str | None = None
     unreachable: list[str] = dataclasses.field(default_factory=list)  # peers this peer has no link to (zids)
     origins: list[str] = dataclasses.field(default_factory=list)  # the routers this interface is linked to (zids)
+    took_s: float = 0.0  # how long this look took
+    drawn_over: dict[str, list[str]] | None = None  # the running xblick rerun's: result -> its images (None: unknown)
 
 
 def statuses(session: zenoh.Session, timeout: float = 0.5) -> dict[str, dict]:
@@ -496,6 +670,18 @@ def statuses(session: zenoh.Session, timeout: float = 0.5) -> dict[str, dict]:
         if reply.ok is not None:
             out[str(reply.ok.key_expr)] = json.loads(reply.ok.payload.to_bytes())
     return out
+
+
+class RerunTree(Tree):
+    """The Rerun tab's entries by camera and node. Space, Enter or a click on an entry marks or unmarks it
+    (``Tree.NodeSelected``, handled by the app); on a camera or node it folds or unfolds."""
+
+    BINDINGS: ClassVar = [Binding("space", "select_cursor", "Mark", show=False)]
+
+    def __init__(self, label: str, **kwargs):
+        super().__init__(label, **kwargs)
+        self.show_root = False
+        self.auto_expand = True
 
 
 class XblickApp(App):
@@ -517,7 +703,9 @@ class XblickApp(App):
     #tab-topics DataTable { height: 2fr; }
     #tab-topics .detail { height: 1fr; }
     #rerun-top { height: 2fr; }
-    #rerun-streams { width: 1fr; height: 1fr; }
+    #rerun-left { width: 1fr; height: 1fr; }
+    #rerun-found, #rerun-options { height: auto; padding: 0 1; background: $boost; }
+    #rerun-streams { height: 1fr; }
     #rerun-form { width: 1fr; height: 1fr; }
     /* narrower than WIDE: the Rerun tab's lists one above the other */
     Screen.-narrow #rerun-top { layout: vertical; }
@@ -540,7 +728,7 @@ class XblickApp(App):
                           ("escape", "close_detail", "Close topic"), ("1", "tab('tab-topics')", "Topics"),
                           ("2", "tab('tab-nodes')", "Nodes"), ("3", "tab('tab-graph')", "Graph"),
                           ("4", "tab('tab-rerun')", "Rerun"), ("5", "tab('tab-params')", "Parameters"),
-                          ("r", "refresh", "Look again"),
+                          ("r", "refresh", "Update now"),
                           ("q", "quit", "Quit")]
     MAIN: ClassVar = {"tab-topics": "#topic-table", "tab-nodes": "#node-table", "tab-graph": "#graph",
                       "tab-rerun": "#rerun-streams",
@@ -580,7 +768,16 @@ class XblickApp(App):
         self._discovered_at: float | None = None
         self._rerun: subprocess.Popen | None = None
         self.rerun_output: list[str] = []  # the child's lines, as in the log
-        self._known_streams: set[str] = set()
+        self._rerun_entries: list[RerunEntry] = []  # what the Rerun tab lists, of the last look
+        self._rerun_shown = None  # what the tree was built from
+        self._rerun_leaves: dict = {}  # entry id -> its node of the tree
+        self._rerun_marks: set[str] = set()  # the entries marked (their ids)
+        self._rerun_seen: dict[str, float] = {}  # entry id -> when it was last found (time.time)
+        self._rerun_folded: set[str] = set()  # the tree's branches folded by the user (camera, camera/node)
+        self._rerun_key: str | None = None  # the running xblick rerun's node, while it takes its selection live
+        self._rerun_live = False  # the running xblick rerun takes a changed selection (started with one)
+        self._rerun_set_lock = threading.Lock()  # one set of its selection at a time, the newest marks
+        self._looking = False  # r pressed: a look at the network is under way
         self.uses: dict[str, list[survey.Use]] = {}  # representation key -> who takes it, how (this interface left out)
         self._measure_after_open = False  # measuring when the connection changed: again on the next
         self.error: str | None = None
@@ -612,10 +809,12 @@ class XblickApp(App):
                         yield Static(GRAPH_HELP, id="graph-detail")
                 with TabPane("Rerun", id="tab-rerun"):
                     with Horizontal(id="rerun-top"):
-                        yield SelectionList(id="rerun-streams")
-                        with VerticalScroll(id="rerun-form"):
+                        with Vertical(id="rerun-left"):
                             yield Static(id="rerun-found")
-                            yield Label("prefix (without streams: only those below it)")
+                            yield RerunTree("found", id="rerun-streams")
+                        with VerticalScroll(id="rerun-form"):
+                            yield Static(id="rerun-options")
+                            yield Label("prefix (nothing marked: only what is below it)")
                             yield Input(id="rerun-prefix", placeholder="e.g. test", compact=True)
                             yield Label("--stale-after (s)")
                             yield Input(id="rerun-stale-after", placeholder="default", type="number", compact=True)
@@ -639,7 +838,7 @@ class XblickApp(App):
                     with Horizontal(id="rerun-buttons"):
                         yield Button("Launch xblick rerun", variant="primary", id="rerun-launch", compact=True)
                         yield Button("Stop", id="rerun-stop", disabled=True, compact=True)
-                        yield Button("Look again (r)", id="rerun-refresh", compact=True)
+                        yield Button("Update list now (r)", id="rerun-refresh", compact=True)
                     yield RichLog(id="rerun-log", max_lines=2000)
                 with TabPane("Parameters", id="tab-params"):
                     yield ParametersPane(id="params")
@@ -738,7 +937,8 @@ class XblickApp(App):
     def action_refresh(self):
         """Looks at the network again now (streams, sessions, tokens), instead of at the next period."""
         self._discover_now.set()
-        self.query_one("#rerun-found", Static).update(Text("looking...", style="yellow"))
+        self._looking = True
+        self._show_rerun_header()
 
     def _opened(self, generation: int):
         with self._open_lock:
@@ -801,6 +1001,8 @@ class XblickApp(App):
                 found.network.programs, found.program_errors = declaration.query(session, 0.5)
                 found.origins = sorted(str(z) for z in session.info.routers_zid())
                 found.unreachable = self._unreachable(session, found.network, missing_since)
+                found.drawn_over = self._rerun_drawn_over(session)
+                found.took_s = time.monotonic() - started
             except Exception as error:  # noqa: BLE001 - shown; discovery goes on
                 if worker.is_cancelled:
                     return
@@ -976,6 +1178,7 @@ class XblickApp(App):
         self._show_topics()
         self._show_reports()
         self._show_detail()
+        self._show_rerun_header()  # "updated N s ago"
         if self.meter is not None:  # the rates on the graph's lines
             self._show_graph()
 
@@ -1302,6 +1505,8 @@ class XblickApp(App):
 
     def _show_graph_detail(self):
         """What the mouse is over, else the selected session: its reports, what it sends and what it takes."""
+        if self._ended():  # a selection's event that arrives while the app ends (its widgets are gone)
+            return
         graph = self.query_one("#graph", GraphView)
         widget = self.query_one("#graph-detail", Static)
         labels = self._labels()
@@ -1352,73 +1557,197 @@ class XblickApp(App):
 
     # ----------------------------------------------------------------------------------------------- rerun
 
-    def _rerun_found(self) -> dict[str, list[str]]:
-        from .cli import _bridged
-
-        return {**_bridged(self.discovery.streams), "trajectories": pose_topics(self.discovery.network)}
-
     def _show_rerun_streams(self):
-        found = self._rerun_found()
-        count = sum(len(keys) for keys in found.values())
-        self.query_one("#rerun-found", Static).update(Text(
-            f"{count} found at {time.strftime('%H:%M:%S', time.localtime(self._discovered_at or time.time()))}; "
-            f"looked for every {self.discover_every:g} s (r: now)", style="dim"))
-        options = {f"{kind}\t{key}" for kind, keys in found.items() for key in keys}
-        if options == self._known_streams:
+        """The tree of what was found, and the marked entries that were not (gone, or a preset's not running); kept
+        as it is (cursor, folds) while nothing in it changed."""
+        found = rerun_entries(self.discovery.streams, self.discovery.network)
+        now = time.time()
+        for e in found:
+            self._rerun_seen[e.id] = now
+        self._rerun_entries = found
+        self._looking = False
+        self._show_rerun_header()
+        self._show_rerun_tree()
+
+    def _rerun_notes(self) -> dict[str, str]:
+        """Entry id -> its note: where the running xblick rerun draws it (its drawn_over), else what the records tell."""
+        drawn = self.discovery.drawn_over if self._rerun_key is not None else None
+        notes = {}
+        for e in self._rerun_entries:
+            images = (drawn or {}).get(e.key)
+            notes[e.id] = (f"drawn over {', '.join(i[len(e.camera) + 1:] for i in images)}" if images else e.note)
+        return notes
+
+    def _show_rerun_tree(self):
+        listed = {e.id: e for e in self._rerun_entries}
+        missing = [rerun_entry(*mark.split("\t")) for mark in sorted(self._rerun_marks) if mark not in listed]
+        entries = list(listed.values()) + missing
+        notes = self._rerun_notes()
+        gone = {}
+        for e in missing:
+            seen = self._rerun_seen.get(e.id)
+            gone[e.id] = (f"gone since {time.strftime('%H:%M:%S', time.localtime(seen))}" if seen is not None
+                          else "not found")
+        shown = (tuple(sorted(listed)), tuple(sorted(gone.items())), tuple(sorted(notes.items())),
+                 tuple(sorted(self._rerun_marks)))
+        if shown == self._rerun_shown:
             return
-        self._known_streams = options
-        self._set_rerun_options(found, self._selection_values())
-
-    def _selection_values(self) -> set[str]:
-        return set(self.query_one("#rerun-streams", SelectionList).selected)
-
-    def _set_rerun_options(self, found: dict[str, list[str]], selected: set[str]):
-        """The streams to choose from: those found, and selected ones not found (a preset's, a node not running)."""
-        listed = {f"{kind}\t{key}" for kind, keys in found.items() for key in keys}
-        widget = self.query_one("#rerun-streams", SelectionList)
-        highlighted = widget.highlighted
-        widget.clear_options()
-        for value in sorted(listed | selected, key=lambda v: (v.split("\t")[1], v)):
-            kind, key = value.split("\t")
-            missing = "" if value in listed else "  (not found)"
-            widget.add_option(Selection(Text(f"{key}  {RERUN_KINDS[kind]}{missing}"), value, value in selected))
-        if widget.option_count:  # a highlighted line, so that Space chooses from the start
-            widget.highlighted = min(highlighted or 0, widget.option_count - 1)
+        tree = self.query_one("#rerun-streams", RerunTree)
+        groups = rerun_groups(entries)
+        structure = [(camera, node, e.id) for camera, nodes in groups.items() for node, es in nodes.items()
+                     for e in es]
+        depth = tree.guide_depth
+        width = max((len(e.label) + (depth if e.node else 0) for e in entries), default=0)
+        if self._rerun_shown is None or [s[2] for s in structure] != list(self._rerun_leaves):
+            cursor = tree.cursor_node.data if tree.cursor_node is not None else None
+            tree.clear()
+            self._rerun_leaves = {}
+            for camera, nodes in groups.items():
+                branch = tree.root.add(camera, expand=camera not in self._rerun_folded, data=f"\0{camera}")
+                for node, es in nodes.items():
+                    at = branch
+                    if node:
+                        path = f"{camera}/{node}"
+                        at = branch.add(node, expand=path not in self._rerun_folded, data=f"\0{path}")
+                    for e in es:
+                        self._rerun_leaves[e.id] = at.add_leaf("", data=e.id)
+            if cursor in self._rerun_leaves or (cursor is None and self._rerun_leaves):
+                # on the first entry from the start, so that Space marks it
+                # after the refresh: the tree places its new nodes on lines only then
+                tree.call_after_refresh(tree.move_cursor, self._rerun_leaves.get(cursor)
+                                        or next(iter(self._rerun_leaves.values())))
+        by_id = {e.id: e for e in entries}
+        for entry_id, leaf in self._rerun_leaves.items():
+            e = by_id[entry_id]
+            leaf.set_label(entry_text(e, entry_id in self._rerun_marks, notes.get(entry_id, ""),
+                                      width - (depth if e.node else 0), gone.get(entry_id, "")))
+        self._rerun_shown = shown
         self._update_command()
+
+    def _show_rerun_header(self):
+        """Above the tree: what was found, when, how often; whether marks apply to a running xblick rerun."""
+        if self._ended():
+            return
+        header = Text()
+        header.append(f"Found on the network: {rerun_counts(self._rerun_entries)}\n", style="bold")
+        if self._looking or self._discovered_at is None:
+            header.append("looking...", style="yellow")
+        else:
+            every = max(self.discover_every, self.discovery.took_s)
+            header.append(f"updated {time.time() - self._discovered_at:.0f} s ago, updates every {every:.0f} s "
+                          "(r: now)", style="dim")
+        if self.discovery.network is not None and not self.discovery.network.routers:
+            header.append("\nno router answered: bodies, IMU, diagnostics, transforms and poses are not listed",
+                          style="yellow")
+        if self._rerun is not None and self._rerun.poll() is None:
+            header.append("\nmarks apply at once to the running xblick rerun" if self._rerun_live else
+                          "\nthe running xblick rerun shows everything found: marks apply at its next start",
+                          style="magenta")
+        self.query_one("#rerun-found", Static).update(header)
+        options = Text("Options of xblick rerun\n", style="bold")
+        options.append("fixed while it runs: they apply at its start" if self._rerun is not None
+                       and self._rerun.poll() is None else "set these before starting it", style="dim")
+        self.query_one("#rerun-options", Static).update(options)
+
+    def on_tree_node_selected(self, event: Tree.NodeSelected):
+        """Space, Enter or a click on an entry: marked or unmarked (a branch folds by itself)."""
+        data = event.node.data
+        if not isinstance(data, str) or data.startswith("\0"):
+            return
+        entries = self._rerun_entries + [rerun_entry(*m.split("\t")) for m in self._rerun_marks
+                                         if m not in {e.id for e in self._rerun_entries}]
+        entry = next(e for e in entries if e.id == data)
+        self._rerun_marks = toggle_mark(self._rerun_marks, entry, entries)
+        self._show_rerun_tree()
+        self._send_selection()
+
+    def on_tree_node_collapsed(self, event: Tree.NodeCollapsed):
+        if isinstance(event.node.data, str) and event.node.data.startswith("\0"):
+            self._rerun_folded.add(event.node.data[1:])
+
+    def on_tree_node_expanded(self, event: Tree.NodeExpanded):
+        if isinstance(event.node.data, str) and event.node.data.startswith("\0"):
+            self._rerun_folded.discard(event.node.data[1:])
 
     def selection(self) -> RerunSelection:
         """What the Rerun tab says now."""
-        chosen: dict[str, list[str]] = {kind: [] for kind in RERUN_KINDS}
-        for value in sorted(self._selection_values()):
-            kind, key = value.split("\t")
-            chosen[kind].append(key)
+        chosen, no_transforms = selected_of(self._rerun_marks)
 
         def number(widget_id: str) -> float | None:
             text = self.query_one(widget_id, Input).value.strip()
             return float(text) if text else None
 
-        return RerunSelection(**chosen, prefix=self.query_one("#rerun-prefix", Input).value.strip(),
+        return RerunSelection(**chosen, no_transforms=no_transforms,
+                              prefix=self.query_one("#rerun-prefix", Input).value.strip(),
                               stale_after=number("#rerun-stale-after"), cloud_rate=number("#rerun-cloud-rate"),
                               viewer=self.query_one("#rerun-viewer", Select).value,
                               viewer_value=self.query_one("#rerun-viewer-value", Input).value.strip(),
                               extra=self.query_one("#rerun-extra", Input).value.strip(), connection=self.connection)
 
     def apply(self, selection: RerunSelection):
-        """Shows a selection (a preset) in the Rerun tab."""
-        values = {f"{kind}\t{key}" for kind in RERUN_KINDS for key in getattr(selection, kind)}
-        self._set_rerun_options(self._rerun_found(), values)
-        self.query_one("#rerun-prefix", Input).value = selection.prefix
-        self.query_one("#rerun-stale-after", Input).value = ("" if selection.stale_after is None
-                                                             else f"{selection.stale_after:g}")
-        self.query_one("#rerun-cloud-rate", Input).value = ("" if selection.cloud_rate is None
-                                                            else f"{selection.cloud_rate:g}")
-        self.query_one("#rerun-viewer", Select).value = selection.viewer
-        self.query_one("#rerun-viewer-value", Input).value = selection.viewer_value
-        self.query_one("#rerun-extra", Input).value = selection.extra
+        """Shows a selection (a preset) in the Rerun tab; while xblick rerun takes its selection live, it gets it."""
+        self._rerun_marks = marks_of(selection)
+        if self._rerun is None or self._rerun.poll() is not None:  # the options apply at the start
+            self.query_one("#rerun-prefix", Input).value = selection.prefix
+            self.query_one("#rerun-stale-after", Input).value = ("" if selection.stale_after is None
+                                                                 else f"{selection.stale_after:g}")
+            self.query_one("#rerun-cloud-rate", Input).value = ("" if selection.cloud_rate is None
+                                                                else f"{selection.cloud_rate:g}")
+            self.query_one("#rerun-viewer", Select).value = selection.viewer
+            self.query_one("#rerun-viewer-value", Input).value = selection.viewer_value
+            self.query_one("#rerun-extra", Input).value = selection.extra
         if selection.connection != self.connection:
             self.notify(f"the preset's connection: {selection.connection.describe()}")
             self._open(selection.connection)
+        self._show_rerun_tree()
         self._update_command()
+        self._send_selection()
+
+    def _rerun_drawn_over(self, session: zenoh.Session) -> dict[str, list[str]] | None:
+        """In the discovery thread: the running xblick rerun's drawn_over (a query; None while it does not answer)."""
+        from .rerun_bridge import DRAWN_OVER
+
+        key = self._rerun_key
+        if key is None:
+            return None
+        try:
+            value, = parameters.ParameterClient(session, key, timeout=0.5).get([DRAWN_OVER])
+        except (TimeoutError, RuntimeError):
+            return None  # starting or ended: the notes of the records meanwhile
+        drawn = {}
+        for line in value.value() or []:
+            result, _, images = line.partition(": ")
+            drawn[result] = [i for i in images.split(", ") if i]
+        return drawn
+
+    def _send_selection(self):
+        """While xblick rerun takes its selection live: the marks to its parameters, in a thread (queries)."""
+        if self._rerun_key is None or not self._rerun_live or self.session is None:
+            return
+        if self._rerun is None or self._rerun.poll() is not None:
+            return
+        self.run_worker(functools.partial(self._send_selection_thread, self.session, self._rerun_key), thread=True,
+                        group="rerun-set")
+
+    def _send_selection_thread(self, session: zenoh.Session, key: str):
+        from .rerun_bridge import SELECTION_OPTIONS
+
+        with self._rerun_set_lock:  # the newest marks, also when two of these threads overtook each other
+            chosen, no_transforms = selected_of(self._rerun_marks)
+            values = {name: (no_transforms if kind == "no_transforms" else chosen[kind])
+                      for name, kind in SELECTION_OPTIONS.items()}
+            try:
+                result = parameters.ParameterClient(session, key, timeout=5.0).set_atomically(values)
+                problem = None if result.successful else result.reason
+            except (TimeoutError, RuntimeError) as error:
+                problem = f"{type(error).__name__}: {error}"
+        with contextlib.suppress(RuntimeError):  # the app has ended
+            if problem:
+                self.call_from_thread(self.notify, f"xblick rerun did not take the selection: {problem}",
+                                      severity="error", timeout=10)
+            else:
+                self.call_from_thread(self._rerun_line, "selection set: " + (", ".join(
+                    k for kind in RERUN_KINDS for k in chosen[kind]) or "nothing"), "dim")
 
     def _update_command(self):
         widget = self.query_one("#rerun-command", Static)
@@ -1429,9 +1758,6 @@ class XblickApp(App):
             return
         widget.update(Text("xblick rerun " + shlex.join(args)))
 
-    def on_selection_list_selected_changed(self, event):
-        self._update_command()
-
     def on_input_changed(self, event: Input.Changed):
         if event.input.id and event.input.id.startswith("rerun-"):
             self._update_command()
@@ -1441,8 +1767,9 @@ class XblickApp(App):
             self._update_command()
 
     def on_button_pressed(self, event: Button.Pressed):
-        handlers = {"rerun-launch": self.launch, "rerun-refresh": self.action_refresh, "rerun-stop": self.stop_rerun, "preset-save": self._save_preset,
-                    "preset-load": self._load_preset, "preset-delete": self._delete_preset}
+        handlers = {"rerun-launch": self.launch, "rerun-refresh": self.action_refresh, "rerun-stop": self.stop_rerun,
+                    "preset-save": self._save_preset, "preset-load": self._load_preset,
+                    "preset-delete": self._delete_preset}
         if event.button.id in handlers:
             handlers[event.button.id]()
 
@@ -1507,17 +1834,31 @@ class XblickApp(App):
                         timeout=10)
             return
         try:
-            command = self.selection().command()
+            selection = self.selection()
+            command = selection.command()
+            key = selection.node_key()
         except (ValueError, OSError) as error:
             self.notify(f"xblick rerun: {error}", severity="error", timeout=10)
             return
         self._rerun_line("$ xblick " + shlex.join(command[3:]), "bold")
+        # started with a selection it takes a changed one at once; without one it shows everything found
+        self._rerun_key, self._rerun_live = key, any(selection.selected().values())
         # a session of its own (no Ctrl-C of the terminal); stopped by PID with SIGTERM, its Ctrl-C
         self._rerun = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                        stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True,
                                        env={**os.environ, "PYTHONUNBUFFERED": "1"})
         self.query_one("#rerun-stop", Button).disabled = False
+        self._fix_rerun_options(True)
         self.run_worker(functools.partial(self._pump, self._rerun), thread=True, group="rerun")
+
+    RERUN_OPTIONS: ClassVar = ("#rerun-prefix", "#rerun-stale-after", "#rerun-cloud-rate", "#rerun-viewer",
+                               "#rerun-viewer-value", "#rerun-extra", "#rerun-launch")
+
+    def _fix_rerun_options(self, running: bool):
+        """The options on the right apply at the start: fixed while xblick rerun runs; the marks stay changeable."""
+        for widget_id in self.RERUN_OPTIONS:
+            self.query_one(widget_id).disabled = running
+        self._show_rerun_header()
 
     def _rerun_line(self, line: str, style: str = ""):
         self.rerun_output.append(line)
@@ -1537,6 +1878,10 @@ class XblickApp(App):
         self._rerun_line(f"xblick rerun ended, exit code {code}", "green" if code == 0 else "bold red")
         if process is self._rerun:
             self.query_one("#rerun-stop", Button).disabled = True
+            self._rerun_key, self._rerun_live = None, False
+            self._fix_rerun_options(False)
+            self._rerun_shown = None  # the notes of the records again
+            self._show_rerun_tree()
 
     def stop_rerun(self, timeout: float = 10.0):
         """SIGTERM to the child (its cleanup sends what Rerun buffers), SIGKILL after ``timeout``."""

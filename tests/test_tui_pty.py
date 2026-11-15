@@ -141,8 +141,9 @@ def test_blick_in_a_real_terminal(fake, terminal, tmp_path, size):  # noqa: F811
     terminal.wait("takes from")
 
     terminal.press("4")
-    terminal.wait(f"{BASE}  image")
-    terminal.press("Space")
+    terminal.wait("[ ] color")  # the tree: the camera, then its stream
+    terminal.wait("Found on the network: 1 stream")
+    terminal.press("Space")  # the cursor on the first entry
     terminal.wait(f"xblick rerun --spawn {BASE} --zenoh-mode client")
 
     # resized: too small says so, larger has the status line again

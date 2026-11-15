@@ -11,7 +11,7 @@ The interface needs a terminal of at least 80 x 24 characters. Without a termina
 service, the command refuses with a message.
 
 The screenshots on this page show a network that `tools/tui_screenshots.py` makes up. Two routers are linked:
-`robot-pc` runs an Azure Kinect, SAM 3, FoundationPose, TAPNext, a robot state bridge of an older version and a
+`robot-pc` runs an Azure Kinect with body tracking, SAM 3, FoundationPose, TAPNext, a robot state bridge of an older version and a
 recorder, and a viewer is attached to the second router. The script regenerates them after a change to the
 interface.
 
@@ -25,7 +25,7 @@ its right it counts the routers, the nodes and the streams.
 | Topics | every key that a session publishes, as a tree. `m` measures all of them: rate, size, type, last stamp and age. Enter on a topic subscribes to it alone and shows its publishers, its subscribers, the info record of the stream, and its last message decoded. |
 | Nodes | every node by router: cameras, processing nodes, tools and the interface itself, with name, program, kind and what each reads and publishes. The routers and their links. The reports on every `<camera>/diagnostics`. The status of the record and play nodes. |
 | Graph | the nodes as boxes in one band per router, and the data between them as arrows. A selected node shows what it sends and takes, and the mouse over an edge shows its keys. |
-| Rerun | the streams, results, label images and pose topics that were found, and the options of `xblick rerun`. The tab builds the command line and checks it with the command's own parser. "Launch" runs it as a child process, and "Stop" sends it SIGTERM. "Look again" (`r`) searches for streams at once instead of at the next period of 2 s. |
+| Rerun | everything that `xblick rerun` can show, as a tree by camera and node, and the options of `xblick rerun`. The tab builds the command line from the marked entries and checks it with the command's own parser. "Launch" runs it as a child process, and "Stop" sends it SIGTERM. |
 | Parameters | the nodes that offer parameters, and a form built from the descriptors of the chosen node: numbers with range, step and unit, a switch for a boolean, a selection for choices. Read-only parameters are marked. A refused change shows its reason under the field. The node's events keep the values current. "Save as params file" writes them. See [parameters](../reference/parameters.md). |
 
 ### Topics
@@ -144,7 +144,24 @@ are read-only and apply at the next start. The node's README names its live para
 
 ### Rerun
 
-![The Rerun tab: the streams found, the options, and the command line it builds](../media/tui/rerun.png)
+![The Rerun tab: the entries found by camera and node, the options, and the command line it builds](../media/tui/rerun.png)
+
+The left side lists what `xblick rerun` can show. Each entry is a topic of its own: a camera's streams, its
+transforms, IMU and diagnostics, and below each node its results. The note beside an entry says what the viewer
+makes of it, for example "drawn over color". The header counts the entries and says when the list was updated. The
+list updates itself every few seconds, and `r` or "Update list now" updates it at once. A new topic appears at the
+next update, and an entry whose publisher ended disappears then.
+
+Space, Enter or a click marks an entry. The command line then names it. The first marked entry of a camera also
+marks the camera's transforms, `tf, tf_static`, which place its streams in 3D. You can unmark them. When the
+publisher of a marked entry ends, the entry stays and says "gone since" with the time. An entry of a preset that
+was never found says "not found". Nothing marked starts `xblick rerun` without a selection, so it shows everything
+that it finds.
+
+The right side holds the options of `xblick rerun`. They apply at its start, so the tab fixes them while it runs.
+The marks stay changeable. A change of the marks applies at once to the running `xblick rerun`, through its
+parameters. The viewer keeps its layout, and a new entry appears in its list of data. While it runs, the notes say
+over which images it draws each result. See the [viewer guide](viewer.md#change-the-selection-while-it-runs).
 
 ## Keys
 
@@ -152,11 +169,12 @@ are read-only and apply at the next start. The node's README names its live para
 | --- | --- |
 | `1` to `5` | select a tab |
 | arrows, Enter | move in the table, tree or list of the tab, open a topic, show a node's or router's detail, fold a prefix of the topics |
+| Space, Enter | in the Rerun tab: mark an entry, fold a camera or node |
 | arrows, click, mouse | in the graph: select a node, show an edge |
 | shift and arrows, a drag | in the graph: move the view |
 | `0`, Home | in the graph: back to its start |
 | `m` | measure all topics |
-| `r` | search the network again now |
+| `r` | update the lists now |
 | `Esc` | close the topic |
 | `c` | connect again |
 | `q` | quit |
@@ -242,4 +260,4 @@ produce every representation, including raw images, while the measurement runs.
 ## Presets
 
 The Rerun tab stores named presets in `~/.config/xblick/rerun_presets.json`, or below `$XDG_CONFIG_HOME`. A
-preset contains its streams, its options and its Zenoh connection. Loading a preset connects to its connection.
+preset contains its marked entries, the cameras whose transforms are unmarked, its options and its Zenoh connection. Loading a preset connects to its connection.
