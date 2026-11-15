@@ -41,6 +41,13 @@ the read at its timeout. A second node that drops the read or that starts betwee
 set. So does a second node that a session just opened has not linked to yet, because a new session links to the
 serving sessions one after the other. A node whose read takes longer than the timeout gets no set ("not sent"); this fails safe.
 
+The set names the node that answered the read and carries a deadline: the moment at which the client stops waiting.
+A node of 0.5.13 or later checks both just before its first writer runs. A second node of that kind refuses a set
+that is meant for another node. The named node refuses a set whose deadline has passed, and its writers do not run.
+An older node applies every set it gets, as before. The [Python reference](python-api.md#node-and-deadline) explains
+the clocks and what the client may claim. `ParameterClient.last_checked` is true when the node of the last set
+confirmed the check.
+
 **A receiver replies and drops the query at once.** A node that serves a command or a parameter (its queryable's
 callback) replies and then ends the callback, without keeping the query object. Do long work outside the callback. Zenoh
 ends a query when every queryable that received it has dropped the query object. A node that keeps the query after its
@@ -50,10 +57,11 @@ sent", and a command gives `PartlyAnswered`. Durchblick's own parameter servers 
 record and play node follow this rule. Check a receiver outside this repository, such as a robot's bridge, for it before
 you command it with 0.5.2.
 
-A set raises `NotReached` (a `TimeoutError`) when it was not sent, `NoAnswer` when it was sent once and no answer came,
-`PartlyAnswered` (a `NoAnswer`) when one node answered and the query was still open at its timeout, and
-`SeveralExecuted` (a `NoAnswer`) when several nodes answered and each applied it. A node may still apply the set then,
-and it was not sent again. C++ throws `xblick::NotReached`, `xblick::NoAnswer`, `xblick::PartlyAnswered` and
+A set raises `NotReached` (a `TimeoutError`) when it was not sent, `Expired` when the node refused it as past its
+deadline, `NoAnswer` when it was sent once and no answer came, `PartlyAnswered` (a `NoAnswer`) when one node answered
+and the query was still open at its timeout, and `SeveralExecuted` (a `NoAnswer`) when several nodes answered and each
+applied it. After `NoAnswer`, a node that does not check the deadline may still apply the set. The client never sends
+a set again. C++ throws `xblick::NotReached`, `xblick::Expired`, `xblick::NoAnswer`, `xblick::PartlyAnswered` and
 `xblick::SeveralExecuted`. Reads are asked again until a node answers.
 
 The client raises an error when no node answers, or when more than one node answers.

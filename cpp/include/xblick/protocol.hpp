@@ -217,6 +217,21 @@ namespace xblick::protocol
     // "metadata").
     inline constexpr std::string_view kSessions = "xblick/sessions";
     inline constexpr std::string_view kProgram = "program";
+    // A command's node and deadline (since 0.5.13, an addition older programs neither send nor look at): a command (a
+    // parameter set, a controller manager's command, a torque step, a recorder command) whose read before it was
+    // answered by a receiver of 0.5.13 carries the query attachment, compact JSON {"xblick_command":1,"node":"<the
+    // Zenoh id of the session that answered the read>","deadline_ns":<the time the sender stops waiting, on that
+    // node's clock: CLOCK_BOOTTIME in ns>}. Such a receiver answers the read and the command with the reply
+    // attachment {"xblick_command":1,"zid":"<its session's Zenoh id>","clock_ns":<its CLOCK_BOOTTIME now>,
+    // "checked":[...]} ("node", "deadline": what it checked before executing the command; empty for a read) and
+    // refuses a command meant for another node, or one whose deadline has passed, by an error reply whose encoding is
+    // "text/plain;<kNotTarget|kExpired>" (kInvalidCommand: an attachment with kCommandField it cannot read). An
+    // attachment without kCommandField is not one of these and is ignored, as before 0.5.13.
+    inline constexpr std::string_view kCommandField = "xblick_command";
+    inline constexpr std::uint32_t kCommandVersion = 1;
+    inline constexpr std::string_view kExpired = "xblick-expired";
+    inline constexpr std::string_view kNotTarget = "xblick-not-target";
+    inline constexpr std::string_view kInvalidCommand = "xblick-invalid-command";
 
     inline constexpr std::uint32_t kAttachmentVersion = 1;
     // 3 (0.3.59): the rings' keys name host and GPU; 4 (0.5.0): the field "durchblick" is "xblick"

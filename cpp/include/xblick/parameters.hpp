@@ -159,12 +159,16 @@ namespace xblick
             Reader read;
         };
         ParameterValue current(const Declared& d) const;
-        std::vector<SetParametersResult> set_all(const std::vector<Parameter>& parameters, bool atomic, bool local);
+        // `gate`: called just before the first change (a command's CommandQuery::check), after everything that may
+        // take time but changes nothing; its CommandRefused leaves everything as it was
+        std::vector<SetParametersResult> set_all(const std::vector<Parameter>& parameters, bool atomic, bool local,
+                                                 const std::function<void()>& gate = {});
         std::optional<std::string> refusal(const Parameter& p, bool local) const;
         void publish_event(const std::vector<Parameter>& added, const std::vector<Parameter>& changed);
         void answer(const std::string& service, const zenoh::Query& query);
 
         std::string key_, name_;
+        std::string zid_;  // the session's Zenoh id: names this node in its replies (commands)
         bool read_only_access_;
         mutable std::recursive_mutex mutex_;
         std::map<std::string, Declared> declared_;
@@ -177,10 +181,13 @@ namespace xblick
     };
 
     // Another node's parameters over Zenoh (key: its <namespace>/<name>): each call queries <key>/<service>; throws
-    // if none or several answer within the timeout, or the node replies an error.
+    // if none or several answer within the timeout, or the node replies an error. A set goes to the node that
+    // answered the read before it, with a deadline when that node is of 0.5.13 or later (Python's ParameterClient);
+    // last_checked(): the node of the last set said that it checked node and deadline before applying it.
     class ParameterClient
     {
     public:
+        bool last_checked() const { return last_checked_; }
         ParameterClient(zenoh::Session& session, std::string key, std::uint32_t timeout_ms = 2000);
         ListParametersResponse list(const ListParametersRequest& request = {});
         DescribeParametersResponse describe(const std::vector<std::string>& names);
@@ -194,6 +201,7 @@ namespace xblick
         zenoh::Session& session_;
         std::string key_;
         std::uint32_t timeout_ms_;
+        bool last_checked_ = false;
     };
 
     // Params files: a ROS params file's values for the node `node` (fully qualified), as the YAML scalars' text, in

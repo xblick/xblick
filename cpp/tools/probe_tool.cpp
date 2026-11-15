@@ -7,7 +7,8 @@
 //   xblick-cpp-probe --connect host:7447 --params <namespace>/<name> [--set NAME:=VALUE]
 //
 // --params: a node's parameters (parameters.hpp, ParameterClient): with --set that change first (a line with its
-// result), then a line per parameter (name, type, value, read_only, additional_constraints).
+// result and "checked": its node checked node and deadline), then a line per parameter (name, type, value, read_only,
+// additional_constraints).
 // --points: a point cloud stream (points.hpp); a line per cloud with its fields instead of the encoding.
 // --connect, --listen, --zenoh-mode peer|client: the Zenoh session (SessionOptions); none of them: the PC's router.
 #include <chrono>
@@ -108,7 +109,8 @@ namespace
                                                                                 assignment.substr(sep + 2))}});
             std::cout << "{\"set\":" << quoted(name) << ",\"successful\":"
                       << (result.results.at(0).successful ? "true" : "false")
-                      << ",\"reason\":" << quoted(result.results.at(0).reason) << "}" << std::endl;
+                      << ",\"reason\":" << quoted(result.results.at(0).reason)
+                      << ",\"checked\":" << (client.last_checked() ? "true" : "false") << "}" << std::endl;
         }
         const auto names = client.list().names;
         const auto descriptors = client.describe(names).descriptors;

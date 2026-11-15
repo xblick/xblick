@@ -155,22 +155,30 @@ command once to each queryable of the key. It never sends the command again. Zen
 query to every queryable of its key, as long as none of them is declared complete. No Durchblick queryable is declared
 complete. `xblick::ParameterClient` sends a set only after a read had exactly one answer and ended before its timeout.
 This check is best effort. A second node that drops the read or starts after it still gets the set. So does a second
-node that a session just opened has not linked to yet.
+node that a session just opened has not linked to yet. The set then names the node that answered the read and carries
+a deadline. A node of 0.5.13 or later refuses a set meant for another node, or one past its deadline
+([Node and deadline](python-api.md#node-and-deadline)).
 
 | Exception (base) | Sent? | Meaning |
 | --- | --- | --- |
 | `xblick::NotReached` (`std::runtime_error`) | not sent | no queryable became known within the timeout. You may try again. |
 | `xblick::ParameterError` "not sent: ..." (`std::runtime_error`) | not sent | the read before the set showed no node or several nodes, or it was still open at its timeout |
 | `xblick::ParameterError` with the node's reason | sent | the node refused it, or a read got no answer |
-| `xblick::NoAnswer` (`std::runtime_error`) | sent once | no answer within the timeout. The receiver may still execute it. It was not sent again. |
+| `xblick::Expired` (`std::runtime_error`) | sent once | the named node refused it, because its deadline had passed. That node did not execute it. |
+| `xblick::NoAnswer` (`std::runtime_error`) | sent once | no answer within the timeout. It may have been executed. A receiver that does not check the deadline may still execute it. It was not sent again. |
 | `xblick::PartlyAnswered` (`NoAnswer`) | sent once | one node answered, and the query was still open at its timeout: another node may still execute it |
-| `xblick::SeveralExecuted` (`NoAnswer`) | sent once | several nodes answered: each of them executed it |
+| `xblick::SeveralExecuted` (`NoAnswer`) | sent once | several nodes answered: each that answered with success executed it |
 
-All of them derive from `std::runtime_error`. `NotReached` and `NoAnswer` do not derive from `ParameterError`: a
-caller that catches only `ParameterError` must catch them as well.
+All of them derive from `std::runtime_error`. `NotReached`, `Expired` and `NoAnswer` do not derive from
+`ParameterError`: a caller that catches only `ParameterError` must catch them as well. `ParameterClient::last_checked()`
+is true when the node of the last set confirmed that it checked node and deadline.
 
-A command has no expiry. A busy or briefly unreachable receiver executes it when it gets it, also after the
-caller got `NoAnswer`.
+A receiver of commands outside this library, such as a robot's controller manager, checks node and deadline with
+`xblick::CommandQuery`. It creates one from the query and its session's Zenoh id, and calls `check()` just before the
+command takes effect. A refusal is a `CommandRefused`, which `xblick::refuse(query, refused)` sends back. Every reply,
+also the one to the read before the command, carries `xblick::answer_attachment(zid, checked)`. A sender of its own
+uses `xblick::target_of` on the read's answer and the overload of `ask_once` with a `CommandTarget`. Python has the
+same functions in `xblick.session`.
 
 ## Messages
 

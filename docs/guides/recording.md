@@ -67,8 +67,10 @@ The control key is also a queryable. A command sent as a query receives its answ
 answers "ready", and `stop` answers with the counts and the check. A refused command answers with the reason. `xblick
 recorder <command>` and `recording.request(...)` in Python use this. A command sent from Python (`recording.request`,
 `send_command`) or with `xblick recorder` goes out once, and only after the node's status had exactly one answer and
-no late answer: a best-effort check of two nodes of one name. A put on the control key, as before 0.5.2, is still
-taken, but nothing checks it, and a put from a session just opened can be lost.
+no late answer: a best-effort check of two nodes of one name. The command names the node that answered and carries a
+deadline. The node refuses a command meant for another node, and one whose deadline had passed when the command was
+about to start ([Node and deadline](../reference/python-api.md#node-and-deadline)). A put on the control key, as
+before 0.5.2, is still taken, but nothing checks it, and a put from a session just opened can be lost.
 
 The node does not record while it plays, because it would record its own playback. It refuses such a command and
 states the reason in its status. `--paused` starts the node idle, so that it waits for a command.

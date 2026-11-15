@@ -122,9 +122,10 @@ namespace xblick
         using std::runtime_error::runtime_error;
     };
 
-    // A command was sent once and no answer came within the timeout: it may still be executed (a command has no
-    // expiry on the wire), and it was not sent again (Python's session.NoAnswer). A type of its own, so that a
-    // caller can tell it from NotReached without reading the text.
+    // A command was sent once and no answer came within the timeout: it may have been executed, and it was not sent
+    // again (Python's session.NoAnswer). A receiver that does not check the command's deadline (any receiver of a
+    // command sent without a target) may still execute it later. A type of its own, so that a caller can tell it
+    // from NotReached without reading the text.
     class NoAnswer : public std::runtime_error
     {
     public:
@@ -161,6 +162,92 @@ namespace xblick
     std::vector<zenoh::Reply> ask_once(const zenoh::Session& session, const std::string& selector,
                                        std::chrono::milliseconds timeout,
                                        const std::optional<std::vector<std::uint8_t>>& payload = std::nullopt);
+
+    // ------------------------------------------------------------------- a command's node and deadline (0.5.13)
+    // protocol.hpp (kCommandField) has the format; Python's session module the same functions.
+
+    // A command refused by the node it was meant for: its deadline had passed when the node came to execute it. That
+    // node did not execute it; not sent again (Python's session.Expired).
+    class Expired : public std::runtime_error
+    {
+    public:
+        using std::runtime_error::runtime_error;
+    };
+
+    // The clock of a command's deadline: CLOCK_BOOTTIME in ns (counts a suspend, never set, only slewed by NTP).
+    std::int64_t command_clock_ns();
+
+    // The node a command is meant for: its session's Zenoh id, and the least its clock can be ahead of this
+    // program's (Python's session.CommandTarget).
+    struct CommandTarget
+    {
+        std::string node;
+        std::int64_t offset_ns = 0;
+        // `timeout` from now on the node's clock, at the earliest that can be
+        std::int64_t deadline_ns(std::chrono::milliseconds timeout) const;
+    };
+
+    // The target of a command from the one successful reply of the read before it and the time the read ended
+    // (command_clock_ns() once it returned); empty when the reply has no attachment of a receiver of 0.5.13 (an older
+    // one: nothing new is sent or checked). The deadline converted with it comes out early by at most the read's
+    // round trip, never late. std::runtime_error ("not sent: ...") for an attachment it cannot read.
+    std::optional<CommandTarget> target_of(const zenoh::Reply& reply, std::int64_t answered_ns);
+
+    // ask_once, the query naming `to` and its deadline, `timeout` from the moment it is sent, on to's clock. A
+    // receiver of 0.5.13 that is not that node does not execute it, nor does that node after the deadline; an older
+    // receiver executes it as before. Without `to` the same as the overload above (nothing attached).
+    std::vector<zenoh::Reply> ask_once(const zenoh::Session& session, const std::string& selector,
+                                       std::chrono::milliseconds timeout,
+                                       const std::optional<std::vector<std::uint8_t>>& payload,
+                                       const std::optional<CommandTarget>& to);
+
+    // An error reply's case (protocol.hpp): refused as past the deadline (kExpired), refused by a node the command was
+    // not meant for (kNotTarget).
+    bool expired(const zenoh::Reply& reply);
+    bool not_target(const zenoh::Reply& reply);
+
+    // True when a successful reply to a command sent to `to` says that its node checked node and deadline before
+    // executing it (a receiver of 0.5.13); false otherwise (Python's session.checked).
+    bool checked(const zenoh::Reply& reply, const std::optional<CommandTarget>& to);
+
+    // What a receiver's replies carry (to a command and to the read before it): its session's Zenoh id `zid`
+    // (session.get_zid().to_string()), its clock now and what it checked ("node", "deadline"; none for a read).
+    std::string answer_attachment(const std::string& zid, const std::vector<std::string>& checked = {});
+
+    // A receiver's refusal of a command before its effect (CommandQuery::check). `schema`: kExpired, kNotTarget or
+    // kInvalidCommand; what() the error reply's text.
+    class CommandRefused : public std::runtime_error
+    {
+    public:
+        CommandRefused(std::string schema, const std::string& text) : std::runtime_error(text), schema(std::move(schema))
+        {
+        }
+        std::string schema;
+    };
+
+    // A command as its receiver got it (the query on the key `what`; `zid`: the receiver's session): the node it is
+    // meant for and its deadline, as a sender of 0.5.13 attached them. A query without them (an older sender, a
+    // command without a target) has nothing to check. Call check() as late as possible before the command takes
+    // effect; reply with answer_attachment(zid, checked()); send a refusal with refuse(). Python's
+    // session.CommandQuery.
+    class CommandQuery
+    {
+    public:
+        CommandQuery(const zenoh::Query& query, std::string zid, std::string what);
+        // CommandRefused when it must not be executed: an attachment it cannot read, meant for another node, or the
+        // deadline passed (command_clock_ns() at or after it). Nothing for a command without a target.
+        void check();
+        const std::vector<std::string>& checked() const { return checked_; }
+        const std::string& zid() const { return zid_; }
+
+    private:
+        std::string zid_, what_, node_, invalid_;
+        std::int64_t deadline_ns_ = 0;
+        std::vector<std::string> checked_;
+    };
+
+    // The error reply of a refused command: its text, its case in the encoding ("text/plain;<schema>").
+    void refuse(const zenoh::Query& query, const CommandRefused& refused);
 
     // Topic names (protocol.hpp): "<base>/image_raw" etc.; base is checked against ROS's name rules.
     std::string check_name(const std::string& path);

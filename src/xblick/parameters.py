@@ -45,8 +45,8 @@ from .msg import (DescribeParametersRequest, DescribeParametersResponse, Floatin
                   ParameterType, ParameterValue, SetParametersAtomicallyRequest, SetParametersAtomicallyResponse,
                   SetParametersRequest, SetParametersResponse, SetParametersResult, Time)
 from .paths import expand_path
-from .session import ASK_PERIOD, ask, command, replies, timed_out
-from .session import count as session_count
+from .session import (ASK_PERIOD, CommandQuery, CommandRefused, answer_attachment, ask, checked, command, log,
+                      node_id, one_node, refuse, replies, timed_out)
 
 P = _core.protocol
 SERVICES = {P.LIST_PARAMETERS: (ListParametersRequest, ListParametersResponse),
@@ -176,6 +176,7 @@ class Parameters:
         self._lock = threading.RLock()
         self._events = self._queryables = self._token = self._server = None
         self._stop = threading.Event()
+        self._zid = node_id(session) if session is not None else ""  # names this node in its replies (commands)
         if session is not None:
             self._events = session.declare_publisher(P.PARAMETER_EVENTS, encoding=cdr_encoding(ParameterEvent))
             # channels, answered by a daemon thread of the node's own: a Python callback would run in zenoh-python's
@@ -425,13 +426,18 @@ class Parameters:
             return RESTART
         return check(declared.descriptor, p.value, declared.choices)
 
-    def _set(self, parameters: list[Parameter], atomic: bool, local: bool = False) -> list[SetParametersResult]:
+    def _set(self, parameters: list[Parameter], atomic: bool, local: bool = False,
+             gate: Callable | None = None) -> list[SetParametersResult]:
+        """``gate``: called just before the first change (a command's CommandQuery.check), after everything that may
+        take time but changes nothing (the lock, the readers); its CommandRefused leaves everything as it was."""
         with self._lock:
             reasons = [self._refusal(p, local) for p in parameters]
             if atomic and any(reasons):
                 return [SetParametersResult(False, "; ".join(f"{p.name}: {r}" for p, r in zip(parameters, reasons)
                                                              if r))]
             before = {n: self._current(d) for n, d in self._declared.items()}
+            if gate is not None:
+                gate()
             results = []
             for p, reason in zip(parameters, reasons):
                 if reason is None:
@@ -484,18 +490,32 @@ class Parameters:
             raise
 
     def _answer(self, service: str, query: zenoh.Query):
+        """A service's query answered; a set (a command) checked first (session.CommandQuery: the node it is meant
+        for, its deadline), just before its first change (``_set``). Every reply names this node and its clock
+        (session.answer_attachment), so that a sender of 0.5.13 can address a command to it."""
         request_type, _ = SERVICES[service]
         payload = query.payload
+        received = (CommandQuery(query, self._zid, f"{self.key}/{service}")
+                    if service in (P.SET_PARAMETERS, P.SET_PARAMETERS_ATOMICALLY) else None)
         try:
             request = request_type.deserialize(payload.to_bytes()) if payload is not None else request_type()
-            response = self.respond(service, request)
+            response = self._respond(service, request, received.check if received is not None else None)
+        except CommandRefused as refused:
+            log.warning(str(refused))
+            refuse(query, refused)
+            return
         except Exception as error:  # noqa: BLE001 - the asker gets the reason
             query.reply_err(f"{self.name}/{service}: {type(error).__name__}: {error}")
             return
-        query.reply(query.key_expr, bytes(response.serialize()), encoding=cdr_encoding(type(response)))
+        query.reply(query.key_expr, bytes(response.serialize()), encoding=cdr_encoding(type(response)),
+                    attachment=answer_attachment(self._zid, received.checked if received is not None else ()))
 
     def respond(self, service: str, request):
         """What the service answers to the request (the queryables' work)."""
+        return self._respond(service, request)
+
+    def _respond(self, service: str, request, gate: Callable | None = None):
+        """``respond``, a set's ``gate`` called just before its first change (``_set``)."""
         with self._lock:
             declared = dict(self._declared)
             if service == P.LIST_PARAMETERS:
@@ -516,8 +536,8 @@ class Parameters:
                 return GetParameterTypesResponse([declared[n].descriptor.type if n in declared else 0
                                                   for n in request.names])
         if service == P.SET_PARAMETERS:
-            return SetParametersResponse(self._set(request.parameters, atomic=False))
-        return SetParametersAtomicallyResponse(self._set(request.parameters, atomic=True)[0])
+            return SetParametersResponse(self._set(request.parameters, atomic=False, gate=gate))
+        return SetParametersAtomicallyResponse(self._set(request.parameters, atomic=True, gate=gate)[0])
 
     def close(self):
         """Ends the services (again: nothing). A node calls it at its end; without it the daemon thread ends with the
@@ -560,35 +580,41 @@ def _under(name: str, prefixes: list[str], depth: int) -> bool:
 class ParameterClient:
     """Another node's parameters over Zenoh (``key``: its ``<namespace>/<name>``): ROS 2's services, and its events
     (``on_event``). Reads: TimeoutError when it does not answer within ``timeout``, RuntimeError when several do.
-    Sets: not sent unless exactly one node answers first (``_call``); then sent once: NotReached (a TimeoutError,
-    nothing sent), NoAnswer (no TimeoutError: sent once, no answer, it may still be applied; not sent again)."""
+    Sets: not sent unless exactly one node answers first (``_call``); then sent once, to that node with a deadline
+    when it is of 0.5.13 or later: NotReached (a TimeoutError, nothing sent), Expired (refused by the node, past its
+    deadline: not applied), NoAnswer (no TimeoutError: sent once, no answer; not sent again). ``last_checked``: the
+    node of the last set said that it checked node and deadline before applying it (session.checked)."""
 
     def __init__(self, session: zenoh.Session, key: str, timeout: float = 2.0):
         self.key = topics.check_name(key.strip("/"))
         self.name = fully_qualified(self.key)
         self.timeout = timeout
+        self.last_checked = False
         self._session = session
         self._subscribers = []
 
     def _call(self, service: str, request):
         """One service call: a read (list, describe, get, types) asked again while nothing answers (session.ask);
         a set (a command: a node may act on it) sent once (session.command), and only after a read (list_parameters)
-        had exactly one answer and no "Timeout" reply (session.count: a best-effort check of two nodes on the key,
-        which would both apply it). NotReached, NoAnswer, PartlyAnswered: as session.command. Ordinary reads keep the
-        one answer that came and ignore a "Timeout" reply, which says that another node had not finished the read: a
-        read changes nothing."""
+        had exactly one answer and no "Timeout" reply (session.one_node: a best-effort check of two nodes on the key,
+        which would both apply it), to the node that answered it (with a deadline, when it is of 0.5.13 or later).
+        NotReached, Expired, NoAnswer, PartlyAnswered: as session.command. Ordinary reads keep the one answer that came
+        and ignore a "Timeout" reply, which says that another node had not finished the read: a read changes
+        nothing."""
         _, response_type = SERVICES[service]
         key = f"{self.key}/{service}"
         if service in (P.SET_PARAMETERS, P.SET_PARAMETERS_ATOMICALLY):
             list_key = f"{self.key}/{P.LIST_PARAMETERS}"
+            self.last_checked = False
             try:
-                session_count(ask(self._session, list_key, self.timeout,
-                                  payload=bytes(ListParametersRequest([], 0).serialize())), list_key)
+                to = one_node(self._session, list_key, self.timeout,
+                              payload=bytes(ListParametersRequest([], 0).serialize()))
             except RuntimeError as error:
                 raise RuntimeError(f"{error} (the set to {key})") from None
             except TimeoutError as error:
                 raise TimeoutError(f"{error} (the set to {key})") from None
-            ok = command(self._session, key, self.timeout, payload=bytes(request.serialize()))
+            ok = command(self._session, key, self.timeout, to, payload=bytes(request.serialize()))
+            self.last_checked = checked(ok[0], to)
             return response_type.deserialize(ok[0].payload.to_bytes())
         answers = ask(self._session, key, self.timeout, payload=bytes(request.serialize()))
         errors = [reply.err.payload.to_string() for reply in answers if reply.err is not None and not timed_out(reply)]

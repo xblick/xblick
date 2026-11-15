@@ -11,6 +11,7 @@ configuration file replaces everything (``config_file``).
 
 from __future__ import annotations
 
+import dataclasses
 import ipaddress
 import json
 import logging
@@ -377,10 +378,11 @@ class NotReached(TimeoutError):
 
 
 class NoAnswer(RuntimeError):
-    """A command was sent once and no answer came within the timeout: it may still be executed (a busy or briefly
-    unreachable receiver executes it when it gets it; a command has no expiry on the wire), and it was not sent
-    again. Deliberately no TimeoutError, so that ``except TimeoutError: try again`` does not send it a second time;
-    a RuntimeError, as a refusal, which callers do not repeat."""
+    """A command was sent once and no answer came within the timeout: it may have been executed, and it was not sent
+    again. A receiver that does not check the command's deadline (any receiver of a command sent without a target,
+    see ``ask_once``) may still execute it later, when it gets it (busy, briefly unreachable). Deliberately no
+    TimeoutError, so that ``except TimeoutError: try again`` does not send it a second time; a RuntimeError, as a
+    refusal, which callers do not repeat."""
 
 
 class PartlyAnswered(NoAnswer):
@@ -390,17 +392,195 @@ class PartlyAnswered(NoAnswer):
 
 
 class SeveralExecuted(NoAnswer):
-    """A command was sent and answered by more than one node: each of them executed it (two nodes on one key, which
-    the check before the command did not see). Not sent again. A NoAnswer, so no TimeoutError."""
+    """A command was sent and answered by more than one node (two nodes on one key, which the check before the
+    command did not see): each that answered with success executed it (one of them may have refused it as expired,
+    said in the text). Not sent again. A NoAnswer, so no TimeoutError."""
+
+
+class Expired(RuntimeError):
+    """A command was refused by the node it was meant for (a receiver of xblick 0.5.13 or later): its deadline, the
+    time the sender stops waiting for the answer, had passed when the node came to execute it. That node did not
+    execute it. Not sent again (a RuntimeError, as a refusal)."""
 
 
 HOLDING = "a second node, or the answering node still holding the query after its reply"  # who keeps a query open
 
 
-def ask_once(session: zenoh.Session, selector: str, timeout: float, **get_options) -> list:
+# ---------------------------------------------------------------------------------------------- command checks
+# Since 0.5.13 a command carries the node it is meant for and a deadline, in its query's attachment, and receivers
+# of 0.5.13 check both just before the command takes effect (docs/reference/python-api.md, "Commands"). An addition
+# older programs ignore: an older receiver never looks at a query's attachment, an older sender never at a reply's.
+# protocol.hpp has the format (kCommandField).
+
+COMMAND_FIELD = "xblick_command"  # the key that marks the attachment as a command's (protocol.hpp kCommandField)
+COMMAND_VERSION = 1                # its value (kCommandVersion)
+EXPIRED = "xblick-expired"         # the error reply's encoding schema: refused, past the deadline (kExpired)
+NOT_TARGET = "xblick-not-target"   # refused, meant for another node (kNotTarget)
+INVALID_COMMAND = "xblick-invalid-command"  # refused, an attachment of this field it cannot read (kInvalidCommand)
+CHECKS = ("node", "deadline")      # what a receiver confirms it checked (a reply's "checked")
+_CLOCK_BOOTTIME = 7  # Linux's CLOCK_BOOTTIME (time.CLOCK_BOOTTIME is missing from some Python builds; Linux only)
+
+
+def command_clock_ns() -> int:
+    """The clock of a command's deadline: CLOCK_BOOTTIME, ns since the PC started, also counting a suspend, never set,
+    only slewed by NTP (C++ ``xblick::command_clock_ns``). Each PC has its own: a sender converts its deadline into
+    the receiver's clock (``CommandTarget``), so that the clocks of two PCs need not agree."""
+    return time.clock_gettime_ns(_CLOCK_BOOTTIME)
+
+
+def node_id(session: zenoh.Session) -> str:
+    """The session's Zenoh id as text: the name a command gives the node it is meant for."""
+    return str(session.info.zid())
+
+
+def _command_record(attachment) -> dict | None:
+    """A query's or reply's attachment as the JSON object of a command (with ``COMMAND_FIELD``), None for none or for
+    anything else (another program's attachment, which is not ours to read). One that names ``COMMAND_FIELD`` but is
+    no JSON object comes back as ``{COMMAND_FIELD: None}``, so that it is refused, not taken for another program's
+    (as C++ does)."""
+    if attachment is None:
+        return None
+    data = attachment.to_bytes()
+    try:
+        record = json.loads(data)
+    except (UnicodeDecodeError, ValueError):
+        return {COMMAND_FIELD: None} if f'"{COMMAND_FIELD}"'.encode() in data else None
+    return record if isinstance(record, dict) and COMMAND_FIELD in record else None
+
+
+def answer_attachment(zid: str, checked=()) -> str:
+    """The attachment of every reply of a receiver of 0.5.13 to a command or to the read before it: its session's
+    Zenoh id ``zid`` (``node_id``), its clock now (``command_clock_ns``) and what it checked before executing the
+    command (``CHECKS``; none for a read or a command without a target). Older senders do not look at it."""
+    return json.dumps({COMMAND_FIELD: COMMAND_VERSION, "zid": zid, "clock_ns": command_clock_ns(),
+                       "checked": list(checked)}, separators=(",", ":"))
+
+
+class CommandRefused(Exception):
+    """A receiver's refusal of a command before its effect (``CommandQuery.check``): ``schema`` names the case
+    (EXPIRED, NOT_TARGET, INVALID_COMMAND), the text is the error reply's. Deliberately no RuntimeError or ValueError,
+    which receivers catch as the command's own failure."""
+
+    def __init__(self, schema: str, text: str):
+        super().__init__(text)
+        self.schema = schema
+
+
+class CommandQuery:
+    """A command as its receiver got it (``query``, on the key ``what``; ``zid``: the receiver's session, ``node_id``):
+    the node it is meant for and its deadline, as a sender of 0.5.13 attached them. A query without them (an older
+    sender, a command sent without a target) has nothing to check, as before 0.5.13. Call ``check()`` as late as
+    possible before the command takes effect, then reply with ``answer_attachment(zid, checked)``; a refusal goes
+    back with ``refuse``. ``checked`` is what was checked (``CHECKS``), empty before ``check`` or without a target."""
+
+    def __init__(self, query: zenoh.Query, zid: str, what: str):
+        self.what, self.zid = what, zid
+        self.node: str | None = None
+        self.deadline_ns: int | None = None
+        self.invalid: str | None = None
+        self.checked: list[str] = []
+        record = _command_record(query.attachment)
+        if record is None:
+            return
+        version, node, deadline = record.get(COMMAND_FIELD), record.get("node"), record.get("deadline_ns")
+        if version is None:
+            self.invalid = f"its {COMMAND_FIELD} attachment is no JSON this node reads"
+        elif version != COMMAND_VERSION:
+            self.invalid = f"its {COMMAND_FIELD} attachment is of version {version!r}, this node reads {COMMAND_VERSION}"
+        elif not isinstance(node, str) or not node or not isinstance(deadline, int) or isinstance(deadline, bool):
+            self.invalid = f"its {COMMAND_FIELD} attachment {json.dumps(record)[:200]} has no node and deadline_ns"
+        else:
+            self.node, self.deadline_ns = node, deadline
+
+    def check(self):
+        """CommandRefused when the command must not be executed: an attachment it cannot read, meant for another node,
+        or its deadline passed (this PC's ``command_clock_ns`` at or after ``deadline_ns``). Nothing for a command
+        without a target."""
+        if self.invalid is not None:
+            raise CommandRefused(INVALID_COMMAND, f"{self.what}: not executed: {self.invalid}")
+        if self.node is None:
+            return
+        if self.node != self.zid:
+            raise CommandRefused(NOT_TARGET, f"{self.what}: not executed here: it is meant for the node of session "
+                                             f"{self.node}, this is {self.zid}")
+        late = command_clock_ns() - self.deadline_ns
+        if late >= 0:
+            raise CommandRefused(EXPIRED, f"{self.what}: not executed: its deadline had passed {late / 1e9:.3f} s "
+                                          "before this node came to execute it")
+        self.checked = list(CHECKS)
+
+
+def refuse(query: zenoh.Query, refused: CommandRefused):
+    """The error reply of a refused command: its text, its case in the encoding's schema (``text/plain;<schema>``),
+    which a sender of 0.5.13 tells apart and an older one shows as the refusal's text."""
+    query.reply_err(str(refused), encoding=zenoh.Encoding(f"text/plain;{refused.schema}"))
+
+
+@dataclasses.dataclass(frozen=True)
+class CommandTarget:
+    """The node a command is meant for (``target_of``): ``node`` its session's Zenoh id, ``offset_ns`` the least its
+    clock (``command_clock_ns``) can be ahead of this program's."""
+
+    node: str
+    offset_ns: int
+
+    def deadline_ns(self, timeout: float) -> int:
+        """``timeout`` s from now on the node's clock, at the earliest that can be: a deadline the node checks is
+        never later than this program's own."""
+        return command_clock_ns() + round(timeout * 1e9) + self.offset_ns
+
+
+def target_of(sample, answered_ns: int) -> CommandTarget | None:
+    """The target of a command from the one answer of the read before it (``sample``, the reply's ok) and the time
+    the read ended (``answered_ns``, ``command_clock_ns()`` once it returned). None when the answer carries no
+    ``answer_attachment`` (an older receiver: then nothing new is sent or checked). The node read its clock before
+    the read ended, so ``clock_ns - answered_ns`` is at most its clock's true offset: the deadline in its clock comes
+    out early by at most the read's round trip, never late. RuntimeError for an attachment it cannot read."""
+    record = _command_record(sample.attachment)
+    if record is None:
+        return None
+    zid, clock = record.get("zid"), record.get("clock_ns")
+    if (record.get(COMMAND_FIELD) != COMMAND_VERSION or not isinstance(zid, str) or not zid
+            or not isinstance(clock, int) or isinstance(clock, bool)):
+        raise RuntimeError(f"not sent: the answer of {sample.key_expr} has a {COMMAND_FIELD} attachment this program "
+                           f"cannot read: {json.dumps(record)[:200]}")
+    return CommandTarget(zid, clock - answered_ns)
+
+
+def one_node(session: zenoh.Session, selector: str, timeout: float, **get_options) -> CommandTarget | None:
+    """The read before a command (``ask``, then ``count``: best effort, exactly one node must answer it in time) and
+    the command's target from its answer (``target_of``; None from an older receiver). Raises as ``count``."""
+    answers = ask(session, selector, timeout, **get_options)
+    answered = command_clock_ns()
+    (sample,) = count(answers, selector)
+    return target_of(sample, answered)
+
+
+def checked(sample, to: CommandTarget | None) -> bool:
+    """True when the answer ``sample`` to a command sent to ``to`` says that the node checked the node and the
+    deadline before executing it (``answer_attachment``): a receiver of 0.5.13 or later. False otherwise; a sender
+    cannot know it in advance, nor after a command without an answer."""
+    record = _command_record(sample.attachment)
+    return (to is not None and record is not None and record.get("zid") == to.node
+            and set(CHECKS) <= set(record.get("checked") or ()))
+
+
+def _schema(reply) -> str:
+    """The schema of an error reply's encoding (``text/plain;<schema>``), empty for none."""
+    return str(reply.err.encoding).partition(";")[2]
+
+
+def ask_once(session: zenoh.Session, selector: str, timeout: float, to: CommandTarget | None = None,
+             **get_options) -> list:
     """The replies to a command (a parameter set, a controller switch, a torque step, a recorder command): sent once
     to each queryable of ``selector``, after the session knows one. NotReached when none became known within
     ``timeout`` (nothing sent). The replies as they came, possibly none; ``command`` interprets them.
+
+    ``to`` (``one_node``): the node it is meant for. The query's attachment then names it and the deadline, ``timeout``
+    from the moment it is sent (the time Zenoh ends the query), converted into the node's clock (``CommandTarget``).
+    A receiver of 0.5.13 or later that is not that node does not execute it, nor does that node once the deadline has
+    passed (``CommandQuery``). An older receiver ignores the attachment and executes it as before. Without ``to``
+    nothing is attached, as before 0.5.13.
 
     Once per queryable: two queryables on the key (two nodes, two bridges) both get it and both may execute it. This
     holds because Zenoh's default query target (BestMatching) reaches every matching queryable while none is declared
@@ -419,6 +599,8 @@ def ask_once(session: zenoh.Session, selector: str, timeout: float, **get_option
     Time: up to ``timeout`` for the queryable, then the query's own timeout ``timeout``; when Zenoh does not end the
     query by then, ``collect`` waits up to ``deadline_of(timeout)`` (``timeout + max(0.5, timeout)``) and 1 s more
     for the cancellation. At most about 3 x timeout + 1 s in all (measured in tests/test_queries.py)."""
+    if to is not None and "attachment" in get_options:
+        raise ValueError("a command to a target carries its own attachment (its node and deadline)")
     end = time.monotonic() + timeout
     querier = session.declare_querier(selector)
     try:
@@ -428,31 +610,68 @@ def ask_once(session: zenoh.Session, selector: str, timeout: float, **get_option
             time.sleep(0.01)
     finally:
         querier.undeclare()
+    if to is not None:  # taken last: the deadline is never later than the time Zenoh ends the query
+        get_options["attachment"] = json.dumps({COMMAND_FIELD: COMMAND_VERSION, "node": to.node,
+                                                "deadline_ns": to.deadline_ns(timeout)}, separators=(",", ":"))
     return replies(session, selector, timeout, **get_options)
 
 
-def command(session: zenoh.Session, selector: str, timeout: float, **get_options) -> list:
-    """A command sent with ``ask_once`` and its answers checked: the successful replies (one or more), else
-    NotReached (not sent), RuntimeError with the first error reply's text (an error reply other than Zenoh's own
-    timeout), NoAnswer (sent once, no answer within ``timeout``: it may still be executed; not sent again),
+def no_answer_text(selector: str, timeout: float, to: CommandTarget | None) -> str:
+    """What a NoAnswer says: without a target as before 0.5.13; with one, that a receiver which checks the deadline
+    no longer begins it (its deadline has passed when the sender gives up) and that the sender cannot tell whether
+    its receiver checks."""
+    if to is None:
+        return f"{selector}: sent once, no answer within {timeout:g} s: it may still be executed; not sent again"
+    return (f"{selector}: sent once with a deadline, no answer within {timeout:g} s: it may have been executed; a "
+            "receiver that checks the deadline (xblick 0.5.13 or later) no longer begins it, one that does not may "
+            "still execute it; not sent again")
+
+
+def command(session: zenoh.Session, selector: str, timeout: float, to: CommandTarget | None = None,
+            **get_options) -> list:
+    """A command sent with ``ask_once`` (``to``: the node it is meant for) and its answers checked: the successful
+    replies (one or more), else NotReached (not sent), RuntimeError with the first error reply's text (an error reply
+    other than Zenoh's own timeout and the refusals below), Expired (refused by its node: its deadline had passed, not
+    executed there), NoAnswer (sent once, no answer within ``timeout``: it may have been executed; not sent again),
     PartlyAnswered (answered, and the query was still open at its timeout: another node may still execute it), or
-    SeveralExecuted (answered by several nodes: each executed it). A receiver replies and drops the query at once: one
-    that keeps the query after its reply keeps it open until the timeout, and the "Timeout" reply that the session then
-    adds looks like a second node."""
-    answers = ask_once(session, selector, timeout, **get_options)
-    errors = [r.err.payload.to_string() for r in answers if r.err is not None and not timed_out(r)]
-    if errors:
-        raise RuntimeError(errors[0])
+    SeveralExecuted (answered by several nodes: each that answered with success executed it). A refusal by a node that
+    the command was not meant for (NOT_TARGET) means that node did not execute it: beside one successful answer it is
+    a warning in the log (a second node on the key, which the read before missed), alone it is a NoAnswer (the target
+    gave no answer). ``checked`` tells whether a successful answer's node checked node and deadline.
+
+    A receiver replies and drops the query at once: one that keeps the query after its reply keeps it open until the
+    timeout, and the "Timeout" reply that the session then adds looks like a second node."""
+    answers = ask_once(session, selector, timeout, to, **get_options)
+    errors = [r for r in answers if r.err is not None and not timed_out(r)]
+    plain = [r.err.payload.to_string() for r in errors if _schema(r) not in (EXPIRED, NOT_TARGET)]
+    if plain:
+        raise RuntimeError(plain[0])
+    expired = [r.err.payload.to_string() for r in errors if _schema(r) == EXPIRED]
+    others = len([r for r in errors if _schema(r) == NOT_TARGET])
+    still_open = any(timed_out(r) for r in answers)
     ok = [r.ok for r in answers if r.ok is not None]
+    refused_by_others = f"; {others} other node(s) refused it as not meant for them" if others else ""
     if not ok:
-        raise NoAnswer(f"{selector}: sent once, no answer within {timeout:g} s: it may still be executed; not sent "
-                       "again")
-    if any(timed_out(r) for r in answers):
+        if expired and not still_open:
+            raise Expired(f"{selector}: refused as expired: {expired[0]}{refused_by_others}; not sent again")
+        if expired:
+            raise PartlyAnswered(f"{selector}: refused as expired by its node ({expired[0]}), and the query was still "
+                                 f"open after {timeout:g} s ({HOLDING}): a second node may still execute it; not sent "
+                                 "again")
+        raise NoAnswer(no_answer_text(selector, timeout, to) + refused_by_others)
+    if still_open:
         raise PartlyAnswered(f"{selector}: answered by {len(ok)} node(s), and the query was still open after "
                              f"{timeout:g} s ({HOLDING}): a second node may still execute it; not sent again")
-    if len(ok) > 1:
-        raise SeveralExecuted(f"{selector}: sent, and {len(ok)} nodes answered: each of them executed it; not sent "
-                              "again (one key, one node)")
+    if len(ok) > 1 or expired:
+        refused = f" and {len(expired)} refused it as expired" if expired else ""
+        raise SeveralExecuted(f"{selector}: sent, and {len(ok) + len(expired)} nodes answered: {len(ok)} executed it"
+                              f"{refused}{refused_by_others}; not sent again (one key, one node)"
+                              if expired else
+                              f"{selector}: sent, and {len(ok)} nodes answered: each of them executed it"
+                              f"{refused_by_others}; not sent again (one key, one node)")
+    if others:
+        log.warning(f"{selector}: executed by its node; {others} other node(s) on the key refused it as not meant for "
+                    "them (one key, one node: the read before the command did not see them)")
     return ok
 
 
@@ -462,8 +681,9 @@ def count(answers: list, selector: str) -> list:
     reply, ``timed_out``). A query still open at its timeout means a queryable got it and had not finished: a node that
     exists but did not answer in time is a second node, not none, or a single node keeps the query after its reply.
     TimeoutError when none answered, in time or at all. A session just opened links to the serving sessions one after
-    the other: for a short time the read can miss a second node (the command then reaches it too, if known by then)
-    or reach only a busy one (TimeoutError, although another node serves the key)."""
+    the other: for a short time the read can miss a second node (the command then reaches it too, if known by then;
+    one of 0.5.13 or later refuses a command meant for another node, ``one_node``) or reach only a busy one
+    (TimeoutError, although another node serves the key)."""
     ok = [r.ok for r in answers if r.ok is not None]
     still_open = any(timed_out(r) for r in answers)
     if not ok:

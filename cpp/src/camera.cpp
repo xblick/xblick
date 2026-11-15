@@ -9,9 +9,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <optional>
 #include <set>
 #include <regex>
@@ -1109,9 +1111,28 @@ namespace xblick
         return not_finalized.load();
     }
 
+    namespace
+    {
+        // replies() with the query's attachment (a command's node and deadline)
+        std::vector<zenoh::Reply> replies_with(const zenoh::Session& session, const std::string& selector,
+                                               std::chrono::milliseconds timeout,
+                                               const std::optional<std::vector<std::uint8_t>>& payload,
+                                               const std::optional<std::string>& attachment);
+    }
+
     std::vector<zenoh::Reply> replies(const zenoh::Session& session, const std::string& selector,
                                       std::chrono::milliseconds timeout,
                                       const std::optional<std::vector<std::uint8_t>>& payload)
+    {
+        return replies_with(session, selector, timeout, payload, std::nullopt);
+    }
+
+    namespace
+    {
+    std::vector<zenoh::Reply> replies_with(const zenoh::Session& session, const std::string& selector,
+                                           std::chrono::milliseconds timeout,
+                                           const std::optional<std::vector<std::uint8_t>>& payload,
+                                           const std::optional<std::string>& attachment)
     {
         struct State
         {
@@ -1129,6 +1150,10 @@ namespace xblick
         if (payload)
         {
             options.payload = zenoh::Bytes(*payload);
+        }
+        if (attachment)
+        {
+            options.attachment = zenoh::Bytes(*attachment);
         }
         session.get(
             zenoh::KeyExpr(selector), "",
@@ -1158,6 +1183,7 @@ namespace xblick
         }
         return std::move(state->replies);
     }
+    }  // namespace
 
     std::vector<zenoh::Reply> ask(const zenoh::Session& session, const std::string& selector,
                                   std::chrono::milliseconds timeout,
@@ -1202,6 +1228,227 @@ namespace xblick
             }
         }
         return replies(session, selector, timeout, payload);
+    }
+
+    // ------------------------------------------------------------------- a command's node and deadline (0.5.13)
+
+    namespace
+    {
+        // A query's or reply's attachment as a command's JSON object (with kCommandField); empty for none or for
+        // another program's attachment. `unreadable`: set when it names kCommandField but is no JSON this parser
+        // reads (so that it is refused, not taken as another program's).
+        std::optional<json::Object> command_record(const std::optional<std::reference_wrapper<const zenoh::Bytes>>& a,
+                                                   bool* unreadable = nullptr)
+        {
+            if (not a)
+            {
+                return std::nullopt;
+            }
+            const std::string text = a->get().as_string();
+            try
+            {
+                json::Object o = json::parse(text);
+                if (o.count(std::string(p::kCommandField)))
+                {
+                    return o;
+                }
+            }
+            catch (const std::exception&)
+            {
+                if (unreadable and text.find("\"" + std::string(p::kCommandField) + "\"") != std::string::npos)
+                {
+                    *unreadable = true;
+                }
+            }
+            return std::nullopt;
+        }
+
+        std::string error_schema(const zenoh::Reply& reply)
+        {
+            if (reply.is_ok())
+            {
+                return "";
+            }
+            const std::string encoding = reply.get_err().get_encoding().as_string();
+            const auto semicolon = encoding.find(';');
+            return semicolon == std::string::npos ? "" : encoding.substr(semicolon + 1);
+        }
+    }
+
+    std::int64_t command_clock_ns()
+    {
+        timespec t{};
+        if (clock_gettime(CLOCK_BOOTTIME, &t) != 0)
+        {
+            throw std::runtime_error(std::string("clock_gettime(CLOCK_BOOTTIME): ") + std::strerror(errno));
+        }
+        return static_cast<std::int64_t>(t.tv_sec) * 1000000000 + t.tv_nsec;
+    }
+
+    std::int64_t CommandTarget::deadline_ns(std::chrono::milliseconds timeout) const
+    {
+        return command_clock_ns() + std::chrono::duration_cast<std::chrono::nanoseconds>(timeout).count() + offset_ns;
+    }
+
+    std::optional<CommandTarget> target_of(const zenoh::Reply& reply, std::int64_t answered_ns)
+    {
+        if (not reply.is_ok())
+        {
+            return std::nullopt;
+        }
+        bool unreadable = false;
+        const auto record = command_record(reply.get_ok().get_attachment(), &unreadable);
+        const std::string key(reply.get_ok().get_keyexpr().as_string_view());
+        if (unreadable)
+        {
+            throw std::runtime_error("not sent: the answer of " + key + " has a " + std::string(p::kCommandField) +
+                                     " attachment this program cannot read");
+        }
+        if (not record)
+        {
+            return std::nullopt;
+        }
+        const auto version = json::get<std::int64_t>(*record, std::string(p::kCommandField));
+        const auto zid = json::get<std::string>(*record, "zid");
+        const auto clock = json::get<std::int64_t>(*record, "clock_ns");
+        if (version != static_cast<std::int64_t>(p::kCommandVersion) or not zid or zid->empty() or not clock)
+        {
+            throw std::runtime_error("not sent: the answer of " + key + " has a " + std::string(p::kCommandField) +
+                                     " attachment this program cannot read");
+        }
+        return CommandTarget{*zid, *clock - answered_ns};
+    }
+
+    std::vector<zenoh::Reply> ask_once(const zenoh::Session& session, const std::string& selector,
+                                       std::chrono::milliseconds timeout,
+                                       const std::optional<std::vector<std::uint8_t>>& payload,
+                                       const std::optional<CommandTarget>& to)
+    {
+        if (not to)
+        {
+            return ask_once(session, selector, timeout, payload);
+        }
+        // as the overload without a target (replies), the attachment taken last: the deadline is never later than
+        // the time Zenoh ends the query
+        using clock = std::chrono::steady_clock;
+        const auto end = clock::now() + timeout;
+        {
+            zenoh::Querier querier = session.declare_querier(zenoh::KeyExpr(selector));
+            while (not querier.get_matching_status().matching)
+            {
+                if (clock::now() >= end)
+                {
+                    throw NotReached("not sent: no node serves " + selector + " (none became known within " +
+                                     std::to_string(timeout.count()) + " ms)");
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
+        const std::string attachment = json::write({{std::string(p::kCommandField),
+                                                     static_cast<std::int64_t>(p::kCommandVersion)},
+                                                    {"node", to->node},
+                                                    {"deadline_ns", to->deadline_ns(timeout)}});
+        return replies_with(session, selector, timeout, payload, attachment);
+    }
+
+    bool expired(const zenoh::Reply& reply)
+    {
+        return error_schema(reply) == p::kExpired;
+    }
+
+    bool not_target(const zenoh::Reply& reply)
+    {
+        return error_schema(reply) == p::kNotTarget;
+    }
+
+    bool checked(const zenoh::Reply& reply, const std::optional<CommandTarget>& to)
+    {
+        if (not to or not reply.is_ok())
+        {
+            return false;
+        }
+        const auto record = command_record(reply.get_ok().get_attachment());
+        if (not record or json::get<std::string>(*record, "zid") != to->node)
+        {
+            return false;
+        }
+        const auto list = json::get<std::vector<std::string>>(*record, "checked").value_or(std::vector<std::string>{});
+        return std::find(list.begin(), list.end(), "node") != list.end() and
+               std::find(list.begin(), list.end(), "deadline") != list.end();
+    }
+
+    std::string answer_attachment(const std::string& zid, const std::vector<std::string>& checked)
+    {
+        return json::write({{std::string(p::kCommandField), static_cast<std::int64_t>(p::kCommandVersion)},
+                            {"zid", zid},
+                            {"clock_ns", command_clock_ns()},
+                            {"checked", checked}});
+    }
+
+    CommandQuery::CommandQuery(const zenoh::Query& query, std::string zid, std::string what)
+        : zid_(std::move(zid)), what_(std::move(what))
+    {
+        bool unreadable = false;
+        const auto record = command_record(query.get_attachment(), &unreadable);
+        if (unreadable)
+        {
+            invalid_ = "its " + std::string(p::kCommandField) + " attachment is no JSON this node reads";
+            return;
+        }
+        if (not record)
+        {
+            return;
+        }
+        const auto version = json::get<std::int64_t>(*record, std::string(p::kCommandField));
+        const auto node = json::get<std::string>(*record, "node");
+        const auto deadline = json::get<std::int64_t>(*record, "deadline_ns");
+        if (version != static_cast<std::int64_t>(p::kCommandVersion))
+        {
+            invalid_ = "its " + std::string(p::kCommandField) + " attachment is of another version, this node reads " +
+                       std::to_string(p::kCommandVersion);
+        }
+        else if (not node or node->empty() or not deadline)
+        {
+            invalid_ = "its " + std::string(p::kCommandField) + " attachment has no node and deadline_ns";
+        }
+        else
+        {
+            node_ = *node;
+            deadline_ns_ = *deadline;
+        }
+    }
+
+    void CommandQuery::check()
+    {
+        if (not invalid_.empty())
+        {
+            throw CommandRefused(std::string(p::kInvalidCommand), what_ + ": not executed: " + invalid_);
+        }
+        if (node_.empty())
+        {
+            return;
+        }
+        if (node_ != zid_)
+        {
+            throw CommandRefused(std::string(p::kNotTarget), what_ + ": not executed here: it is meant for the node of "
+                                                             "session " + node_ + ", this is " + zid_);
+        }
+        const std::int64_t late = command_clock_ns() - deadline_ns_;
+        if (late >= 0)
+        {
+            char seconds[32];
+            std::snprintf(seconds, sizeof seconds, "%.3f", static_cast<double>(late) / 1e9);
+            throw CommandRefused(std::string(p::kExpired), what_ + ": not executed: its deadline had passed " + seconds +
+                                                           " s before this node came to execute it");
+        }
+        checked_ = {"node", "deadline"};
+    }
+
+    void refuse(const zenoh::Query& query, const CommandRefused& refused)
+    {
+        zenoh::Query::ReplyErrOptions options;
+        options.encoding = zenoh::Encoding("text/plain;" + refused.schema);
+        query.reply_err(zenoh::Bytes(std::string(refused.what())), std::move(options));
     }
 
     std::vector<std::string> query_info(zenoh::Session& session, const std::string& base,

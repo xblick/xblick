@@ -85,6 +85,41 @@ pass a secret as an argument.
 `metadata`. A program of Durchblick 0.5.8 or older and any other Zenoh program declare nothing. They keep working,
 and the terminal interface shows `–` as their program.
 
+## A command's node and deadline
+
+A command is a query that makes a node act: a parameter set, a controller manager's command, a torque step or a
+command to the record and play node. Before a command, the caller reads the same node, and the command goes to the
+node that answered. Three attachments carry what the node and the caller need for that. Each JSON object has the
+field `xblick_command`, which holds the version 1.
+
+A receiver puts this attachment on its replies, to the read and to the command:
+
+```json
+{"xblick_command": 1, "zid": "5a1c...", "clock_ns": 86400000000000, "checked": ["node", "deadline"]}
+```
+
+The caller then puts this attachment on the command's query:
+
+```json
+{"xblick_command": 1, "node": "5a1c...", "deadline_ns": 86402000000000}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `zid` | the Zenoh id of the receiver's session |
+| `clock_ns` | the receiver's `CLOCK_BOOTTIME` when it replied, in ns |
+| `checked` | what the receiver checked before it executed the command. The list is empty for a read. |
+| `node` | the Zenoh id of the session that the command is meant for |
+| `deadline_ns` | the moment at which the caller stops waiting for the answer, on the receiver's `CLOCK_BOOTTIME` |
+
+A receiver refuses a command with an error reply. Its encoding names the case: `text/plain;xblick-not-target` for a
+command meant for another node, and `text/plain;xblick-expired` for a command whose deadline has passed. A receiver
+that cannot read an attachment with the field `xblick_command` refuses the command with
+`text/plain;xblick-invalid-command`. It ignores an attachment without that field, which another program may send.
+
+A program older than 0.5.13 sends none of these attachments and reads none. The
+[Python reference](../reference/python-api.md#node-and-deadline) explains the clocks and what the caller may claim.
+
 ## Related pages
 
 - [Durchblick and ROS 2](../integrations/ros2.md): what is compatible with ROS 2 and what is not.

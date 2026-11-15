@@ -511,6 +511,75 @@ def test_cpp_parameters_from_python(cpp_camera):
     session.close()
 
 
+def test_cpp_parameters_check_node_and_deadline(cpp_camera):
+    """The C++ Parameters (the C++ camera's) as a receiver of 0.5.13 (session.ask_once): its read names its session
+    and clock; a set to it is checked (last_checked); one past its deadline is refused (Expired) and its writer never
+    runs; one meant for another node is refused; one without a target (as older senders send it) is applied as
+    before. Then the two-node case without timing: a Python node of the same name, the only one when the read before
+    the set ran; the C++ node, which the session reaches afterwards, refuses the set meant for the Python node."""
+    from xblick import session as zs
+    from xblick.msg import GetParametersRequest, Parameter, ParameterValue, SetParametersRequest
+    from xblick.parameters import ParameterClient, Parameters, find_nodes
+
+    def request(value):
+        return bytes(SetParametersRequest([Parameter("pattern.shift", ParameterValue.of(value))]).serialize())
+
+    session = cpp_camera(params=True)
+    end = time.monotonic() + 10
+    while "t/cpp/cpp_camera" not in find_nodes(session, 0.3) and time.monotonic() < end:
+        time.sleep(0.1)
+    key = "t/cpp/cpp_camera"
+    client = ParameterClient(session, key)
+    assert client.set({"pattern.shift": 7})[0].successful and client.last_checked
+    to = zs.one_node(session, f"{key}/list_parameters", 2.0)
+    assert to.node != zs.node_id(session)  # the C++ program's session
+    with pytest.raises(zs.Expired, match="not executed: its deadline had passed 8\\."):
+        zs.command(session, f"{key}/set_parameters", 2.0, zs.CommandTarget(to.node, to.offset_ns - 10**10),
+                   payload=request(9))
+    with pytest.raises(zs.NoAnswer, match="1 other node\\(s\\) refused it as not meant for them"):
+        zs.command(session, f"{key}/set_parameters", 1.0, zs.CommandTarget("0" * 32, 0), payload=request(10))
+    assert client.get(["pattern.shift"])[0].value() == 7  # neither applied
+    (ok,) = zs.command(session, f"{key}/set_parameters", 2.0, payload=request(11))  # no target: as before 0.5.13
+    assert json.loads(ok.attachment.to_bytes())["checked"] == [] and client.get(["pattern.shift"])[0].value() == 11
+    session.close()
+
+    # the second node: a Python node "cpp_camera" in t/cpp2 alone first, then a C++ one of that name
+    port = free_port()
+    python_side = open_session(listen=[f"127.0.0.1:{port}"])
+    twin = Parameters(python_side, "cpp_camera", "t/cpp2")
+    twin.declare("pattern.shift", 0)
+    try:
+        with open_session(connect=[f"127.0.0.1:{port}"]) as s:
+            while not replies(s, "t/cpp2/cpp_camera/list_parameters", 1.0):
+                time.sleep(0.05)
+            to = zs.one_node(s, "t/cpp2/cpp_camera/list_parameters", 2.0)
+            cpp = subprocess.Popen([tool("xblick-cpp-camera"), "--connect", f"127.0.0.1:{port}", "--base",
+                                    "t/cpp2/color", "--size", str(W), str(H), "--fps", "30", "--seconds", "60",
+                                    "--params"], stdout=subprocess.PIPE, text=True)
+            try:
+                assert cpp.stdout.readline().strip() == "ready"
+                end = time.monotonic() + 10
+                while len([r for r in replies(s, "t/cpp2/cpp_camera/list_parameters", 1.0) if r.ok]) < 2:
+                    assert time.monotonic() < end, "the C++ node is not reached"
+                    time.sleep(0.05)
+                (ok,) = zs.command(s, "t/cpp2/cpp_camera/set_parameters", 2.0, to, payload=request(5))
+                assert zs.checked(ok, to)
+                values = {json.loads(r.ok.attachment.to_bytes())["zid"]: r.ok.payload.to_bytes()
+                          for r in replies(s, "t/cpp2/cpp_camera/get_parameters", 2.0,
+                                           payload=bytes(GetParametersRequest(["pattern.shift"]).serialize())) if r.ok}
+                assert twin["pattern.shift"] == 5 and len(values) == 2
+                from xblick.msg import GetParametersResponse
+
+                cpp_zid = next(z for z in values if z != to.node)
+                assert GetParametersResponse.deserialize(values[cpp_zid]).values[0].value() == 0  # refused there
+            finally:
+                cpp.terminate()
+                cpp.wait(10)
+    finally:
+        twin.close()
+        python_side.close()
+
+
 def test_python_parameters_from_cpp():
     """Python's Parameters through the C++ client (xblick-cpp-probe --params): the same descriptors, values and
     checks."""
@@ -529,7 +598,7 @@ def test_python_parameters_from_cpp():
             return [json.loads(line) for line in out.stdout.splitlines()]
 
         lines = probe_params("--set", "threshold:=0.45")
-        assert lines[0] == {"set": "threshold", "successful": True, "reason": ""}
+        assert lines[0] == {"set": "threshold", "successful": True, "reason": "", "checked": True}
         assert {p["name"]: p["value"] for p in lines[1:]} == {"labels": '[cup, "a, b"]', "mode": "fast",
                                                              "threshold": "0.45"}
         assert probe_params("--set", "threshold:=0.47")[0]["reason"] == "0.47 is not 0 plus a multiple of 0.05"

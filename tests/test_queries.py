@@ -243,9 +243,9 @@ def test_the_time_a_command_takes_at_most(network):
 
 
 def test_late_execution_after_the_caller_gave_up(network):
-    """A command has no expiry: a receiver busy with an earlier query executes it after the caller got NoAnswer. This
-    pins the behaviour (and its message), which the guide and AGENTS.md state; a deadline would need a wire
-    change."""
+    """A command sent without a target (no read before it, or one answered by an older receiver) has no deadline: a
+    receiver busy with an earlier query executes it after the caller got NoAnswer, as before 0.5.13. This pins the
+    behaviour and its message; with a target, test_a_busy_node_does_not_execute_a_set_after_the_sender_gave_up."""
     executed = []
 
     def handle(query):
@@ -319,7 +319,7 @@ def test_a_parameter_set_runs_the_nodes_writer_once(network):
             with network.new_session() as s:
                 assert ParameterClient(s, "t/w/node", 2.0).set({"x": float(i)})[0].successful
         with network.new_session() as s:
-            with pytest.raises(NoAnswer, match="sent once, no answer within 0.3 s"):
+            with pytest.raises(NoAnswer, match="sent once with a deadline, no answer within 0.3 s"):
                 ParameterClient(s, "t/w/node", 0.3).set({"x": 9.0})
         time.sleep(1.5)
         assert writes == [1.0, 2.0, 3.0, 9.0]
@@ -462,8 +462,8 @@ def test_a_cpp_parameter_set_runs_the_writer_once(network, slow):
             out = subprocess.run([probe, "--connect", network.endpoint[0], "--listen", "tcp/127.0.0.1:0", "--params",
                                   "t/c/node", "--set", f"x:={i}.0"], capture_output=True, text=True, timeout=30)
             if slow:
-                assert out.returncode != 0 and "set_parameters: sent once, no answer within 2000 ms: it may still " \
-                                                "be executed; not sent again" in out.stderr, out.stderr
+                assert out.returncode != 0 and "set_parameters: sent once with a deadline, no answer within 2000 ms: " \
+                                                "it may have been executed" in out.stderr, out.stderr
             else:
                 assert out.returncode == 0, out.stderr
         time.sleep(3.5 if slow else 0.0)
@@ -488,8 +488,9 @@ def test_the_command_line_says_which_case_it_was(network, capsys):
         time.sleep(0.5)
         assert cli.main(["param", "--node", "t/cli/node", "--set", "x:=9.0", "--timeout", "0.5", *endpoint]) == 1
         err = capsys.readouterr().err
-        assert err == ("xblick param: t/cli/node/set_parameters: sent once, no answer within 0.5 s: it may still be "
-                       "executed; not sent again\n"), err
+        assert err == ("xblick param: t/cli/node/set_parameters: sent once with a deadline, no answer within 0.5 s: it "
+                       "may have been executed; a receiver that checks the deadline (xblick 0.5.13 or later) no longer "
+                       "begins it, one that does not may still execute it; not sent again\n"), err
         assert cli.main(["param", "--node", "t/twin/node", "--set", "x:=1.0", *endpoint]) == 1
         err = capsys.readouterr().err
         assert err.startswith("xblick param: ") and "2 nodes answer" in err and err.count("\n") == 1, err
@@ -736,3 +737,397 @@ def test_a_command_reaches_every_queryable_of_its_key():
     found = [f"{f.relative_to(root)}:{n}: {line.strip()}" for f in files
              for n, line in enumerate(f.read_text().splitlines(), 1) if pattern.search(line)]
     assert found == [], "\n".join(found)
+
+
+# ------------------------------------------------------------------------ commands: node and deadline (0.5.13)
+# A command whose read before it was answered by a receiver of 0.5.13 names that node and carries a deadline in its
+# query's attachment (session.ask_once); such a receiver refuses a command meant for another node and one whose
+# deadline has passed, just before the effect (session.CommandQuery). An older receiver never looks at the
+# attachment, an older sender never at a reply's: the mixed cases below use queryables that ignore them, as the
+# programs of 0.5.0 to 0.5.12 do.
+
+from xblick import session as zs  # noqa: E402
+from xblick.session import CommandTarget, Expired, node_id, one_node  # noqa: E402
+
+SET = "set_parameters"
+
+
+def set_request(name: str, value) -> bytes:
+    from xblick.msg import Parameter, ParameterValue, SetParametersRequest
+
+    return bytes(SetParametersRequest([Parameter(name, ParameterValue.of(value))]).serialize())
+
+
+def record_of(attachment) -> dict | None:
+    return None if attachment is None else json.loads(attachment.to_bytes())
+
+
+def test_the_command_names_are_the_protocols():
+    """session.py's names of the attachment and of the refusals are protocol.hpp's (xblick._core.protocol)."""
+    from xblick import _core
+
+    P = _core.protocol
+    assert (zs.COMMAND_FIELD, zs.COMMAND_VERSION, zs.EXPIRED, zs.NOT_TARGET, zs.INVALID_COMMAND) == (
+        P.COMMAND_FIELD, P.COMMAND_VERSION, P.EXPIRED, P.NOT_TARGET, P.INVALID_COMMAND)
+
+
+def test_the_target_and_its_deadline_on_the_nodes_clock():
+    """target_of: the node's clock offset is its clock in the read's answer minus this program's clock when the read
+    ended, the least the true offset can be; the deadline on the node's clock is never later than ours. A node far
+    ahead or behind (another PC, another boot) shifts it by that much: no clock needs to be set."""
+    import zenoh
+
+    class Answer:  # a reply's ok as target_of reads it
+        key_expr = "t/n/list_parameters"
+
+        def __init__(self, record):
+            self.attachment = None if record is None else zenoh.ZBytes(json.dumps(record).encode())
+
+    now = zs.command_clock_ns()
+    for ahead in (0, 5 * 10**12, -3 * 10**12):
+        to = zs.target_of(Answer({zs.COMMAND_FIELD: 1, "zid": "ab12", "clock_ns": now + ahead, "checked": []}), now)
+        assert to == CommandTarget("ab12", ahead)
+        before = zs.command_clock_ns()
+        deadline = to.deadline_ns(0.5)
+        after = zs.command_clock_ns()
+        assert before + ahead + 500_000_000 <= deadline <= after + ahead + 500_000_000
+    assert zs.target_of(Answer(None), now) is None  # an older receiver: no target, nothing attached
+    assert zs.target_of(Answer({"v": 1, "other": "program"}), now) is None  # another attachment: not ours
+    for bad in ({zs.COMMAND_FIELD: 2, "zid": "ab", "clock_ns": 1}, {zs.COMMAND_FIELD: 1, "zid": "ab"}):
+        with pytest.raises(RuntimeError, match="not sent: the answer of t/n/list_parameters has a xblick_command "
+                                               "attachment this program cannot read"):
+            zs.target_of(Answer(bad), now)
+
+
+def test_a_receiver_checks_node_then_deadline():
+    """CommandQuery.check on queries as a receiver gets them: nothing to check without the attachment (an older sender)
+    or with another program's; refused when meant for another node, past its deadline, or unreadable."""
+    import zenoh
+
+    class Query:
+        def __init__(self, attachment):
+            self.attachment = None if attachment is None else zenoh.ZBytes(attachment)
+
+    def check(attachment, zid="me"):
+        q = zs.CommandQuery(Query(attachment), zid, "t/k")
+        q.check()
+        return q.checked
+
+    later = zs.command_clock_ns() + 10**10
+    assert check(None) == [] and check(b"\x00\x01binary") == [] and check(b'{"seq": 1}') == []
+    assert check(json.dumps({zs.COMMAND_FIELD: 1, "node": "me", "deadline_ns": later}).encode()) == ["node", "deadline"]
+    cases = [({zs.COMMAND_FIELD: 1, "node": "other", "deadline_ns": later}, zs.NOT_TARGET,
+              "t/k: not executed here: it is meant for the node of session other, this is me"),
+             ({zs.COMMAND_FIELD: 1, "node": "me", "deadline_ns": zs.command_clock_ns() - 1}, zs.EXPIRED,
+              "t/k: not executed: its deadline had passed 0.0"),
+             ({zs.COMMAND_FIELD: 2, "node": "me", "deadline_ns": later}, zs.INVALID_COMMAND,
+              "t/k: not executed: its xblick_command attachment is of version 2"),
+             ({zs.COMMAND_FIELD: 1, "node": "me"}, zs.INVALID_COMMAND, "t/k: not executed: its xblick_command"),
+             (b'{"xblick_command": 1, "node": "me", "deadline', zs.INVALID_COMMAND,
+              "t/k: not executed: its xblick_command attachment is no JSON this node reads")]
+    for record, schema, text in cases:
+        with pytest.raises(zs.CommandRefused) as refused:
+            check(record if isinstance(record, bytes) else json.dumps(record).encode())
+        assert refused.value.schema == schema and str(refused.value).startswith(text), str(refused.value)
+
+
+def test_a_set_names_its_node_and_deadline(network):
+    """A set to a Parameters node of 0.5.13: its read answer names the serving session and its clock, the set's query
+    names that node and a deadline no later than the end of the client's wait, and the answer says both were
+    checked (ParameterClient.last_checked). A second queryable on the set key in the same session (a spy that
+    replies nothing and drops the query) sees the attachment."""
+    from xblick.parameters import ParameterClient, Parameters
+
+    seen = []
+    params = Parameters(network.server, "node", "t/named")
+    params.declare("x", 0.0)
+    spy = network.server.declare_queryable(f"t/named/node/{SET}", lambda q: seen.append(record_of(q.attachment)))
+    try:
+        with network.new_session() as s:
+            knows_all(s, "t/named/node/list_parameters", 1)
+            (read,) = [r.ok for r in replies(s, "t/named/node/list_parameters", 1.0) if r.ok is not None]
+            answer = record_of(read.attachment)
+            assert answer[zs.COMMAND_FIELD] == 1 and answer["zid"] == node_id(network.server)
+            assert answer["checked"] == [] and isinstance(answer["clock_ns"], int)
+            client = ParameterClient(s, "t/named/node", 2.0)
+            before = zs.command_clock_ns()
+            assert client.set({"x": 1.0})[0].successful and client.last_checked
+            after = zs.command_clock_ns()
+        (sent,) = seen
+        assert sent["node"] == node_id(network.server)
+        # the same PC: the node's clock is this one; the deadline at most the client's own (2 s after sending)
+        assert before + 2 * 10**9 - 10**9 < sent["deadline_ns"] <= after + 2 * 10**9
+        assert params["x"] == 1.0
+    finally:
+        spy.undeclare()
+        params.close()
+
+
+def test_an_older_receiver_gets_todays_command(network):
+    """New sender, older receiver: a read answered without the attachment (a queryable that knows nothing of it) gives
+    no target, the command goes out without any attachment, exactly as before 0.5.13, and the caller does not claim
+    a check (last_checked False)."""
+    seen = []
+    network.serve(f"{M}/list_controllers", lambda q: bytes(ListControllersResponse([STATE]).serialize()))
+    network.serve(f"{M}/switch_controller", lambda q: (seen.append(q.attachment),
+                                                        bytes(SwitchControllerResponse(True, "ok").serialize()))[1])
+    with network.new_session() as s:
+        m = controller_manager.ControllerManager(s, "robot", timeout=2.0)
+        assert m.switch(activate=["arms"]) == "ok" and not m.last_checked
+    assert seen == [None] and network.calls[f"{M}/switch_controller"] == 1
+
+
+def test_an_older_receiver_ignores_the_attachment(network):
+    """New sender, a read answered by a receiver of 0.5.13 and the command served by a queryable that never looks at
+    its attachment (an older torque_step server beside new parameters): executed once, success as before, and the
+    caller does not claim a check. The case "an older receiver ignores the attachment"."""
+    zid = node_id(network.server)
+    network._queryables.append(network.server.declare_queryable(  # the read answered as by a receiver of 0.5.13
+        "robot/controller/arms/list_parameters",
+        lambda q: q.reply(q.key_expr, bytes(ListParametersResponse(["level"], []).serialize()),
+                          attachment=zs.answer_attachment(zid))))
+    attachments = []
+    network.serve("robot/controller/arms/torque_step",
+                  lambda q: (attachments.append(record_of(q.attachment)),
+                             bytes(TorqueStepResponse(True, "").serialize()))[1])
+    with network.new_session() as s:
+        controller_manager.torque_step(s, "robot/controller/arms", "j", 1.0, 0.1)
+        to = one_node(s, "robot/controller/arms/list_parameters", 2.0)
+        ok = command(s, "robot/controller/arms/torque_step", 2.0, to, payload=b"x")
+        assert not zs.checked(ok[0], to)
+    assert network.calls["robot/controller/arms/torque_step"] == 2
+    assert [a["node"] for a in attachments] == [zid, zid]  # it got the attachment and executed all the same
+
+
+def test_an_older_sender_is_served_as_before(network):
+    """Older sender, new receiver: a set without the attachment (as 0.5.0 to 0.5.12 send it: no target) is applied as
+    before, and the reply's attachment (which such a sender never reads) says nothing was checked."""
+    from xblick.parameters import Parameters
+
+    params = Parameters(network.server, "node", "t/old")
+    params.declare("x", 0.0)
+    try:
+        with network.new_session() as s:
+            knows_all(s, "t/old/node/list_parameters", 1)
+            (ok,) = command(s, f"t/old/node/{SET}", 2.0, payload=set_request("x", 4.0))
+            assert record_of(ok.attachment)["checked"] == [] and not zs.checked(ok, None)
+            (raw,) = [r for r in replies(s, f"t/old/node/{SET}", 2.0, payload=set_request("x", 5.0),
+                                         attachment=b"\x01not json")]  # another program's attachment
+            assert raw.ok is not None
+        assert params["x"] == 5.0
+    finally:
+        params.close()
+
+
+@pytest.mark.parametrize("server", ["parameters", "recorder"])
+def test_an_expired_command_is_not_executed(network, server, tmp_path):
+    """A command whose deadline has passed when its node gets to it: Expired (a RuntimeError, no TimeoutError, no
+    NoAnswer), and the handler was never called: the writer did not run (the value is unchanged), the recorder did not
+    start (idle, no file). The target is the node itself, its clock moved back 10 s so that the deadline lies in the
+    past on arrival."""
+    writes = []
+    if server == "parameters":
+        from xblick.parameters import Parameters
+
+        node = Parameters(network.server, "node", "t/exp")
+        node.declare("x", 0.0, write=writes.append)
+        read_key, key, payload = "t/exp/node/list_parameters", f"t/exp/node/{SET}", set_request("x", 1.0)
+    else:
+        node = recording.Recorder(network.server, tmp_path, name="exp")
+        read_key, key, payload = "xblick/exp/status", "xblick/exp/control", json.dumps({"command": "record"})
+    try:
+        with network.new_session() as s:
+            knows_all(s, read_key, 1)
+            to = one_node(s, read_key, 2.0)
+            assert to.node == node_id(network.server)
+            late = CommandTarget(to.node, to.offset_ns - 10 * 10**9)
+            with pytest.raises(Expired, match=f"{key}: refused as expired: {key}: not executed: its deadline had "
+                                              "passed 8\\.") as error:
+                command(s, key, 2.0, late, payload=payload)
+            assert not isinstance(error.value, (TimeoutError, NoAnswer))
+            if server == "parameters":
+                assert node["x"] == 0.0 and writes == []
+            else:
+                assert recording.query_status(s, "exp")["state"] == "idle"
+        assert list(tmp_path.iterdir()) == []
+    finally:
+        node.close()
+
+
+def test_a_busy_node_does_not_execute_a_set_after_the_sender_gave_up(network, caplog):
+    """Issue #1's case, with a check as late as possible: the node gets the set in time, but a step before its effect
+    (here the parameter's reader, which the set calls first) takes until after the sender gave up (NoAnswer). The
+    check right before the writer finds the deadline passed: the writer never runs. Before 0.5.13 it ran after the
+    caller's NoAnswer (test_late_execution_after_the_caller_gave_up)."""
+    import logging
+
+    from xblick.parameters import ParameterClient, Parameters
+
+    writes, entered, release = [], threading.Event(), threading.Event()
+    armed = threading.Event()
+
+    def read():
+        if armed.is_set():
+            entered.set()
+            release.wait(10.0)
+        return 0.0
+
+    params = Parameters(network.server, "node", "t/late")
+    params.declare("x", 0.0, read=read, write=writes.append)
+    try:
+        with network.new_session() as s, caplog.at_level(logging.WARNING, logger="xblick"):
+            knows_all(s, "t/late/node/list_parameters", 1)
+            armed.set()
+            with pytest.raises(NoAnswer, match="t/late/node/set_parameters: sent once with a deadline, no answer "
+                                               "within 0.5 s: it may have been executed; a receiver that checks the "
+                                               "deadline"):
+                ParameterClient(s, "t/late/node", 0.5).set({"x": 1.0})
+            assert entered.is_set()  # the node had the set before the sender gave up
+            armed.clear()
+            release.set()
+            # the node answers queries one after another: a get answered means the set's handling has ended
+            assert ParameterClient(s, "t/late/node", 5.0).get(["x"])[0].value() == 0.0
+        assert writes == []
+        assert any("t/late/node/set_parameters: not executed: its deadline had passed" in r.getMessage()
+                   for r in caplog.records)
+    finally:
+        release.set()
+        params.close()
+
+
+@pytest.mark.parametrize("second", ["new", "old"])
+def test_a_second_node_the_read_did_not_see(network, second, caplog):
+    """Two nodes on one key, the read before the set answered by one only: here the second starts after the read
+    (made so, not by timing: the read and the set are sent by hand, the second node declared between them, and the
+    session waits until it reaches it). A second node of 0.5.13 refuses the set (not meant for it): only the named node
+    applies it, the caller gets its answer and a warning. A second node that does not check (older) applies it too:
+    SeveralExecuted, as before 0.5.13."""
+    import logging
+
+    from xblick.parameters import Parameters
+
+    writes = {"a": [], "b": []}
+    a = Parameters(network.server, "node", "t/late2")
+    a.declare("x", 0.0, write=writes["a"].append)
+    b = None
+    try:
+        with network.new_session() as s, caplog.at_level(logging.WARNING, logger="xblick"):
+            knows_all(s, "t/late2/node/list_parameters", 1)
+            to = one_node(s, "t/late2/node/list_parameters", 2.0)
+            other = network.second_server()
+            if second == "new":
+                b = Parameters(other, "node", "t/late2")
+                b.declare("x", 0.0, write=writes["b"].append)
+            else:
+                from xblick.msg import SetParametersResponse
+
+                network.serve("t/late2/node/list_parameters",
+                              lambda q: bytes(ListParametersResponse(["x"], []).serialize()), server=other,
+                              name="old list")
+                network.serve(f"t/late2/node/{SET}", lambda q: (writes["b"].append(1.0), bytes(
+                    SetParametersResponse([]).serialize()))[1], server=other, name="old set")
+            knows_all(s, "t/late2/node/list_parameters", 2)
+            if second == "new":
+                (ok,) = command(s, f"t/late2/node/{SET}", 2.0, to, payload=set_request("x", 1.0))
+                assert zs.checked(ok, to)
+                assert any("t/late2/node/set_parameters: executed by its node; 1 other node(s) on the key refused it "
+                           "as not meant for them" in r.getMessage() for r in caplog.records)
+            else:
+                with pytest.raises(SeveralExecuted, match="sent, and 2 nodes answered: each of them executed it"):
+                    command(s, f"t/late2/node/{SET}", 2.0, to, payload=set_request("x", 1.0))
+        assert writes == {"a": [1.0], "b": [] if second == "new" else [1.0]}
+    finally:
+        a.close()
+        if b is not None:
+            b.close()
+
+
+def test_a_command_meant_for_a_node_that_is_gone(network):
+    """The named node gone (here: a target that names no serving session), another node of 0.5.13 on the key: it
+    refuses, nothing is executed, and the caller gets NoAnswer (the named node's answer is missing) that names the
+    refusal."""
+    from xblick.parameters import Parameters
+
+    writes = []
+    params = Parameters(network.server, "node", "t/gone")
+    params.declare("x", 0.0, write=writes.append)
+    try:
+        with network.new_session() as s:
+            knows_all(s, "t/gone/node/list_parameters", 1)
+            with pytest.raises(NoAnswer, match="no answer within 1 s: .*; 1 other node\\(s\\) refused it as not meant "
+                                               "for them"):
+                command(s, f"t/gone/node/{SET}", 1.0, CommandTarget("0" * 32, 0), payload=set_request("x", 1.0))
+        assert writes == [] and params["x"] == 0.0
+    finally:
+        params.close()
+
+
+@pytest.mark.skipif(not __import__("os").environ.get("XBLICK_CPP_BUILD"), reason="XBLICK_CPP_BUILD is not set")
+@pytest.mark.parametrize("case", ["checked", "late", "second"])
+def test_a_cpp_set_with_node_and_deadline(network, case):
+    """C++ ParameterClient (xblick-cpp-probe --set) against Python nodes: "checked" (the set names its node and a
+    deadline, and the answer confirms the check), "late" (the node's reader holds the set until the probe gave up: the
+    writer never runs, the probe says "sent once with a deadline"), "second" (a second node of 0.5.13 on the set key
+    that the read cannot see, as it serves no list_parameters: it refuses, only the named node applies it). The second
+    node is the router's own session: the probe knows its queryables from its first link on, before it can reach
+    the named node, so it surely gets the set."""
+    import os
+    import subprocess
+
+    from xblick.parameters import ParameterClient, Parameters
+
+    writes, seen, release, held = [], [], threading.Event(), threading.Event()
+
+    def read():
+        if held.is_set():
+            release.wait(10.0)
+        return 0.0
+
+    params = Parameters(network.server, "node", "t/cpp13")
+    params.declare("x", 0.0, write=writes.append, read=read if case == "late" else None)
+    extra = []
+    if case == "checked":  # a spy beside the node (same session, no reply): it sees the attachment
+        extra.append(network.server.declare_queryable(f"t/cpp13/node/{SET}",
+                                                      lambda q: seen.append(record_of(q.attachment))))
+    if case == "second":
+        zid = node_id(network.router)
+
+        def second(query):
+            received = zs.CommandQuery(query, zid, f"t/cpp13/node/{SET}")
+            try:
+                received.check()
+            except zs.CommandRefused as refused:
+                seen.append(refused.schema)
+                zs.refuse(query, refused)
+                return
+            writes.append("second")
+            query.reply(query.key_expr, b"")
+
+        extra.append(network.router.declare_queryable(f"t/cpp13/node/{SET}", second))
+    probe = os.path.join(os.environ["XBLICK_CPP_BUILD"], "xblick-cpp-probe")
+    try:
+        if case == "late":
+            held.set()
+        out = subprocess.run([probe, "--connect", network.endpoint[0], "--listen", "tcp/127.0.0.1:0", "--params",
+                              "t/cpp13/node", "--set", "x:=1.0"], capture_output=True, text=True, timeout=30)
+        if case == "late":
+            assert out.returncode != 0 and ("set_parameters: sent once with a deadline, no answer within 2000 ms"
+                                            in out.stderr), out.stderr
+            held.clear()
+            release.set()
+            with network.new_session() as s:  # answered after the set's handling ended (one query at a time)
+                assert ParameterClient(s, "t/cpp13/node", 5.0).get(["x"])[0].value() == 0.0
+            assert writes == []
+        else:
+            assert out.returncode == 0, out.stderr
+            assert json.loads(out.stdout.splitlines()[0])["checked"] is True
+            assert writes == [1.0]
+            if case == "checked":
+                assert seen[0]["node"] == node_id(network.server) and isinstance(seen[0]["deadline_ns"], int)
+            else:
+                assert seen == [zs.NOT_TARGET] and "1 other node(s) on the key refused it" in out.stderr, out.stderr
+    finally:
+        release.set()
+        for q in extra:
+            q.undeclare()
+        params.close()

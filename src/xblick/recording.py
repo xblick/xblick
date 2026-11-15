@@ -31,7 +31,10 @@ file's or the playback's numbers) on ``xblick/<name>/status`` every second and a
 command's reason is its ``refused``.
 While it does not record it subscribes to nothing (the publishers encode nothing for it). The control key is a
 queryable too: a command sent as a query (``request``) is answered once it took effect, with its result (JSON
-``{"v":1,"ok":true,"command":...,"result":{...}}``, or ``"ok":false`` with ``refused`` or ``error``).
+``{"v":1,"ok":true,"command":...,"result":{...}}``, or ``"ok":false`` with ``refused`` or ``error``). Such a command
+from a sender of 0.5.13 names this node and has a deadline (session.CommandQuery): checked just before the command
+starts, refused as an error reply when it is meant for another node or late; a command that waits for another one
+(a play behind a stop) can start after its deadline. A put on the control key has neither.
 
 **Recording a simulation.** ``record`` with ``keys`` (a list of key expressions) subscribes to exactly those (no
 discovery), looks for their publishers and answers *ready* once it is subscribed to all of them, with the keys it
@@ -85,7 +88,7 @@ from .codecs import parse_format
 from .msg import CameraInfo, Clock, CompressedImage, Message, Time
 from .msgdefs import MSGDEFS
 from .parameters import Parameters
-from .session import ask, count, replies
+from .session import CommandQuery, CommandRefused, answer_attachment, node_id, one_node, refuse, replies
 from .session import command as send_once
 from .stamps import header_stamp  # recording.header_stamp: its old home
 
@@ -393,7 +396,9 @@ class Recorder:
                     "failed": self.failed, "error": repr(self._error) if self._error else None}
 
     def _answer_status(self, query: zenoh.Query):
-        query.reply(status_key(self.name), json.dumps(self.status()), encoding=zenoh.Encoding.APPLICATION_JSON)
+        # names this node and its clock: the read before a command (request), whose answer the command is sent to
+        query.reply(status_key(self.name), json.dumps(self.status()), encoding=zenoh.Encoding.APPLICATION_JSON,
+                    attachment=answer_attachment(node_id(self.session)))
 
     def _publish_status(self):
         while not self._closed.wait(1.0):
@@ -406,13 +411,22 @@ class Recorder:
 
     def _on_request(self, query: zenoh.Query):
         payload = query.payload.to_bytes() if query.payload is not None else b""
-        threading.Thread(target=self._answer_request, args=(query, payload), daemon=True).start()
+        received = CommandQuery(query, node_id(self.session), control_key(self.name))
+        threading.Thread(target=self._answer_request, args=(query, payload, received), daemon=True).start()
 
-    def _answer_request(self, query: zenoh.Query, payload: bytes):
-        """A command sent as a query: answered once it took effect (its result) or was refused."""
+    def _answer_request(self, query: zenoh.Query, payload: bytes, received: CommandQuery):
+        """A command sent as a query: answered once it took effect (its result) or was refused; checked (node,
+        deadline) just before it starts, an error reply when refused so (session.refuse)."""
         try:
-            reply = self._execute(payload)
-            query.reply(control_key(self.name), json.dumps(reply), encoding=zenoh.Encoding.APPLICATION_JSON)
+            try:
+                reply = self._execute(payload, received.check)
+            except CommandRefused as refused:
+                self.refused = str(refused)
+                print(f"{self.prog}: refused: {refused}", flush=True)
+                refuse(query, refused)
+                return
+            query.reply(control_key(self.name), json.dumps(reply), encoding=zenoh.Encoding.APPLICATION_JSON,
+                        attachment=answer_attachment(received.zid, received.checked))
         finally:
             query.drop()
 
@@ -420,13 +434,16 @@ class Recorder:
         """A control sample: done, or refused (its reason in the status and the log; the node goes on)."""
         self._execute(payload)
 
-    def _execute(self, payload: bytes) -> dict:
+    def _execute(self, payload: bytes, gate=None) -> dict:
         """Do a command: the reply of a request (REPLY_VERSION): ``ok`` and its ``result``, or why it was refused or
-        failed (also in the status and the log)."""
+        failed (also in the status and the log). ``gate``: called just before the command starts (CommandQuery.check;
+        its CommandRefused goes to the caller)."""
         self.refused = None  # the reason of this command's refusal, if it is refused
         command = None
         try:
             command, options = parse_command(payload)
+            if gate is not None:
+                gate()
             result = {"record": lambda: self.record(**options), "stop": self.stop,
                       "pause": lambda: (self.pause(), self.status())[1],
                       "resume": lambda: (self.resume(), self.status())[1],
@@ -998,18 +1015,20 @@ def request(session: zenoh.Session, name: str, command: str, timeout: float = 30
     that failed its check a RecordingError (with the numbers in ``result``). Not sent unless exactly one node of
     that name answers its status first and the query ends before its timeout (session.count, best effort:
     RuntimeError, TimeoutError for none); then sent once (session.command): NotReached (a TimeoutError, nothing
-    sent), NoAnswer (no TimeoutError: sent once, no answer within ``timeout`` s; it may still be executed; not sent
-    again), PartlyAnswered, RuntimeError for an error reply."""
+    sent), Expired (refused by the node: past its deadline, not executed), NoAnswer (no TimeoutError: sent once, no
+    answer within ``timeout`` s; not sent again), PartlyAnswered, RuntimeError for an error reply. The command names
+    the node that answered the status and has a deadline, the end of the ``timeout`` (session.ask_once), when that
+    node is of 0.5.13 or later."""
     payload = json.dumps({"command": command, **options})
     parse_command(payload.encode())  # bad ones fail here, not in the node
     # one node of that name as far as its status shows (best effort; session.count), then once (session.command)
     try:
-        count(ask(session, status_key(name), min(timeout, 10.0)), status_key(name))
+        to = one_node(session, status_key(name), min(timeout, 10.0))
     except RuntimeError as error:
         raise RuntimeError(f"{error} (the command {command})") from None
     except TimeoutError as error:
         raise TimeoutError(f"{error} (the command {command})") from None
-    answers = send_once(session, control_key(name), timeout, payload=payload)
+    answers = send_once(session, control_key(name), timeout, to, payload=payload)
     reply = json.loads(answers[0].payload.to_bytes())
     if not isinstance(reply, dict) or reply.get("v") != REPLY_VERSION:
         raise ProtocolError(f"{name}: {reply!r} is no reply of version {REPLY_VERSION}")

@@ -21,10 +21,11 @@ and no "Timeout" reply, else the command is not sent (RuntimeError, or TimeoutEr
 is a best-effort check that catches two nodes that both answer the read. A second node that does not answer the read
 (hung, dropping queries), that appears between the read and the command, or that serves a broad key expression still
 gets the command. For a torque step the read counts the controller's parameter servers, not its torque_step servers.
-Then the command is sent once (session.command): NotReached (a TimeoutError) when no manager became known, nothing
-sent; RuntimeError with the manager's reason when it refuses; NoAnswer (no TimeoutError) when it went out and no
-answer came: the robot may still execute it later, and it was not sent again; PartlyAnswered (a NoAnswer) when one
-answered and another got it and did not answer in time.
+Then the command is sent once (session.command), to the node that answered the read (session.one_node): NotReached
+(a TimeoutError) when no manager became known, nothing sent; RuntimeError with the manager's reason when it refuses;
+Expired when the manager refused it as past its deadline (not executed); NoAnswer (no TimeoutError) when it went out
+and no answer came, and it was not sent again; PartlyAnswered (a NoAnswer) when one answered and another got it and
+did not answer in time.
 
 Time of a command, at the worst (Zenoh not ending a query by its timeout; session.collect's deadline): the read with
 the manager's ``timeout`` T (up to T + max(0.5, T) + 1 s), then ask_once with the command's timeout C (up to C for the
@@ -32,8 +33,13 @@ manager to become known, then up to C + max(0.5, C) + 1 s for the reply). ``swit
 C = 2 + 5 s): up to 5 s + 7 s + 15 s = 27 s; a few ms when the manager answers at once. A manager whose read takes
 longer than T gets nothing ("not sent"); before 0.5.2 the command went out. This fails safe.
 
-A command has no expiry: a busy or briefly unreachable robot executes it when it gets it, also after the caller
-gave up (NoAnswer). Check the robot's state before acting on a NoAnswer.
+Node and deadline (0.5.13): when the read's answer comes from a receiver of 0.5.13 or later (it names its session
+and its clock), the command names that node and carries a deadline, the time the caller stops waiting. A receiver
+that checks them (the robot's software has to; ``session.CommandQuery``) executes the command only if it is that
+node and only before the deadline, so that after a NoAnswer it no longer begins it. An older receiver, or one that
+does not check, executes it as before: when it gets it, also after the caller gave up (NoAnswer). The caller cannot
+tell which before it has an answer (``ControllerManager.last_checked`` afterwards). Check the robot's state before
+acting on a NoAnswer.
 """
 
 from __future__ import annotations
@@ -60,7 +66,7 @@ from .msg import (
     UnloadControllerRequest,
     UnloadControllerResponse,
 )
-from .session import ask, command, count, timed_out
+from .session import CommandTarget, ask, checked, command, one_node, timed_out
 
 P = _core.protocol
 
@@ -81,17 +87,19 @@ def _read(session: zenoh.Session, key: str, request, response_type, timeout: flo
     return response_type.deserialize(ok[0].payload.to_bytes())
 
 
-def _command(session: zenoh.Session, key: str, request, response_type, timeout: float):
-    """A command, sent once (session.command); its one answer."""
-    ok = command(session, key, timeout, payload=bytes(request.serialize()))
-    return response_type.deserialize(ok[0].payload.to_bytes())
+def _command(session: zenoh.Session, key: str, request, response_type, timeout: float, to: CommandTarget | None):
+    """A command, sent once to ``to`` (session.command); its one answer and whether its node checked node and
+    deadline (session.checked)."""
+    ok = command(session, key, timeout, to, payload=bytes(request.serialize()))
+    return response_type.deserialize(ok[0].payload.to_bytes()), checked(ok[0], to)
 
 
-def _count(session: zenoh.Session, read_key: str, request, timeout: float, key: str):
+def _count(session: zenoh.Session, read_key: str, request, timeout: float, key: str) -> CommandTarget | None:
     """The best-effort check before a command on ``key``: the read ``read_key`` of the same node must have exactly
-    one answer and no "Timeout" reply (session.count), else nothing is sent."""
+    one answer and no "Timeout" reply (session.one_node), else nothing is sent. The command's target: the node that
+    answered (None for an older one)."""
     try:
-        count(ask(session, read_key, timeout, payload=bytes(request.serialize())), read_key)
+        return one_node(session, read_key, timeout, payload=bytes(request.serialize()))
     except RuntimeError as error:
         raise RuntimeError(f"{error} (the command {key})") from None
     except TimeoutError as error:
@@ -99,11 +107,13 @@ def _count(session: zenoh.Session, read_key: str, request, timeout: float, key: 
 
 
 class ControllerManager:
-    """The controller manager of the robot ``robot`` (its Durchblick namespace, e.g. robot)."""
+    """The controller manager of the robot ``robot`` (its Durchblick namespace, e.g. robot). ``last_checked``: the
+    manager said that it checked node and deadline before executing the last command (session.checked)."""
 
     def __init__(self, session: zenoh.Session, robot: str, timeout: float = 5.0):
         self.key = f"{topics.check_name(robot.strip('/'))}/{P.CONTROLLER_MANAGER}"
         self.timeout = timeout
+        self.last_checked = False
         self._session = session
 
     def _call(self, service: str, request, response_type, timeout: float | None = None, read: bool = False):
@@ -112,8 +122,10 @@ class ControllerManager:
         if read:
             return _read(self._session, key, request, response_type, timeout)
         # one manager, as far as a read shows (two would both execute it): its list_controllers has one answer
-        _count(self._session, f"{self.key}/{P.LIST_CONTROLLERS}", ListControllersRequest(), self.timeout, key)
-        return _command(self._session, key, request, response_type, timeout)
+        self.last_checked = False
+        to = _count(self._session, f"{self.key}/{P.LIST_CONTROLLERS}", ListControllersRequest(), self.timeout, key)
+        response, self.last_checked = _command(self._session, key, request, response_type, timeout, to)
+        return response
 
     def list(self) -> list:
         """Every controller (controller_manager_msgs ControllerState: name, state, type, ...)."""
@@ -171,15 +183,17 @@ def torque_step(session: zenoh.Session, key: str, joint: str, torque: float, dur
     Not sent unless exactly one controller answers a read of its parameters (``<key>/list_parameters``; every
     controller offers parameters) and none answers it late. Best effort: the read counts the controller's parameter
     servers, not its torque_step servers, so a second torque_step server without parameters (an older bridge), one
-    that drops the read, or one that starts after it still gets the step. ``timeout`` [s]: how long to wait for the
-    controller to become known and then for its answer; it is no deadline for the step. NoAnswer: sent once, no
-    answer within ``timeout``; the controller may still execute the step later (a command has no expiry), and it was
-    not sent again."""
+    that drops the read, or one that starts after it still gets the step (a torque_step server of 0.5.13 or later in
+    another session refuses it: the step names the session that answered the read). ``timeout`` [s]: how long to wait
+    for the controller to become known and then for its answer; the step's deadline (module docstring) is the end of
+    that answer's wait. Expired: refused as past its deadline, not executed. NoAnswer: sent once, no answer within
+    ``timeout``; a controller that does not check the deadline may still execute the step later, and it was not sent
+    again."""
     from .msg import ListParametersRequest
 
     key = topics.check_name(key.strip('/'))
-    _count(session, f"{key}/{P.LIST_PARAMETERS}", ListParametersRequest([], 0), timeout, f"{key}/{P.TORQUE_STEP}")
-    response = _command(session, f"{key}/{P.TORQUE_STEP}", TorqueStepRequest(joint, float(torque), float(duration)),
-                        TorqueStepResponse, timeout)
+    to = _count(session, f"{key}/{P.LIST_PARAMETERS}", ListParametersRequest([], 0), timeout, f"{key}/{P.TORQUE_STEP}")
+    response, _ = _command(session, f"{key}/{P.TORQUE_STEP}", TorqueStepRequest(joint, float(torque), float(duration)),
+                           TorqueStepResponse, timeout, to)
     if not response.ok:
         raise RuntimeError(f"torque step refused: {response.message}")

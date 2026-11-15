@@ -240,7 +240,8 @@ key expression still gets the command. A session that was just opened links to t
 For a short time its read can miss a second manager, which may then get the command too, or reach only a busy one and
 refuse with "no node answered in time". For `torque_step` the read counts the controller's parameter servers, not its
 torque-step servers. The check can also stop a command that worked before 0.5.2: a manager whose read takes longer than
-the timeout gets nothing ("not sent"). This fails safe.
+the timeout gets nothing ("not sent"). This fails safe. A second node that gets the command refuses it when it checks
+the command's node ([Node and deadline](#node-and-deadline)).
 
 A command raises:
 
@@ -250,9 +251,10 @@ A command raises:
 | `TimeoutError` "not sent: no node answered ..." | not sent | nobody answered the read before the command, in time or at all |
 | `RuntimeError` "not sent: ..." | not sent | the read showed several nodes, or it was still open at its timeout (a second node, or one node holding its query) |
 | `RuntimeError` with the manager's reason | sent | the manager refused it: nothing was done |
-| `xblick.NoAnswer` (`RuntimeError`, no `TimeoutError`) | sent once | no answer within the timeout. The robot may still execute it. It was not sent again. |
+| `xblick.Expired` (`RuntimeError`) | sent once | the named node refused it, because its deadline had passed when the node came to execute it. That node did not execute it. |
+| `xblick.NoAnswer` (`RuntimeError`, no `TimeoutError`) | sent once | no answer within the timeout. It may have been executed. A receiver that does not check the deadline may still execute it. It was not sent again. |
 | `xblick.PartlyAnswered` (`NoAnswer`) | sent once | one node answered, and the query was still open at its timeout: another node may still execute it |
-| `xblick.SeveralExecuted` (`NoAnswer`) | sent once | several nodes answered: each of them executed it |
+| `xblick.SeveralExecuted` (`NoAnswer`) | sent once | several nodes answered: each that answered with success executed it |
 
 **A receiver replies and drops the query at once.** A node that serves a command or a parameter (its queryable's
 callback) replies and then ends the callback, without keeping the query object. Do long work outside the callback. Zenoh
@@ -263,9 +265,60 @@ sent", and a command gives `PartlyAnswered`. Durchblick's own parameter servers 
 record and play node follow this rule. Check a receiver outside this repository, such as a robot's bridge, for it before
 you command it with 0.5.2.
 
-**A command has no expiry.** A robot that is busy or briefly unreachable executes a command when it gets it, also
-after the caller got `NoAnswer`. Check the robot's state before you act on a `NoAnswer`, and before you go near the
-robot. The `timeout` of `torque_step` is how long the caller waits. It is no deadline for the step.
+### Node and deadline
+
+A command names the node that it is meant for and carries a deadline. The receiver checks both just before the
+command takes effect. Durchblick's parameter servers (Python `Parameters`, C++ `xblick::Parameters`) and the record
+and play node check them. A controller manager and a torque-step server belong to the robot's software. They check
+only if that software uses `xblick.session.CommandQuery` (C++ `xblick::CommandQuery`).
+
+**The node.** The read before the command names the session that answered it, in its reply's
+[attachment](../concepts/protocol.md#a-commands-node-and-deadline). The command then names that session by its Zenoh
+id. A receiver in any other session refuses the command with an error reply and does not execute it. So among
+receivers that check, only the named node executes the command. This also holds when the read missed a second node.
+Two programs never share a Zenoh id. Two receivers on one key in one session share it, and both execute the command.
+A receiver serves the read before a command and the command in one session. A command handler in another session
+refuses every command, because the read names the other session.
+
+**The deadline.** The deadline is the moment at which the caller stops waiting for the answer: `timeout` after it
+sends the command. The receiver refuses the command when its clock has reached the deadline. It answers with an
+error reply, and the caller raises `xblick.Expired`.
+
+**The clock.** Each side reads its own `CLOCK_BOOTTIME`, the time since its PC started. The clocks of two PCs need
+not agree. The receiver puts its clock reading into its answer to the read. The caller takes the offset between the
+clocks as that reading minus its own clock when the read ended. The true offset can only be larger. So the caller
+converts its deadline into a deadline on the receiver's clock that is early by at most the read's round trip, and
+never late. This rests on two assumptions. Both clocks run at the same rate: NTP changes a clock's rate by at most
+0.05 %, which is 5 ms over 10 s. No clock jumps between the read and the command: `CLOCK_BOOTTIME` is never set, and
+it goes on during a suspend. If a receiver's clock ran slower than the caller's, the receiver could begin the command
+late by that rate difference times the time between the read and its check.
+
+**Where the receiver checks.** The check comes as late as possible before the effect. `Parameters` checks after it
+holds its lock and has called the parameters' readers, just before the first writer. The record and play node checks
+after it has parsed the command, just before the command starts. A `play` that waits for a `stop` in progress can
+start after its deadline. The deadline bounds when an effect begins. A writer, a switch that waits for the
+controllers' states, or a `record` that waits for its publishers can end after the deadline.
+
+**What the caller may claim.**
+
+| Outcome | Executed? |
+| --- | --- |
+| a success | executed by the node that answered. `last_checked` of `ParameterClient` and `ControllerManager` is true when that node confirmed the check (`xblick.session.checked`). |
+| `xblick.Expired` | not executed by the named node |
+| `NoAnswer` after a command with a deadline | unknown. A receiver that checks does not begin it any more once the caller has raised `NoAnswer`. A receiver that does not check may still execute it. |
+| a success, and another node refused it as not meant for it | executed by the named node only. The caller logs a warning: one key has a second node. |
+| no success, and only refusals as not meant for them | `NoAnswer`: the named node did not answer, and the others did not execute it |
+
+The caller cannot know in advance whether the command's receiver checks. A reply to the read shows that the read's
+server knows the check. For `torque_step` that server is the controller's parameter server, which need not be the
+torque-step server. Only the answer to the command confirms the check. Check the robot's state before you act on a
+`NoAnswer`, and before you go near the robot.
+
+**Older programs.** When the read's answer carries no such attachment, the receiver is older than 0.5.13. The caller
+then attaches nothing and behaves as before. Such a receiver executes a command when it gets it, also after the caller
+got `NoAnswer`. An older receiver ignores the attachment of a command and executes it as before. An older caller
+sends no attachment, and a receiver of 0.5.13 executes its command without a check. `session.command` without `to`
+sends no attachment either.
 
 A command takes a few ms when the manager answers at once. At the worst, when Zenoh does not end a query by its
 timeout, `switch()` with the defaults takes up to 27 s: up to 5 s for the read (the manager's timeout of 2 s), then

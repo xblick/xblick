@@ -224,6 +224,11 @@ NB_MODULE(_core, m)
     protocol.attr("PARAMETERS_TOKEN") = std::string(p::kParametersToken);
     protocol.attr("SESSIONS") = std::string(p::kSessions);
     protocol.attr("PROGRAM") = std::string(p::kProgram);
+    protocol.attr("COMMAND_FIELD") = std::string(p::kCommandField);
+    protocol.attr("COMMAND_VERSION") = p::kCommandVersion;
+    protocol.attr("EXPIRED") = std::string(p::kExpired);
+    protocol.attr("NOT_TARGET") = std::string(p::kNotTarget);
+    protocol.attr("INVALID_COMMAND") = std::string(p::kInvalidCommand);
     protocol.attr("ATTACHMENT_VERSION") = p::kAttachmentVersion;
     protocol.attr("INFO_VERSION") = p::kInfoVersion;
     protocol.attr("SENT_VERSION") = p::kSentVersion;
