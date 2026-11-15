@@ -21,7 +21,7 @@ that your code contains only your method.
 | `xblick.rgbd` | `RGBDInputs`, `FramePreparer` | They pair colour, depth and a segmenter's results of one camera by stamp and prepare them on the GPU. See [pairing streams](pairing-streams.md). |
 | `xblick.camera` | `check_local` | It stops a node that was told to keep frames on the GPU (`--local cuda`) when the publisher on its host offers no CUDA ring. |
 | `xblick.parameters` | `node.Parameters`, `declare_options` | Your options become ROS 2 parameters with type, range, step, unit, choices and a read-only flag. It adds `--param NAME:=VALUE`, `--params-file`, `--dump-params` and `--params-read-only`. Other programs change the live parameters over Zenoh. The module checks each change and passes it to your writer. See [options as parameters](#options-as-parameters). |
-| `xblick.poses` | `CameraPoses`, `RobotPoses` | They give a camera's or a robot's poses at an image's stamp. The module also has rotations, quaternions, `transform_of` and `pose_of`. |
+| `xblick.poses` | `TransformBuffer`, `RobotPoses` | `TransformBuffer.lookup(target, source, stamp_ns, timeout)` gives the pose of one frame in another at an image's stamp. It merges the camera's `tf_static` (fixed, valid at every stamp) and `tf` (looked up at the stamp), so a node works alike with a fixed camera (`xblick cam --pose`) and a moving one. It raises `TransformError`, one line naming the frames, when there is none. `RobotPoses` gives a robot's frames. `CameraPoses` reads `<camera>/tf` only. The module also has rotations, quaternions, `transform_of` and `pose_of`. |
 
 A subscriber keeps only the newest frame. [Latest value](../concepts/latest-value.md) explains why. A node that
 looks a frame up by its stamp later therefore needs a `FrameHistory`.

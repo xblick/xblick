@@ -390,20 +390,22 @@ def collect_views(session, spec: CameraSpec, n_views: int, device, *, instance: 
     """The next ``n_views`` views of an object from a camera with a segmenter (its spec's ``:segmenter=NAME``): the
     object is the segmenter's instance ``instance``, or its largest instance labelled ``label`` in the first view and
     that instance (its tracking id) after; a view is kept when, seen from the object (its centre from the depth), the
-    camera (its pose from ``<camera>/tf``) is at least ``min_angle`` degrees from every view kept, and its mask has at
+    camera (the pose of the image's frame in ``world``, from ``poses.TransformBuffer``: the camera's ``tf_static``
+    and ``tf``, so a fixed camera's pose works as a moving one's) is at least ``min_angle`` degrees from every view kept, and its mask has at
     least ``min_pixels``. Move the camera or the object meanwhile. ValueError if the camera has no segmenter, or if the
     views do not come within ``timeout`` seconds (the message says why: frames without the object are waited out). ``log``: a function of a line, per view kept."""
-    from .poses import CameraPoses
+    from . import topics
+    from .poses import TransformBuffer, TransformError
 
     if spec.segmenter is None:
         raise ValueError(f"{spec}: no segmenter (its spec's :segmenter=NAME) for the views' masks")
     wake = threading.Event()
     inputs = RGBDInputs(session, spec, 30, local, wake, device=device)
     prepare = FramePreparer(device)
-    poses = CameraPoses(session, spec.camera) if n_views > 1 else None
+    poses = TransformBuffer(session, spec.camera) if n_views > 1 else None
     views: list[View] = []
     directions: list[np.ndarray] = []
-    last, seen, without_pose, missing = None, 0, 0, None
+    last, seen, without_pose, missing, no_pose = None, 0, 0, None, None
     try:
         end = time.monotonic() + timeout
         while len(views) < n_views and time.monotonic() < end:
@@ -428,9 +430,10 @@ def collect_views(session, spec: CameraSpec, n_views: int, device, *, instance: 
                 continue
             if n_views == 1:
                 return [View(frame, mask, stamp, used)]
-            pose = poses.wait(stamp, 0.2)
-            if pose is None:
-                without_pose += 1
+            try:
+                pose = poses.lookup(topics.WORLD, frame.frame_id, stamp, 0.2)
+            except TransformError as error:
+                without_pose, no_pose = without_pose + 1, error
                 continue
             centre = object_centre(frame, mask)
             if centre is None:
@@ -444,7 +447,8 @@ def collect_views(session, spec: CameraSpec, n_views: int, device, *, instance: 
         if len(views) < n_views:
             raise ValueError(
                 f"{len(views)} of {n_views} views {min_angle} deg apart within {timeout} s ({seen} frames with the "
-                f"object, {without_pose} without a pose on {spec.camera}/tf); move the camera, or fewer views"
+                f"object, {without_pose} without a pose" + (f", the last: {no_pose}" if no_pose else "")
+                + "); move the camera, or fewer views"
                 if views or seen else f"no frame of {spec} with the object within {timeout} s"
                 + (f" (the last: {missing})" if missing is not None else ""))
         return views

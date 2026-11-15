@@ -189,7 +189,7 @@ def test_rgbd_inputs_limit_the_pair(sessions, max_hz, offset_ms, max_offset_ms):
 
     thread = threading.Thread(target=camera)
     thread.start()
-    processed, last, sent = 0, None, 0
+    processed, last = 0, None
     end = time.monotonic() + 3.0
     while time.monotonic() < end:  # a node's loop: the newest complete colour frame, its depth
         wake.wait(0.05)

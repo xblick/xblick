@@ -81,7 +81,9 @@ transform tree, which is the camera's entity. Without them, or for a frame they 
 the camera's origin. Everything is drawn in camera axes (x right, y down, z forward: the scene's up is -y), unless a
 camera's pose in the world comes on ``<camera>/tf`` (tf2_msgs/TFMessage, parent frame ``world``, e.g. from the
 simulation): then that camera's entity moves through the world with it, the root of its transform tree placed
-where the pose of the named frame puts it, on the capture timeline, and the scene's up is the world's z.
+where the pose of the named frame puts it, on the capture timeline, and the scene's up is the world's z. A fixed
+camera's pose in the world on its ``tf_static`` (``xblick cam --pose``) makes ``world`` the root of its tree: its
+streams sit at their poses in the world, z up.
 
 A node's poses of a camera in the world (``trajectories``, any key of tf2_msgs/TFMessage with parent frame ``world``,
 e.g. xblick-vslam's ``test/camera/vslam/tf``, or ``<camera>/tf`` to compare with) go to the entity
@@ -1025,6 +1027,10 @@ class RerunBridge:
                 for t in message.transforms}
         with self._lock:
             self._tf[camera] = tree
+            # a fixed camera's pose in the room (xblick cam --pose): the root of its tree is the world, drawn z up
+            if not self._in_world and any(parent == topics.WORLD for parent, _, _ in tree.values()):
+                self.rr.log("/", self.rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
+                self._in_world = True
             self._place(camera)
             self._update_blueprint()
 

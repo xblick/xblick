@@ -64,6 +64,7 @@ own, connect to another host as a client, as in the first line. The
 
 A camera's `tf_static` places its streams. Each stream sits at the pose of its frame, and the bodies sit with them.
 A camera whose pose arrives on `<camera>/tf` moves through the world with its streams, points, bodies and boxes.
+A fixed camera's pose in the world on its `tf_static` (`xblick cam --pose`) places its streams in the world.
 The 3D view then has z up.
 
 `--trajectory <key>` draws the poses of any `TFMessage` topic as a path, with axes at the newest pose. Two

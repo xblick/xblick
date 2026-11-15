@@ -148,7 +148,8 @@ extra `xblick[cam]`. See the [guide](../guides/cam.md).
 | `--size WxH`, `--fps FPS`, `--pixel-format FORMAT` | the mode to ask the camera for. The camera must deliver it. `--pixel-format` is for V4L2 only. |
 | `--camera-info FILE` | a ROS calibration file of the delivered size |
 | `--hfov DEG`, `--vfov DEG` | without `--camera-info`: the field of view of the assumed pinhole camera (default 60 degrees horizontal) |
-| `--frame-id ID` | the frame id. The default is the stream with `_` in place of `/`. |
+| `--frame-id ID` | the frame id. The default is the stream with `_` in place of `/`. With `--pose` it names the body frame, and the images are in `<ID>_optical`. |
+| `--pose X Y Z YAW PITCH ROLL` | the camera's fixed pose in the room: its body frame (x forward, y left, z up) in `world`, in metres and degrees. A positive pitch looks down. It is published once on `<camera>/tf_static` with the step to the optical frame, and answered to later subscribers. Example, a webcam on a monitor 1.5 m high: `--pose 0 0 1.5 0 10 0`. |
 | `--timeout S` | end with an error when no frame comes for this long (default 5). With `--reconnect`: open the camera again. |
 | `--reconnect [SECONDS]` | open a camera that stops or cannot be opened again every SECONDS (default 2), also at the start. It must come back with its first mode. |
 | `--mjpeg reencode\|passthrough` | an MJPEG camera's frames on the transport `compressed`: the decoded frame encoded again (default), or the camera's own JPEG with the standard Huffman tables inserted where a frame has none |
@@ -168,7 +169,8 @@ Publishes a moving test pattern on `test/camera/color`.
 | `--size W H` | 640 480 |
 | `--fps` | 15 |
 | `--vfov` | the vertical field of view in degrees for the camera info |
-| `--frame-id` | the frame id of the images |
+| `--frame-id` | `TestCamera`: the frame id of the images. With `--pose` the body frame's, and the images are in `<ID>_optical`. |
+| `--pose X Y Z YAW PITCH ROLL` | none: the camera's fixed pose in the room, as `xblick cam --pose` |
 | `--cuda-device N` | none: the frames also in a CUDA ring on GPU `N`, as `xblick cam --cuda-device` |
 
 ### `xblick-cpp-camera`, `xblick-cpp-probe`

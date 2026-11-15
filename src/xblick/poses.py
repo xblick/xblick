@@ -1,17 +1,26 @@
-"""Poses at a stamp, from TFMessages: a camera's pose in the world for an image (``<camera>/tf``), a robot's frames at a
-depth frame's time (``<robot>/tf``).
+"""Poses at a stamp, from TFMessages: a transform between a camera's frames at an image's stamp (``<camera>/tf_static``
+and ``<camera>/tf``), a robot's frames at a depth frame's time (``<robot>/tf``).
 
 The simulation stamps a camera's pose with each image; a robot's poses come with its state, at its own rate, so an
 image's stamp falls between two of them. :class:`PoseBuffer` gives the pose of the stamp where there is one, else the
 pose interpolated between the two around it (translation linearly, rotation along the shorter arc), if they are at
 most ``max_gap`` apart; it never extrapolates.
 
-    camera = CameraPoses(session, "test/camera")      # <camera>/tf, frames in the world
-    world_from_camera = camera.wait(image.header.stamp.to_ns(), seconds=0.2)   # 4x4 or None
+:class:`TransformBuffer` is the lookup for nodes, as tf2's buffer: it keeps what both of a camera's topics bring. A
+fixed transform (``tf_static``, e.g. a fixed camera's pose in the room from ``xblick cam --pose``) holds at every
+stamp, a changing one (``tf``, e.g. a robot's moving camera) is looked up at the stamp as above, and a chain of both is
+composed. So a node works alike with a fixed camera and with a moving one:
+
+    transforms = TransformBuffer(session, "test/camera")
+    world_from_image = transforms.lookup(topics.WORLD, image.header.frame_id, image.header.stamp.to_ns(), 0.2)
+    # 4x4; TransformError (one line naming the frames) if there is none
+
+``CameraPoses`` reads ``<camera>/tf`` only (the pose of the frame it names, in the world).
 """
 
 from __future__ import annotations
 
+import argparse
 import threading
 import time
 
@@ -19,8 +28,13 @@ import numpy as np
 import zenoh
 
 from . import topics
-from .camera import TransformSubscriber
-from .msg import Point, Pose, Quaternion, TFMessage, Transform, TransformStamped, Vector3
+from .camera import StaticTransformSubscriber, TransformSubscriber
+from .msg import Header, Point, Pose, Quaternion, TFMessage, Time, Transform, TransformStamped, Vector3
+
+OPTICAL_SUFFIX = "_optical"  # a body frame's optical frame (REP 103): <body>_optical
+# the optical frame (x right, y down, z forward) in the body frame (x forward, y left, z up), REP 103
+BODY_FROM_OPTICAL = np.array([[0.0, 0.0, 1.0, 0.0], [-1.0, 0.0, 0.0, 0.0], [0.0, -1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]])
+POSE_EXAMPLE = "0 0 1.5 0 10 0"  # a webcam on a monitor: 1.5 m high, looking 10 degrees down
 
 
 def rotation_from_quaternion(x: float, y: float, z: float, w: float) -> np.ndarray:
@@ -188,6 +202,150 @@ class RobotPoses:
 
     def close(self):
         self._subscriber.close()
+
+
+class TransformError(LookupError):
+    """No transform between two frames at a stamp: a frame no transform names, frames that are not connected, or no
+    changing pose at the stamp. The message is one line naming the frames and the topics."""
+
+
+class TransformBuffer:
+    """A camera's transforms from ``<camera>/tf_static`` (asked for at the start, so a later subscriber gets them) and
+    ``<camera>/tf`` (or ``tf_key``, e.g. xblick-vslam's ``<camera>/vslam/tf``), looked up as tf2's buffer. A
+    transform on ``tf_static`` holds at every stamp. A transform on ``tf`` is kept per child frame in a
+    :class:`PoseBuffer`: exact at its stamps, interpolated between two at most ``max_gap`` seconds apart, never
+    extrapolated. :meth:`lookup` composes the chain between two frames. A child frame has one parent; a frame on
+    both topics, or one whose parent changes, is an error (raised by :meth:`check` and :meth:`lookup`)."""
+
+    def __init__(self, session: zenoh.Session, camera: str, tf_key: str | None = None, max_gap: float = 0.1,
+                 static_timeout: float = 10.0):
+        self.camera = topics.check_name(camera)
+        self.static_key = topics.tf_static(self.camera)
+        self.tf_key = topics.check_name(tf_key) if tf_key else topics.tf(self.camera)
+        self.max_gap = max_gap
+        self._static: dict[str, tuple[str, np.ndarray]] = {}  # child -> (parent, parent_from_child)
+        self._moving: dict[str, tuple[str, PoseBuffer]] = {}  # child -> (parent, its poses by stamp)
+        self._lock = threading.Lock()
+        self._static_subscriber = StaticTransformSubscriber(session, self.camera, self._on_static, static_timeout)
+        self._subscriber = _TfSubscriber(session, self.tf_key, self._on_tf)
+
+    def _on_static(self, message: TFMessage):
+        with self._lock:
+            for t in message.transforms:
+                self._link(self._static, t, self.static_key)
+                self._static[t.child_frame_id] = (t.header.frame_id, matrix_of(t))
+
+    def _on_tf(self, message: TFMessage):
+        with self._lock:
+            for t in message.transforms:
+                self._link(self._moving, t, self.tf_key)
+                if t.child_frame_id not in self._moving:
+                    self._moving[t.child_frame_id] = (t.header.frame_id, PoseBuffer(600, self.max_gap))
+                self._moving[t.child_frame_id][1].add(t.header.stamp.to_ns(), matrix_of(t))
+
+    def _link(self, links: dict, t: TransformStamped, key: str):
+        """Checks a transform against the links known: one parent per child, each child on one of the topics."""
+        child, parent = t.child_frame_id, t.header.frame_id
+        other = self._moving if links is self._static else self._static
+        if child in other:
+            raise ValueError(f"{key}: frame {child!r} is on both {self.static_key} and {self.tf_key}")
+        if child in links and links[child][0] != parent:
+            raise ValueError(f"{key}: frame {child!r} had the parent {links[child][0]!r}, now {parent!r}")
+
+    def _from_root(self, frame: str, stamp_ns: int):
+        """(root frame, root_from_frame) at the stamp; or (None, reason, final) for a changing link without a pose."""
+        pose, seen = np.eye(4), {frame}
+        while True:
+            if frame in self._static:
+                parent, step = self._static[frame]
+            elif frame in self._moving:
+                parent, buffer = self._moving[frame]
+                step, final = buffer.at(stamp_ns)
+                if step is None:
+                    why = ("the poses around it are more than " f"{self.max_gap:g} s apart, or it is before the first"
+                           if final else "none at or after it yet (never extrapolated)")
+                    return None, f"{self.tf_key}: no pose of {frame!r} in {parent!r} at stamp {stamp_ns}: {why}", final
+            else:
+                return frame, pose
+            if parent in seen:
+                raise TransformError(f"{self.camera}: the transforms form a cycle through {parent!r}")
+            seen.add(parent)
+            pose, frame = step @ pose, parent
+
+    def _try(self, target: str, source: str, stamp_ns: int):
+        """(target_from_source, None, True), or (None, reason, final)."""
+        with self._lock:
+            ends = [self._from_root(f, stamp_ns) for f in (source, target)]
+            known = set(self._static) | set(self._moving) | {p for p, _ in self._static.values()} | {
+                p for p, _ in self._moving.values()}
+        for end in ends:
+            if end[0] is None:
+                return end
+        (source_root, root_from_source), (target_root, root_from_target) = ends
+        if source_root != target_root:
+            unknown = [f for f in (source, target) if f not in known]
+            why = (f"no transform names {' or '.join(repr(f) for f in unknown)}" if unknown
+                   else f"{source!r} leads to {source_root!r}, {target!r} to {target_root!r}")
+            return None, (f"no transform from {source!r} to {target!r} on {self.static_key} and {self.tf_key}: "
+                          f"{why}"), False
+        return np.linalg.inv(root_from_target) @ root_from_source, None, True
+
+    def lookup(self, target: str, source: str, stamp_ns: int, timeout: float) -> np.ndarray:
+        """The 4x4 pose of frame ``source`` in frame ``target`` at the stamp (``target_from_source``: p_target =
+        T p_source), waiting up to ``timeout`` seconds for the transforms to come. TransformError if there is none:
+        at once for a stamp between two poses too far apart or before the first, else after the timeout."""
+        self.check()
+        end = time.monotonic() + timeout
+        while True:
+            pose, why, final = self._try(target, source, stamp_ns)
+            if pose is not None:
+                return pose
+            if final or time.monotonic() >= end:
+                raise TransformError(why)
+            time.sleep(0.003)
+
+    def check(self):
+        self._static_subscriber.check()
+        self._subscriber.check()
+
+    def close(self):
+        self._subscriber.close()
+        self._static_subscriber.close()
+
+
+def pose_from(x: float, y: float, z: float, yaw: float, pitch: float, roll: float) -> np.ndarray:
+    """The 4x4 pose of a position (metres) and an orientation (degrees) as ROS's roll-pitch-yaw: rotated by yaw about
+    z, then pitch about the new y, then roll about the new x. For a body frame (x forward, y left, z up) a positive
+    pitch looks down."""
+    a, b, c = np.radians([yaw, pitch, roll])
+    rz = np.array([[np.cos(a), -np.sin(a), 0.0], [np.sin(a), np.cos(a), 0.0], [0.0, 0.0, 1.0]])
+    ry = np.array([[np.cos(b), 0.0, np.sin(b)], [0.0, 1.0, 0.0], [-np.sin(b), 0.0, np.cos(b)]])
+    rx = np.array([[1.0, 0.0, 0.0], [0.0, np.cos(c), -np.sin(c)], [0.0, np.sin(c), np.cos(c)]])
+    out = np.eye(4)
+    out[:3, :3] = rz @ ry @ rx
+    out[:3, 3] = (x, y, z)
+    return out
+
+
+def fixed_camera_transforms(body_frame: str, world_from_body: np.ndarray, stamp_ns: int) -> list[TransformStamped]:
+    """A fixed camera's transforms for its ``tf_static``: its body frame in ``world``, and its optical frame
+    (``<body_frame>_optical``, the images' frame) in the body frame."""
+    header = Header(Time.from_ns(stamp_ns), topics.WORLD)
+    return [TransformStamped(header, body_frame, transform_of(world_from_body)),
+            TransformStamped(Header(Time.from_ns(stamp_ns), body_frame), body_frame + OPTICAL_SUFFIX,
+                             transform_of(BODY_FROM_OPTICAL))]
+
+
+def add_pose_argument(parser: argparse.ArgumentParser, frame_option: str = "--frame-id"):
+    """``--pose X Y Z YAW PITCH ROLL``: a camera's fixed pose in the room (``fixed_camera_transforms``)."""
+    parser.add_argument(
+        "--pose", type=float, nargs=6, default=None, metavar=("X", "Y", "Z", "YAW", "PITCH", "ROLL"),
+        help="the camera's fixed pose in the room: its body frame (x forward, y left, z up) in the frame world, X Y Z "
+             "in metres, YAW PITCH ROLL in degrees (a positive pitch looks down). Published once on "
+             f"<camera>/tf_static and answered to later subscribers, with the step to the optical frame: the images "
+             f"are then in <{frame_option.lstrip('-')}>{OPTICAL_SUFFIX}. Nodes that need the camera's pose in the "
+             "room (xblick-boxer, collect_views) look it up there. Example, a webcam on a monitor 1.5 m high, looking "
+             f"slightly down: --pose {POSE_EXAMPLE} (default: no pose)")
 
 
 class _TfSubscriber(TransformSubscriber):

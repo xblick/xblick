@@ -30,8 +30,8 @@ from pathlib import Path
 
 import zenoh
 
-from .camera import CameraPublisher
-from . import ffopts, mjpeg, pick, topics, v4l2
+from .camera import CameraPublisher, StaticTransformPublisher
+from . import ffopts, mjpeg, pick, poses, topics, v4l2
 from .codecs import JPEG, RVL
 from .gpu import device_uuid, rings_text
 from .diagnostics import DiagnosticsPublisher
@@ -175,7 +175,7 @@ class LiveCamera:
                  camera_info: str | None = None, hfov: float | None = None, vfov: float | None = None,
                  frame_id: str | None = None, timeout: float = 5.0, reconnect: float | None = None,
                  options: dict | None = None, mjpeg: str = "reencode", prog: str = "xblick cam",
-                 cuda_device: int | None = None):
+                 cuda_device: int | None = None, pose: tuple[float, ...] | None = None):
         self.av = import_av()
         self.cuda_device = cuda_device  # frames also in a CUDA ring on this GPU (checked by the caller)
         self.session, self.source, self.base, self.prog = session, source, base, prog
@@ -198,6 +198,12 @@ class LiveCamera:
             raise CamError(f"--mjpeg {mjpeg}: one of {', '.join(MJPEG_MODES)}")
         self.passthrough = mjpeg == "passthrough"
         self.frame_id = frame_id  # None: the stream's name, "/" as "_", once it is known
+        if pose is not None and len(pose) != 6:
+            raise CamError(f"--pose: X Y Z YAW PITCH ROLL, six numbers, not {len(pose)}")
+        # --pose: the camera's fixed pose in the room on <camera>/tf_static; the images in the body's optical frame
+        self.pose = pose
+        self.body_frame: str | None = None
+        self.tf_static: StaticTransformPublisher | None = None
         self.calibration, self.hfov, self.vfov = camera_info, hfov, vfov
         if self.fmt == V4L2 and not Path(source).exists() and reconnect is None:
             devices = v4l2_devices()
@@ -313,6 +319,8 @@ class LiveCamera:
     def _start_publisher(self, encoding: str):
         self.base = self.base or stream_for(self.camera, encoding)
         self.frame_id = self.frame_id or self.base.replace("/", "_")
+        if self.pose is not None:  # the frame id names the body frame; the images are in its optical frame
+            self.body_frame, self.frame_id = self.frame_id, self.frame_id + poses.OPTICAL_SUFFIX
         info, said = camera_info_for(self.delivered.size[0], self.delivered.size[1], self.frame_id,
                                      self.calibration, self.hfov, self.vfov)
         with self._lock:
@@ -321,7 +329,13 @@ class LiveCamera:
             self.publisher = CameraPublisher(self.session, self.base, encoding=encoding, frame_id=self.frame_id,
                                              camera_info=info, source=SOURCE,
                                              codec=RVL if encoding == "16UC1" else JPEG, cuda_device=self.cuda_device)
+            if self.pose is not None:
+                self.tf_static = StaticTransformPublisher(self.session, self.camera, poses.fixed_camera_transforms(
+                    self.body_frame, poses.pose_from(*self.pose), time.time_ns()))
         self.encoding = encoding
+        if self.pose is not None:
+            print(f"{self.prog}: pose on {topics.tf_static(self.camera)}: {topics.WORLD} -> {self.body_frame} "
+                  f"({' '.join(f'{v:g}' for v in self.pose)}) -> {self.frame_id}, the images' frame", flush=True)
         jpeg = "; JPEG: the camera's own" if self.passthrough else ""
         print(f"{self.prog}: {self.source} -> {self.base}: {self.delivered.text()}, published as {encoding}{jpeg}; "
               f"{said}", flush=True)
@@ -421,6 +435,9 @@ class LiveCamera:
             if self.publisher is not None:
                 self.publisher.close()
                 self.publisher = None
+            if self.tf_static is not None:
+                self.tf_static.close()
+                self.tf_static = None
         if self._thread is not None:
             self._thread.join(timeout=0.5)
 
@@ -581,7 +598,9 @@ def add_arguments(parser: argparse.ArgumentParser):
     parser.add_argument("--hfov", type=float, default=None, metavar="DEG",
                         help="without --camera-info: a pinhole of this horizontal field of view (default 60)")
     parser.add_argument("--vfov", type=float, default=None, metavar="DEG", help="... or of this vertical one")
-    parser.add_argument("--frame-id", default=None, metavar="ID", help="the frame id (default: the base, / as _)")
+    parser.add_argument("--frame-id", default=None, metavar="ID",
+                        help="the frame id (default: the base, / as _); with --pose the body frame's")
+    poses.add_pose_argument(parser)
     parser.add_argument("--timeout", type=float, default=5.0, metavar="S",
                         help="end with an error when the camera delivers no frame for this long (default 5); with "
                              "--reconnect: open it again")

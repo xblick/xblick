@@ -38,9 +38,9 @@ from pathlib import Path
 
 import numpy as np
 
-from . import cam, diagnostics, mps, recording, rerun_bridge, router, survey, topics, view
+from . import cam, diagnostics, mps, poses, recording, rerun_bridge, router, survey, topics, view
 from . import session as zsession
-from .camera import CameraPublisher, ImageSubscriber, find_streams, wait_for_info
+from .camera import CameraPublisher, ImageSubscriber, StaticTransformPublisher, find_streams, wait_for_info
 from .msg import CameraInfo
 from .node import end_on_signals
 from .paths import expand_path
@@ -202,16 +202,24 @@ def _test_camera(args) -> int:
     uuid = cuda_device_checked(args, "xblick test-camera")
     w, h = args.size
     f = 0.5 * h / np.tan(np.radians(args.vfov) / 2)
-    info = CameraInfo.pinhole(w, h, f, f, (w - 1) / 2, (h - 1) / 2, frame_id=args.frame_id)
+    # --pose: the frame id names the body frame, the images are in its optical frame
+    frame_id = args.frame_id if args.pose is None else args.frame_id + poses.OPTICAL_SUFFIX
+    info = CameraInfo.pinhole(w, h, f, f, (w - 1) / 2, (h - 1) / 2, frame_id=frame_id)
+    camera = base.rpartition('/')[0]
     with zsession.open_from_args(args, prog=f"xblick {args.command}") as z:
         _say_if_alone(z, "xblick test-camera")
-        publisher = CameraPublisher(z, base, encoding="rgb8", frame_id=args.frame_id, camera_info=info,
+        publisher = CameraPublisher(z, base, encoding="rgb8", frame_id=frame_id, camera_info=info,
                                     source="test", cuda_device=args.cuda_device)
+        tf_static = None
+        if args.pose is not None:
+            tf_static = StaticTransformPublisher(z, camera, poses.fixed_camera_transforms(
+                args.frame_id, poses.pose_from(*args.pose), time.time_ns()))
+            print(f"xblick test-camera: pose on {topics.tf_static(camera)}: {topics.WORLD} -> {args.frame_id} "
+                  f"({' '.join(f'{v:g}' for v in args.pose)}) -> {frame_id}, the images' frame", flush=True)
         print(f"xblick test-camera: {w}x{h} rgb8 at {args.fps:g} Hz (Ctrl-C to stop)", flush=True)
         print(f"xblick test-camera: {rings_text(uuid, args.cuda_device)}", flush=True)
         print(f"xblick test-camera: publishing the stream {base}", flush=True)
-        print(f"xblick test-camera: start a node with --camera {base.rpartition('/')[0]} (the camera, not the stream)",
-              flush=True)
+        print(f"xblick test-camera: start a node with --camera {camera} (the camera, not the stream)", flush=True)
         period, start = 1.0 / args.fps, time.monotonic()
         try:
             while True:
@@ -221,6 +229,8 @@ def _test_camera(args) -> int:
         except KeyboardInterrupt:
             pass
         publisher.close()
+        if tf_static is not None:
+            tf_static.close()
     return 0
 
 
@@ -251,7 +261,7 @@ def _cam(args, parser) -> int:
                                     pixel_format=args.pixel_format, camera_info=args.camera_info, hfov=args.hfov,
                                     vfov=args.vfov, frame_id=args.frame_id, timeout=args.timeout,
                                     reconnect=args.reconnect, options=cam.parse_options(args.option),
-                                    mjpeg=args.mjpeg, cuda_device=args.cuda_device)
+                                    mjpeg=args.mjpeg, cuda_device=args.cuda_device, pose=args.pose)
             camera.run()
         except (cam.CamError, VideoError, ParameterError, cam.ffopts.OptionError) as error:
             raise SystemExit(f"xblick cam: {error}") from None
@@ -686,7 +696,9 @@ def build_parser(prog: str = "xblick") -> argparse.ArgumentParser:
     p.add_argument("--namespace", default="test")
     p.add_argument("--camera", default="camera")
     p.add_argument("--stream", default="color")
-    p.add_argument("--frame-id", default="TestCamera")
+    p.add_argument("--frame-id", default="TestCamera", help="the images' frame id; with --pose the body frame's "
+                                                         "(default: %(default)s)")
+    poses.add_pose_argument(p)
     p.add_argument("--size", type=int, nargs=2, default=(640, 480), metavar=("W", "H"))
     p.add_argument("--vfov", type=float, default=60.0, help="vertical field of view in degrees")
     p.add_argument("--fps", type=float, default=15.0)

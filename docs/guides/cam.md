@@ -203,6 +203,22 @@ that measures in 3D gives wrong results with an assumed calibration.
 
 The frame id is `--frame-id`, by default the name of the stream with `_` in place of `/`.
 
+## A fixed pose in the room
+
+A node that measures in the room, such as xblick-boxer, needs the camera's pose. Give a fixed camera its pose with
+`--pose X Y Z YAW PITCH ROLL`. X, Y and Z are metres, and the angles are degrees. They place the camera's body frame
+in the frame `world`. The body frame has x forward, y left and z up, as in ROS (REP 103). A positive pitch looks
+down. A webcam on a monitor, 1.5 m high and looking slightly down:
+
+```bash
+xblick cam /dev/video0 --pose 0 0 1.5 0 10 0
+```
+
+`xblick cam` publishes the pose once on `<camera>/tf_static` and answers it to every subscriber that starts later.
+The message also holds the step from the body frame to its optical frame (z forward, x right, y down). The frame id
+then names the body frame, and the images are in the optical frame `<frame id>_optical`. Nodes look the pose up with
+`xblick.poses.TransformBuffer`. A moving camera's pose on `<camera>/tf` reaches them through the same lookup.
+
 ## Stamps
 
 The stamp of a frame is the time at which its data arrived from FFmpeg on this PC, read from the wall clock. The
@@ -338,6 +354,8 @@ xblick param --node cam/video0
 
 - Tested on 2026-11-13 with FFmpeg's `lavfi` test pattern and with an HTTP URL that served a Matroska file with
   MJPEG frames. No V4L2 device, RTSP camera or other IP camera was tested.
+- `--pose` was tested with the `lavfi` test pattern and `TransformBuffer`. A node reads the pose only once it looks
+  the camera's pose up with `TransformBuffer`. A node that reads `<camera>/tf` alone finds no pose.
 - The list of cameras was tested in a pseudo-terminal with stand-in cameras. Reading the capabilities and the modes
   was tested with sample answers of the ioctls. Neither was tested on a PC with a real camera.
 - The list does not read the formats of a multi-planar capture node. Such a camera can be started in its own mode.

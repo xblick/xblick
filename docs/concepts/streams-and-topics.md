@@ -45,7 +45,7 @@ Some topics describe the camera as a whole and sit beside its streams.
 
 | Topic | Content |
 | --- | --- |
-| `<camera>/tf_static` | the fixed transforms between the camera's frames, for example from depth to colour |
+| `<camera>/tf_static` | the fixed transforms between the camera's frames, for example from depth to colour, and a fixed camera's pose in the world |
 | `<camera>/tf` | the pose of the camera in the world, one message per image |
 | `<camera>/imu` | the samples of the camera's inertial sensor |
 | `<camera>/diagnostics` | the state of every program that publishes for this camera, about once per second |

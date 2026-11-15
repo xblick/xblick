@@ -80,6 +80,33 @@ def test_frames_arrive_at_the_size_and_rate_asked_for(sessions):  # noqa: F811
     assert not errors and not thread.is_alive()
 
 
+def test_a_fixed_pose(sessions):  # noqa: F811
+    """--pose: the camera's pose in the room on its tf_static (world -> body -> optical), the images in the optical
+    frame; a lookup that starts after the camera gets it."""
+    from xblick.poses import BODY_FROM_OPTICAL, TransformBuffer, pose_from
+
+    a, b = sessions
+    camera = cam.LiveCamera(a, source(), "t/posed/color", fmt="lavfi", frame_id="webcam", pose=(0, 0, 1.5, 0, 10, 0))
+    images = ImageSubscriber(b, "t/posed/color", transport="raw", camera_info=True)
+    history = FrameHistory(images, 10)
+    thread, errors = run_in_thread(camera)
+    transforms = None
+    try:
+        wait_until(lambda: images.camera_info is not None and history.stamps(), timeout=10.0)
+        frame = history.at(max(history.stamps()))
+        assert frame.header.frame_id == images.camera_info.header.frame_id == "webcam_optical"
+        transforms = TransformBuffer(b, "t/posed")
+        assert np.allclose(transforms.lookup(topics.WORLD, frame.header.frame_id, frame.stamp_ns, 5.0),
+                           pose_from(0, 0, 1.5, 0, 10, 0) @ BODY_FROM_OPTICAL)
+    finally:
+        if transforms is not None:
+            transforms.close()
+        history.close()
+        camera.stop()
+        thread.join(5.0)
+    assert not errors
+
+
 def test_a_calibration_file_of_the_delivered_size(sessions, tmp_path):  # noqa: F811
     from xblick.msg import CameraInfo
 

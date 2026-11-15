@@ -38,7 +38,7 @@ every GPU of its host.
 
 | Topic | Type | Content | Sent |
 | --- | --- | --- | --- |
-| `<camera>/tf_static` | `tf2_msgs/msg/TFMessage` | the fixed transforms between the camera's frames, for example depth to colour. Same role as `/tf_static` in ROS. | once, and answered when queried by later subscribers |
+| `<camera>/tf_static` | `tf2_msgs/msg/TFMessage` | the fixed transforms between the camera's frames, for example depth to colour, and a fixed camera's pose in `world` (`xblick cam --pose`: `world` to the body frame to `<body>_optical`). Same role as `/tf_static` in ROS. | once, and answered when queried by later subscribers |
 | `<camera>/tf` | `tf2_msgs/msg/TFMessage` | the pose of the camera in the world. Parent frame `world`, child a frame of the camera's streams. | one message per image, with the stamp of the image |
 | `<camera>/imu` | `sensor_msgs/msg/Imu` | one message per sample | on request |
 | `<camera>/diagnostics` | `diagnostic_msgs/msg/DiagnosticArray` | one status for each program that publishes for the camera. The attachment names the sending session (`zid`). | about once per second |

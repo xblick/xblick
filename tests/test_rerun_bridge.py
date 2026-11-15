@@ -423,6 +423,32 @@ def test_static_transforms_place_the_streams(sessions):  # noqa: F811
     color.close()
 
 
+def test_a_fixed_cameras_pose_places_it_in_the_world(sessions):  # noqa: F811
+    """A fixed camera's pose on its tf_static (xblick cam --pose: world -> body -> optical): its stream sits at the
+    optical frame's pose in the world, and the scene is drawn z up."""
+    from xblick.poses import BODY_FROM_OPTICAL, fixed_camera_transforms, pose_from
+
+    a, b = sessions
+    color_base = f"{CAMERA}/color"
+    color = CameraPublisher(a, color_base, encoding="rgb8", frame_id="cam_optical",
+                            camera_info=CameraInfo.pinhole(64, 48, 50.0, 50.0, 31.5, 23.5, frame_id="cam_optical"))
+    transforms = StaticTransformPublisher(a, CAMERA, fixed_camera_transforms("cam", pose_from(1, 0, 1.5, 0, 10, 0), 0))
+    rr = FakeRerun()
+    bridge = RerunBridge(b, rr, [color_base])
+    wait_until(lambda: color.subscribed)
+    time.sleep(0.3)
+    color.publish(pattern())
+    wait_until(lambda: color_base in {e for e, *_ in of(rr, "Transform3D")} or bridge._error is not None)
+    bridge.check()
+    fields = [f for e, _, f, _ in of(rr, "Transform3D") if e == color_base][-1]
+    expected = pose_from(1, 0, 1.5, 0, 10, 0) @ BODY_FROM_OPTICAL
+    assert np.allclose(fields["mat3x3"], expected[:3, :3]) and np.allclose(fields["translation"], expected[:3, 3])
+    assert ("/", "ViewCoordinates", {"xyz": "RFU"}, None) in rr.logged
+    bridge.close()
+    transforms.close()
+    color.close()
+
+
 def test_imu_and_diagnostics(sessions):  # noqa: F811
     a, b = sessions
     depth_base = f"{CAMERA}/depth"

@@ -284,7 +284,7 @@ The controller side, for a simulation that takes the controller's place, is `Com
 | `xblick.paths` | `cache_dir`, `data_dir`, `config_dir` of a node; `expand_path` for paths on a node's command line | [Where files are](files.md) |
 | `xblick.view` | `xblick view`: streams as MJPEG over HTTP (`View`, `to_jpeg`) | [Streams in a browser or VLC](../guides/view.md) |
 | `xblick.parameters` | parameters of a node; `declare_options` makes a node's command-line options its parameters | [Parameters](parameters.md) |
-| `xblick.poses` | poses of a camera or a robot at the stamp of an image, rotations and quaternions | |
+| `xblick.poses` | `TransformBuffer.lookup`: a transform between a camera's frames at the stamp of an image, from its `tf_static` and `tf` (`TransformError` if there is none); a robot's poses; a fixed camera's transforms (`pose_from`, `fixed_camera_transforms`); rotations and quaternions | [Writing nodes](../guides/writing-nodes.md), [Live cameras](../guides/cam.md#a-fixed-pose-in-the-room) |
 | `xblick.rectify` | `rectify_map(info)`: the rectification map of a CameraInfo, as `cv2.initUndistortRectifyMap` gives it; `rectified_info(info)`: the CameraInfo of the rectified image | [C++](cpp-api.md#rectify-an-image) |
 | `xblick.robot`, `sim`, `controller` | robot state, simulated worlds, the controller link | [Topics](topics.md) |
 | `xblick.recording`, `video` | recording and playback | [Recording](../guides/recording.md) |
