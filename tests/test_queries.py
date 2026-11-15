@@ -933,6 +933,7 @@ def test_an_expired_command_is_not_executed(network, server, tmp_path):
         node.declare("x", 0.0, write=writes.append)
         read_key, key, payload = "t/exp/node/list_parameters", f"t/exp/node/{SET}", set_request("x", 1.0)
     else:
+        pytest.importorskip("mcap")  # the record it refuses needs it (xblick[record])
         node = recording.Recorder(network.server, tmp_path, name="exp")
         read_key, key, payload = "xblick/exp/status", "xblick/exp/control", json.dumps({"command": "record"})
     try:
@@ -1304,6 +1305,7 @@ def test_a_node_the_set_is_not_meant_for_refuses_before_its_own_checks(network):
 def test_the_recorder_checks_the_deadline_inside_its_lock(network, tmp_path):
     """The recorder's deadline check comes after the waits before an effect: a record held up by the recorder's lock
     until the caller gave up (NoAnswer) is refused once it gets the lock, and nothing is recorded."""
+    pytest.importorskip("mcap")  # a record needs it (xblick[record]) before it takes the lock
     rec = recording.Recorder(network.server, tmp_path, name="lk")
     try:
         with network.new_session() as s:

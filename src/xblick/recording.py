@@ -429,7 +429,8 @@ class Recorder:
                 print(f"{self.prog}: refused: {refused}", flush=True)
                 refuse(query, refused)
                 return
-            except Exception as error:  # noqa: BLE001 - no input may leave a query without a reply
+            except BaseException as error:  # noqa: BLE001 - nothing may leave a query without a reply; in this thread
+                # also SystemExit (record without the mcap package): it would end only this thread, unanswered
                 query.reply_err(f"{control_key(self.name)}: {type(error).__name__}: {error}")
                 return
             query.reply(control_key(self.name), json.dumps(reply), encoding=zenoh.Encoding.APPLICATION_JSON,
