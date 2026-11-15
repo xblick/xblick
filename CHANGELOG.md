@@ -11,6 +11,28 @@ Each version below is a heading with its release notes: one summary sentence, th
 (and Known limit), one line on compatibility. `tools/release_notes.sh <version>` prints a version's notes for its
 GitHub release. The rule is in [Development](docs/project/development.md#release-notes).
 
+## 0.5.10
+
+The terminal interface's Rerun tab lists everything `xblick rerun` can show as an entry of its own, and the selection of a running `xblick rerun` changes without touching the viewer's layout.
+
+### Added
+- `xblick rerun --bodies KEY`, `--imu KEY` and `--diagnostics KEY` name body tracking results, a camera's IMU and its diagnostics; `--no-transforms CAMERA` leaves out a camera's `tf_static` and `tf` ([viewer guide](docs/guides/viewer.md#choose-what-it-shows)).
+- The selection of `xblick rerun` is a set of live parameters of its node `xblick/rerun` (`--name`): a set subscribes to a new topic and unsubscribes from a removed one at once; `drawn_over` names the images each result is drawn over ([viewer guide](docs/guides/viewer.md#change-the-selection-while-it-runs)).
+- Rerun tab: a tree by camera and node, one entry per stream, result, transforms, IMU, diagnostics and pose topic, each with a note on what the viewer makes of it, such as "drawn over color" ([guide](docs/guides/tui.md#rerun)).
+- Rerun tab: while `xblick rerun` runs, a change of the marks applies at once and the options are fixed.
+
+### Changed
+- `xblick rerun` with a selection shows only what it names: a camera's bodies, IMU and diagnostics no longer come with its streams, its transforms still do. `--detections`, `--segmentation` and `--trajectory` alone are a selection. Without arguments it shows everything found, as before.
+- `xblick rerun` sends the viewer its layout once, 2 s after the start (`--layout-after`). A topic added later appears in the viewer's data, and nothing the user arranged moves.
+- Rerun tab: a camera's transforms are marked with its first entry and can be unmarked; a marked entry whose publisher ended says "gone since" with the time.
+- Rerun tab: the header above the list counts what was found and says when it was updated and how often it updates; "Look again" is "Update list now" (`r`); the right side is headed "Options of xblick rerun".
+
+### Fixed
+- `xblick play --loop` reported a position that went down from report to report: the line names the pass, and the position is within it (#14).
+- Graph tab: a selection that arrived while the interface ended raised an error.
+
+Works with programs of 0.5.0 and later; nothing on the wire changed. Presets of earlier versions load; a preset saved now needs 0.5.10.
+
 ## 0.5.9
 
 Every program declares itself on the network, the terminal interface's Nodes and Graph tabs show programs and names by router, and `xblick cam` offers a GPU ring.
