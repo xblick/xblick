@@ -19,6 +19,15 @@
 // <namespace>/<name>/parameters. A change is checked against the descriptor (type, range and step, choices,
 // read_only: "read-only: applies at the next start"), then given to the parameter's writer, which may fail with a
 // reason; the event has every value that differs after it (a write may change another parameter).
+//
+// With a session that takes part in ROS 2 (--ros, ros.hpp) the node is the ROS node /<namespace>/<name> as well: the
+// six services on rmw_zenoh's keys (complete queryables, answered in Zenoh's thread and dropped at once) and its events
+// on ROS's /parameter_events, so that ros2 param works on it. Reads are answered. A ROS client's set is refused (every
+// parameter with "sets through ROS 2 are off on this node ...") unless the session was started with
+// --ros-params-writable; then it is executed unchecked (ROS has no node and no deadline: no CommandQuery) and
+// uncounted (every node of the name executes it), while --params-read-only, read-only parameters, types, ranges and
+// choices apply as always. A call without ROS's attachment or with a request that does not decode gets an error
+// reply. As Python's Parameters (docs/integrations/ros2.md).
 #pragma once
 
 #include <cstdint>
@@ -34,6 +43,7 @@
 #include <zenoh.hxx>
 
 #include "xblick/msg.hpp"
+#include "xblick/ros.hpp"
 
 namespace xblick
 {
@@ -166,6 +176,8 @@ namespace xblick
         std::optional<std::string> refusal(const Parameter& p, bool local) const;
         void publish_event(const std::vector<Parameter>& added, const std::vector<Parameter>& changed);
         void answer(const std::string& service, const zenoh::Query& query);
+        // A ROS client's call on ROS's key (--ros): parameters.cpp has the rules.
+        void answer_ros(const std::string& service, const ros::Service& server, const zenoh::Query& query);
 
         std::string key_, name_;
         std::string zid_;  // the session's Zenoh id: names this node in its replies (commands)
@@ -178,6 +190,12 @@ namespace xblick
         std::optional<zenoh::Publisher> events_;
         std::vector<zenoh::Queryable<void>> queryables_;
         std::optional<zenoh::LivelinessToken> token_;
+        // --ros: the ROS node /<namespace>/<name>, its six parameter services on ROS's keys, its events on
+        // /parameter_events (null without --ros)
+        bool ros_params_writable_ = false;
+        std::unique_ptr<ros::RosNode> ros_node_;
+        std::vector<std::unique_ptr<ros::Service>> ros_services_;
+        std::unique_ptr<ros::Publisher> ros_events_;
     };
 
     // Another node's parameters over Zenoh (key: its <namespace>/<name>): each call queries <key>/<service>; throws

@@ -9,6 +9,7 @@ xblick-points in it (a build with XBLICK_POINTS) and a GPU."""
 
 import json
 import os
+import re
 import subprocess
 import time
 
@@ -17,11 +18,15 @@ import pytest
 
 from xblick import _core, ros
 from xblick.camera import (CameraPublisher, ImageSubscriber, StaticTransformSubscriber, TransformSubscriber)
-from xblick.msg import CameraInfo
+from xblick.encodings import numpy_to_image
+from xblick.msg import CameraInfo, Header, Parameter, ParameterValue, SetParametersRequest, Time
+from xblick.parameters import READ_ONLY_ACCESS, ROS_SETS_OFF, ParameterClient
 from xblick.points import PointCloudSubscriber
-from xblick.session import RosOptions, open_session
+from xblick.session import RosOptions, open_session, replies
 
 from test_cpp_interop import BUILD, H, W, checksum, cloud_pattern, first_frame, free_port, pattern, tool
+from test_ros_parameters import ros_set
+import test_ros_live as live
 
 pytestmark = pytest.mark.skipif(not BUILD, reason="XBLICK_CPP_BUILD (the C++ build directory) is not set")
 
@@ -343,3 +348,204 @@ def test_cpp_ros_options_refused():
         done = subprocess.run([tool("xblick-cpp-camera"), "--listen", f"127.0.0.1:{free_port()}", "--seconds", "1",
                                *argv], capture_output=True, text=True, timeout=30)
         assert done.returncode == 1 and "xblick-cpp-camera:" in done.stderr, (argv, done.stderr)
+
+
+# ------------------------------------------------------------------- C++ Parameters as a ROS node's (command path)
+
+NODE = "rc/cpp/cpp_camera"  # xblick-cpp-camera --params: fps, pattern.shift (refuses 13), pattern.auto_shift, codec
+
+
+def test_cpp_parameters_are_a_ros_node(tmp_path):
+    """The C++ node's parameters: the ROS node /rc/cpp/cpp_camera with the six services (rcl_interfaces, QoS of
+    ROS's parameters), read through ROS's keys by our ROS client; sets refused by default with Python's reason."""
+    camera = CppCamera(tmp_path, "--params", "--ros", "--ros-domain", DOMAIN)
+    reader = camera.ros_session()
+    client = ParameterClient(reader, NODE, timeout=5.0, ros=True)
+    try:
+        wait_until(lambda: sum(ros.parse_token(t).kind == ros.SERVICE for t in camera.tokens) == 6)
+        parsed = [ros.parse_token(t) for t in camera.tokens]
+        services = {t.topic: t for t in parsed if t.kind == ros.SERVICE}
+        assert set(services) == {f"/{NODE}/{s}" for s in ("list_parameters", "describe_parameters", "get_parameters",
+                                                          "get_parameter_types", "set_parameters",
+                                                          "set_parameters_atomically")}
+        assert all(t.qos == ros.PARAMETERS_QOS and t.type_name.startswith("rcl_interfaces/srv/")
+                   for t in services.values())
+        assert any(t.kind == ros.NODE and t.fully_qualified_node == f"/{NODE}" for t in parsed)
+        assert sorted(client.list()) == ["codec", "fps", "pattern.auto_shift", "pattern.shift"]
+        assert [v.value() for v in client.get(["fps", "codec"])] == [20.0, "jpeg"]
+        assert client.describe(["codec"])[0].read_only
+        (result,) = client.set({"fps": 10.0})
+        assert not result.successful and result.reason == ROS_SETS_OFF
+        assert not client.set_atomically({"fps": 10.0}).successful
+        assert ParameterClient(camera.observer, NODE).get(["fps"])[0].value() == 20.0  # nothing changed
+    finally:
+        client.close()
+        reader.close()
+        camera.close()
+
+
+def test_cpp_parameters_writable_through_ros(tmp_path):
+    """With --ros-params-writable a ROS client's sets are executed (unchecked: no node, no deadline), each
+    parameter's checks and its writer apply, and the change is an event on ROS's /parameter_events."""
+    camera = CppCamera(tmp_path, "--params", "--ros", "--ros-domain", DOMAIN, "--ros-params-writable")
+    reader = camera.ros_session()
+    client = ParameterClient(reader, NODE, timeout=5.0, ros=True)
+    events = []
+    client.on_event(events.append)
+    ours = ParameterClient(camera.observer, NODE)
+    try:
+        (result,) = client.set({"fps": 10.0})
+        assert result.successful and not client.last_checked
+        assert ours.get(["fps"])[0].value() == 10.0
+        (refused,) = client.set({"pattern.shift": 13})
+        assert not refused.successful and refused.reason == "the camera refused 13"
+        (refused,) = client.set({"codec": "png"})
+        assert not refused.successful and "read-only" in refused.reason
+        assert not client.set_atomically({"fps": 200.0}).successful and ours.get(["fps"])[0].value() == 10.0
+        wait_until(lambda: any(p.name == "fps" for e in events for p in e.changed_parameters))
+    finally:
+        client.close()
+        reader.close()
+        camera.close()
+
+
+def test_cpp_read_only_access_holds_on_the_ros_path(tmp_path):
+    camera = CppCamera(tmp_path, "--params", "--params-read-only", "--ros", "--ros-domain", DOMAIN,
+                       "--ros-params-writable")
+    reader = camera.ros_session()
+    try:
+        time.sleep(1.0)
+        (answer,) = ros_set(reader, NODE, "fps", 10.0, timeout=5.0)
+        assert not answer.results[0].successful and answer.results[0].reason == READ_ONLY_ACCESS
+        assert ParameterClient(camera.observer, NODE).get(["fps"])[0].value() == 20.0
+    finally:
+        reader.close()
+        camera.close()
+
+
+def test_cpp_malformed_ros_requests_are_refused_and_it_goes_on(tmp_path):
+    """A ROS call without ROS's attachment, with CDR that does not decode, or with an empty payload: one error reply
+    each, nothing changed; the node answers afterwards on both paths."""
+    camera = CppCamera(tmp_path, "--params", "--ros", "--ros-domain", DOMAIN, "--ros-params-writable")
+    reader = camera.ros_session()
+    client = reader.ros.node.client(f"/{NODE}/set_parameters", "rcl_interfaces/srv/SetParameters")
+    try:
+        wait_until(lambda: client.matched)
+        good = client.request_options(SetParametersRequest([Parameter("fps", ParameterValue.of(10.0))]).serialize())
+        no_attachment = {k: v for k, v in good.items() if k != "attachment"}
+        bad_cdr = dict(client.request_options(b"\x00\x01\x00\x00\xff"))
+        for options in (no_attachment, bad_cdr, {**client.request_options(b""), "payload": b""}):
+            answers = replies(reader, client.key, 2.0, **options)
+            assert [r.err is not None for r in answers] == [True], answers
+        assert ParameterClient(camera.observer, NODE).get(["fps"])[0].value() == 20.0
+        assert ParameterClient(reader, NODE, timeout=5.0, ros=True).get(["fps"])[0].value() == 20.0
+        assert camera.proc.poll() is None
+    finally:
+        client.close()
+        reader.close()
+        camera.close()
+
+
+# ---------------------------------------------------------------- live: against ROS 2 Jazzy's programs (rmw_zenoh)
+
+JAZZY, LIVE_DOMAIN, run = live.JAZZY, live.DOMAIN, live.run
+ros_env, rosprobe = live.ros_env, live.rosprobe  # its fixtures: ROS's router on a free port, rosprobe built with g++
+
+needs_jazzy = pytest.mark.skipif(not (JAZZY / "lib/rmw_zenoh_cpp/rmw_zenohd").exists(),
+                                 reason="needs ROS 2 Jazzy with rmw_zenoh_cpp in /opt/ros/jazzy")
+
+
+class CppOnRouter:
+    """A C++ program with --ros on ROS's router (rmw_zenohd of ros_env), ended by SIGTERM."""
+
+    def __init__(self, port: int, program: str, *args, ready: bool = True):
+        self.proc = subprocess.Popen([tool(program), "--connect", f"127.0.0.1:{port}", "--ros", "--ros-domain",
+                                      str(LIVE_DOMAIN), *map(str, args)], stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL, text=True)
+        if ready:
+            assert self.proc.stdout.readline().strip() == "ready"
+
+    def close(self):
+        if self.proc.poll() is None:
+            self.proc.terminate()
+        self.proc.wait(10)
+
+
+def camera_args(*extra):
+    return ["--base", "live/cpp/color", "--encoding", "rgb8", "--size", W, H, "--fps", "20", "--seconds", "90", *extra]
+
+
+@needs_jazzy
+def test_rclcpp_reads_the_cpp_camera(ros_env, rosprobe):
+    env, port = ros_env
+    camera = CppOnRouter(port, "xblick-cpp-camera", *camera_args())
+    try:
+        # camera_info goes out with the frames, which the camera renders while somebody takes images (subscribed)
+        reading = subprocess.Popen([str(rosprobe), "sub", "/live/cpp/color/image_raw", "sensor_msgs/msg/Image", "15"],
+                                   env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        info = run(env, [str(rosprobe), "sub", "/live/cpp/color/camera_info", "sensor_msgs/msg/CameraInfo", "2"], 30)
+        jpeg = run(env, [str(rosprobe), "sub", "/live/cpp/color/image_raw/compressed",
+                         "sensor_msgs/msg/CompressedImage", "2"], 30)
+        image, _ = reading.communicate(timeout=60)
+    finally:
+        if reading.poll() is None:
+            reading.terminate()
+            reading.wait(10)
+        camera.close()
+    totals = [int(re.search(r"TOTAL (\d+)", out)[1]) for out in (image, info, jpeg)]
+    assert min(totals) > 3, (totals, image[-1000:])
+    assert b"TestCamera".hex() in image  # the frame id in the bytes rclcpp got
+
+
+@needs_jazzy
+def test_cpp_tf_static_to_a_late_ros_listener(ros_env):
+    """The C++ camera's /tf_static, put once at its start, reaches tf2_echo started later (the cache's stand-in)."""
+    env, port = ros_env
+    camera = CppOnRouter(port, "xblick-cpp-camera", *camera_args("--tf"))
+    try:
+        time.sleep(1.0)
+        out = run(env, [str(JAZZY / "lib/tf2_ros/tf2_echo"), "world", "TestCamera"], 6)
+    finally:
+        camera.close()
+    assert "Translation: [1.000, 2.000, 3.000]" in out, out[-2000:]
+
+
+@needs_jazzy
+@pytest.mark.parametrize("writable", [False, True])
+def test_ros_parameter_client_on_the_cpp_node(ros_env, rosprobe, writable):
+    env, port = ros_env
+    camera = CppOnRouter(port, "xblick-cpp-camera",
+                         *camera_args("--params", *(["--ros-params-writable"] if writable else [])))
+    try:
+        listed = run(env, [str(rosprobe), "params", "/live/cpp/cpp_camera", "list"], 30)
+        got = run(env, [str(rosprobe), "params", "/live/cpp/cpp_camera", "get", "pattern.shift"], 30)
+        set_shift = run(env, [str(rosprobe), "params", "/live/cpp/cpp_camera", "set", "pattern.shift", "42"], 30)
+        set_13 = run(env, [str(rosprobe), "params", "/live/cpp/cpp_camera", "set", "pattern.shift", "13"], 30)
+    finally:
+        camera.close()
+    assert "NAME fps" in listed and "NAME pattern.shift" in listed, listed[-2000:]
+    assert "VALUE pattern.shift 0" in got, got[-2000:]
+    if writable:
+        assert "SET 1" in set_shift and "SET 0 the camera refused 13" in set_13, set_shift + set_13
+    else:
+        assert f"SET 0 {ROS_SETS_OFF}" in set_shift and "SET 0" in set_13, set_shift + set_13
+
+
+@needs_jazzy
+def test_cpp_probe_reads_a_ros_image(ros_env, rosprobe):
+    env, port = ros_env
+    picture = np.arange(4 * 6 * 3, dtype=np.uint8).reshape(4, 6, 3)
+    payload = bytes(numpy_to_image(picture, "rgb8", Header(Time(5, 0), "ros_cam")).serialize())
+    publisher = subprocess.Popen([str(rosprobe), "pub", "/live/roscam/image_raw", "sensor_msgs/msg/Image",
+                                  payload.hex(), "60"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    probe = CppOnRouter(port, "xblick-cpp-probe", "--base", "live/roscam", "--transport", "ros", "--frames", "2",
+                        "--timeout", "20", ready=False)
+    try:
+        out, _ = probe.proc.communicate(timeout=60)
+    finally:
+        probe.close()
+        publisher.terminate()
+        publisher.wait(10)
+    lines = [json.loads(line) for line in out.splitlines()]
+    assert probe.proc.returncode == 0 and len(lines) == 2, out
+    assert all(line["checksum"] == checksum(picture) and line["width"] == 6 and line["seq"] == -1 for line in lines)

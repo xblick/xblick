@@ -743,7 +743,9 @@ def test_a_command_reaches_every_queryable_of_its_key():
     ros_keys_only = {"src/xblick/ros.py": {
         "self._declared = self._raw.declare_queryable(self.key, complete=True)": 1,
         "self._declared = self._raw.declare_querier(self.key, target=zenoh.QueryTarget.ALL_COMPLETE)": 1,
-        'return {"payload": bytes(payload), "target": zenoh.QueryTarget.ALL_COMPLETE,': 1}}
+        'return {"payload": bytes(payload), "target": zenoh.QueryTarget.ALL_COMPLETE,': 1},
+        # C++ (ros.hpp): ros::Service, whose entities refuse a key that does not start with the domain id (ros::Entity)
+        "cpp/src/ros.cpp": {"options.complete = true;  // ROS clients query with target ALL_COMPLETE (ros.hpp)": 1}}
     found, allowed = [], {}
     for f in files:
         name = str(f.relative_to(root))
