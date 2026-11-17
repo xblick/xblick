@@ -725,7 +725,12 @@ def test_a_command_reaches_every_queryable_of_its_key():
     """"Sent once to each queryable of its key" holds because Zenoh's default query target (BestMatching) delivers a
     query to every matching queryable while none of them is declared complete. Pinned in the sources: no Durchblick
     queryable sets ``complete`` and no query sets a ``target``. The behaviour itself, two queryables that both get a
-    command, is pinned by test_a_second_torque_step_server_without_parameters_gets_the_step."""
+    command, is pinned by test_a_second_torque_step_server_without_parameters_gets_the_step.
+
+    One exception, on ROS 2's keys only (``--ros``, ros.py): a ROS service is a complete queryable and a ROS client
+    queries with target ALL_COMPLETE, as rmw_zenoh does, because ROS's clients reach no other queryable. ROS's keys
+    (``<domain>/<name>/<pkg>::srv::dds_::<Name>_/RIHS01_<hash>``) never match one of our keys, so no query on our keys
+    meets a complete queryable. Exactly these lines of ros.py are allowed."""
     import re
     from pathlib import Path
 
@@ -734,8 +739,13 @@ def test_a_command_reaches_every_queryable_of_its_key():
     assert len(files) > 20
     pattern = re.compile(r"\bcomplete\s*=(?!=)|\.complete\b|QueryTarget|query_target|Z_QUERY_TARGET|\.target\s*=(?!=)|"
                          r"\btarget\s*=\s*zenoh")
+    ros_keys_only = {"src/xblick/ros.py": {
+        "self._declared = self._raw.declare_queryable(self.key, complete=True)",
+        "self._declared = self._raw.declare_querier(self.key, target=zenoh.QueryTarget.ALL_COMPLETE)",
+        'return {"payload": bytes(payload), "target": zenoh.QueryTarget.ALL_COMPLETE,'}}
     found = [f"{f.relative_to(root)}:{n}: {line.strip()}" for f in files
-             for n, line in enumerate(f.read_text().splitlines(), 1) if pattern.search(line)]
+             for n, line in enumerate(f.read_text().splitlines(), 1) if pattern.search(line)
+             and line.strip() not in ros_keys_only.get(str(f.relative_to(root)), ())]
     assert found == [], "\n".join(found)
 
 

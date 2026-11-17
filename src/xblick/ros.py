@@ -685,8 +685,10 @@ class RosService(_Entity):
 
 
 class RosClient(_Entity):
-    """A ROS service client: ``call(payload, timeout)`` sends one request (target ALL_COMPLETE, as rmw_zenoh) and
-    returns the replies as they came (session.replies). ``matched``: a service of the key is known."""
+    """A ROS service client, as rmw_zenoh's: its token, and ``request_options(payload)``, the options of one request's
+    query (target ALL_COMPLETE, which reaches ROS's complete service queryables and no other, and ROS's attachment
+    with a sequence number of its own), for session.replies or session.command. ``matched``: a service of the key is
+    known."""
 
     def __init__(self, node: RosNode, name: str, type_name: str, qos: Qos = PARAMETERS_QOS):
         super().__init__(node, CLIENT, name, type_name, qos)
@@ -699,9 +701,10 @@ class RosClient(_Entity):
     def matched(self) -> bool:
         return self._declared.matching_status.matching
 
-    def call(self, payload, timeout: float) -> list:
-        from .session import replies
+    def request_options(self, payload) -> dict:
+        """A new request's options: each request its own sequence number (a ROS service refuses a second pending
+        request of one client with the same number)."""
         with self._seq_lock:
             seq = next(self._seq)
-        return replies(self._raw, self.key, timeout, payload=bytes(payload), target=zenoh.QueryTarget.ALL_COMPLETE,
-                       attachment=encode_attachment(seq, time.time_ns(), self.gid))
+        return {"payload": bytes(payload), "target": zenoh.QueryTarget.ALL_COMPLETE,
+                "attachment": encode_attachment(seq, time.time_ns(), self.gid)}
