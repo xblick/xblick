@@ -11,6 +11,27 @@ Each version below is a heading with its release notes: one summary sentence, th
 (and Known limit), one line on compatibility. `tools/release_notes.sh <version>` prints a version's notes for its
 GitHub release. The rule is in [Development](docs/project/development.md#release-notes).
 
+## Branch ros2 (not released)
+
+With `--ros`, a program also takes part in ROS 2 Jazzy on `rmw_zenoh`: ROS nodes see its streams, transforms and
+parameters, and it reads theirs.
+
+### Added
+
+- `--ros`, `--ros-domain` and `--ros-node` in every command and in every node that opens its session with `open_from_args`, and as read-only node parameters.
+- With `--ros`: images, camera_info, JPEG and PNG compressed images, point clouds, detections, diagnostics and robot state on ROS's keys, while a ROS subscriber is there.
+- With `--ros`: transforms on ROS's global `/tf` and `/tf_static`, the static ones also for ROS subscribers that start later; a frame with two parents in one program is one error line.
+- With `--ros`: each node's parameters as a ROS node's services, so that `ros2 param` works; `xblick param --via-ros` and `ParameterClient(ros=True)` for a ROS node's parameters.
+- Readers of ROS topics: transport `ros` for images and clouds (`xblick hz`, `xblick snapshot`), `DetectionSubscriber(ros_type=...)`, `TransformBuffer(ros=True)`.
+- The guide [Durchblick and ROS 2](docs/integrations/ros2.md) and the protocol's section on `rmw_zenoh`.
+
+### Known limit
+
+- A set by a ROS client carries no node and no deadline, so the node executes it without these checks.
+- The C++ API and programs have no `--ros` yet.
+
+Compatible with 0.5.14: without `--ros` no byte on the wire changes.
+
 ## 0.5.14
 
 `xblick play` gives each of any number of videos its own camera, calibration and pose, so that two videos make a
