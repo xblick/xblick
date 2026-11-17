@@ -339,8 +339,11 @@ def test_a_nodes_options_as_parameters():
     names = params.declare_options(parser, args, live={"threshold": {"range": (0.0, 1.0, 0.05)},
                                                         "max_hz": {"default": 0.0, "unit": "frames/s"}})
     params.check_overrides()
-    # every option but argparse's, the parameters' own and the connection's
-    assert set(names) == {"camera", "threshold", "words", "checkpoint", "gpu", "mode", "out", "no_depth", "max_hz"}
+    # every option but argparse's, the parameters' own and the connection's; the ROS options too (read-only: they
+    # say whether and how the node takes part in ROS 2)
+    assert set(names) == {"camera", "threshold", "words", "checkpoint", "gpu", "mode", "out", "no_depth", "max_hz",
+                          "ros", "ros_domain", "ros_node"}
+    assert params["ros"] is False and params.descriptor("ros").read_only
     # a value given at the start reaches args, with the option's type
     assert (args.gpu, args.threshold, args.checkpoint, args.out) == (3, 0.7, "/w.pt", Path("/tmp/out"))
     assert args.max_hz is None  # the live stand-in for None given back as None

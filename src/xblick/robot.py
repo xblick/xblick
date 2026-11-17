@@ -35,13 +35,13 @@ class RobotStatePublisher:
         self.source = source
         self._session = session
         self._joint_states = self._publisher(topics.joint_states(robot), JointState)
-        self._tf = self._publisher(topics.tf(robot), TFMessage)
+        self._tf = self._publisher(topics.tf(robot), TFMessage, ros_tf=True)  # with --ros: ROS's /tf
         self._odom = self._publisher(topics.odom(robot), Odometry)
         self._wrenches: dict[str, CountedPublisher] = {}
 
-    def _publisher(self, key: str, message_type: type) -> CountedPublisher:
+    def _publisher(self, key: str, message_type: type, ros_tf: bool = False) -> CountedPublisher:
         return CountedPublisher(self._session, key, cdr_encoding(message_type), blocking=self.blocking,
-                                source=self.source)
+                                source=self.source, ros_tf=ros_tf)
 
     @property
     def keys(self) -> list[str]:

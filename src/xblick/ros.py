@@ -485,6 +485,8 @@ class Ros:
         self._ids = itertools.count()
         self._lock = threading.Lock()
         self._nodes: list[RosNode] = []
+        self._tf_parents: dict[str, str] = {}  # child frame -> parent, of what this program sent to /tf, /tf_static
+        self._tf_clashes: set[str] = set()     # frames said already
         self.node = self.add_node(node, namespace)
 
     def next_id(self) -> str:
@@ -502,6 +504,56 @@ class Ros:
             nodes, self._nodes = self._nodes, []
         for node in nodes:
             node.close()
+
+    def check_tf(self, payload, static: bool):
+        """One error line per frame that this program gives two parents on ROS's /tf and /tf_static (tf2 takes one
+        parent per frame: frame names must be unique across cameras and robots). The transforms still go out: a
+        consumer sees the clash too."""
+        from .msg import TFMessage
+        try:
+            transforms = TFMessage.deserialize(bytes(payload)).transforms
+        except Exception as error:  # noqa: BLE001 - a payload of ours that does not decode: said, not raised
+            log.error(f"/tf{'_static' if static else ''}: a message that is no TFMessage ({error})")
+            return
+        with self._lock:
+            for t in transforms:
+                child, parent = t.child_frame_id, t.header.frame_id
+                known = self._tf_parents.setdefault(child, parent)
+                if known != parent and child not in self._tf_clashes:
+                    self._tf_clashes.add(child)
+                    log.error(f"ROS tf: frame {child!r} has parent {known!r} and parent {parent!r} in this program; "
+                              "tf2 takes one parent per frame: give each camera and robot frame names of its own "
+                              "(--frame-id)")
+
+
+def mirror(session, key: str, encoding, topic: str | None = None, qos: Qos = STREAM_QOS) -> RosPublisher | None:
+    """The ROS publisher that mirrors one of our keys when ``session`` takes part in ROS (``--ros``), else None.
+    ``encoding``: the key's Zenoh encoding (``application/cdr;<ROS type>``); ``topic``: ROS's topic, by default the
+    key's (``topic_of``). A key whose type ROS has no hash for (Durchblick's own types, JSON, moveit_msgs) is not
+    offered: one warning line, None. RosError for a key that is no ROS name."""
+    taking_part = getattr(session, "ros", None)
+    if taking_part is None:
+        return None
+    topic = topic or topic_of(key)
+    schema = str(encoding).partition(";")
+    type_name = schema[2] if schema[0] == "application/cdr" else ""
+    if not type_name or "@" in type_name or type_name not in TYPE_HASHES:
+        log.warning(f"{key}: not offered to ROS ({type_name or str(encoding)} has no ROS type hash here)")
+        return None
+    return taking_part.node.publisher(topic, type_name, qos)
+
+
+def mirror_tf(session, static: bool = False) -> RosPublisher | None:
+    """The publisher on ROS's global ``/tf`` (``/tf_static`` with ``static``, transient local) when ``session`` takes
+    part in ROS, else None. Its ``put`` checks the frames for a second parent (``Ros.check_tf``)."""
+    taking_part = getattr(session, "ros", None)
+    if taking_part is None:
+        return None
+    from .msg import TFMessage
+    publisher = taking_part.node.publisher("/tf_static" if static else "/tf", TFMessage.TYPE,
+                                           TF_STATIC_QOS if static else TF_QOS)
+    publisher.check = lambda payload: taking_part.check_tf(payload, static)
+    return publisher
 
 
 class RosNode:
@@ -601,6 +653,7 @@ class RosPublisher(_Entity):
 
     def __init__(self, node: RosNode, topic: str, type_name: str, qos: Qos = STREAM_QOS):
         super().__init__(node, PUBLISHER, topic, type_name, qos)
+        self.check = None  # called with each payload before it goes out (mirror_tf: the frames' parents)
         self._seq = itertools.count(1)
         self._seq_lock = threading.Lock()
         if qos.durability == TRANSIENT_LOCAL:
@@ -621,6 +674,8 @@ class RosPublisher(_Entity):
         return self._declared.matching_status.matching
 
     def put(self, payload):
+        if self.check is not None:
+            self.check(payload)
         with self._seq_lock:
             seq = next(self._seq)
         self._declared.put(bytes(payload), attachment=encode_attachment(seq, time.time_ns(), self.gid))

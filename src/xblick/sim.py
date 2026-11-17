@@ -88,10 +88,10 @@ class SimPublisher:
         self.blocking = blocking
         self.robot = RobotStatePublisher(session, robot, blocking=blocking, source=source)
 
-        def publisher(key: str, encoding) -> CountedPublisher:
-            return CountedPublisher(session, key, encoding, blocking=blocking, source=source)
+        def publisher(key: str, encoding, ros_tf: bool = False) -> CountedPublisher:
+            return CountedPublisher(session, key, encoding, blocking=blocking, source=source, ros_tf=ros_tf)
 
-        self._bodies = publisher(topics.tf(world), cdr_encoding(TFMessage))
+        self._bodies = publisher(topics.tf(world), cdr_encoding(TFMessage), ros_tf=True)  # with --ros: ROS's /tf
         self._clock = publisher(topics.clock(world), cdr_encoding(Clock))
         self._events = publisher(topics.events(world), zenoh.Encoding.APPLICATION_JSON)
         self._command_joints = publisher(topics.command(robot, "joints"), cdr_encoding(JointState))

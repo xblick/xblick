@@ -13,7 +13,7 @@ import time
 
 import zenoh
 
-from . import topics
+from . import ros, topics
 from .camera import _attachment, _check_encoding, cdr_encoding, parse_attachment
 from .msg import DiagnosticArray, DiagnosticStatus, Header, KeyValue, Time
 
@@ -40,6 +40,9 @@ def sender(sample: zenoh.Sample) -> str | None:
 
 
 class DiagnosticsPublisher:
+    """One node's status on ``<camera>/diagnostics``; with a session with ``--ros`` on ROS 2's ``/<camera>/diagnostics``
+    too, while a ROS subscriber is there."""
+
     OK, WARN, ERROR, STALE = DiagnosticStatus.OK, DiagnosticStatus.WARN, DiagnosticStatus.ERROR, DiagnosticStatus.STALE
 
     def __init__(self, session: zenoh.Session, camera: str, name: str, hardware_id: str = ""):
@@ -48,13 +51,18 @@ class DiagnosticsPublisher:
         self.seq = 0
         self._zid = str(session.info.zid())  # in every sample: the nodes of a camera share its diagnostics key
         self._publisher = session.declare_publisher(topics.diagnostics(camera), encoding=cdr_encoding(DiagnosticArray))
+        self._ros = ros.mirror(session, topics.diagnostics(camera), cdr_encoding(DiagnosticArray))
 
     def publish(self, level: int, message: str, values: dict):
         status = DiagnosticStatus(level, self.name, message, self.hardware_id,
                                   [KeyValue(k, f"{v:.2f}" if isinstance(v, float) else str(v)) for k, v in values.items()])
         self.seq += 1
-        self._publisher.put(bytes(DiagnosticArray(Header(Time.from_ns(time.time_ns()), ""), [status]).serialize()),
-                            attachment=_attachment(self.seq, "", self._zid))
+        payload = bytes(DiagnosticArray(Header(Time.from_ns(time.time_ns()), ""), [status]).serialize())
+        self._publisher.put(payload, attachment=_attachment(self.seq, "", self._zid))
+        if self._ros is not None and self._ros.matched:
+            self._ros.put(payload)
 
     def close(self):
         self._publisher.undeclare()
+        if self._ros is not None:
+            self._ros.close()

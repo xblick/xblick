@@ -89,13 +89,18 @@ def make_config(connect: Sequence[str] = (), listen: Sequence[str] = (), mode: s
 
 def open_session(connect: Sequence[str] = (), listen: Sequence[str] = (), mode: str = "peer",
                  multicast_scouting: bool = False, config_file: str | None = None,
-                 local_router: bool = True, program: str | None = None, declare: bool = True) -> Session:
+                 local_router: bool = True, program: str | None = None, declare: bool = True,
+                 ros_options: RosOptions | None = None) -> Session:
     """A session (``make_config``). It keeps the endpoints of ``across_pcs`` for ``why_nothing``. OpenError (a
     zenoh.ZError) when Zenoh cannot open it, with a message that says why in one line.
 
     With ``declare`` (the default) the session declares its program on the network (declaration.py): ``program``
     (default ``program_name()``), its version (``declaration.program_version``), host, command line, process id and
-    start time. ``declare=False``: a session that does not (a test standing in for an older program)."""
+    start time. ``declare=False``: a session that does not (a test standing in for an older program).
+
+    ``ros_options`` (``--ros``): the session takes part in ROS 2 as well (``Session.ros``, ros.py): a ROS node of
+    that name on that domain, and the publishers, subscribers and parameters made with the session offer themselves
+    to ROS too (docs/guides/ros2.md). Without it nothing of ROS is sent."""
     from . import declaration
 
     config = make_config(connect, listen, mode, multicast_scouting, config_file, local_router)
@@ -111,7 +116,17 @@ def open_session(connect: Sequence[str] = (), listen: Sequence[str] = (), mode: 
         except BaseException:
             close(opened)
             raise
-    return Session(opened, across_pcs(connect, listen, mode, config_file), declared)
+    taking_part = None
+    if ros_options is not None:
+        from . import ros
+        try:
+            taking_part = ros.Ros(opened, ros_options.domain, ros_options.node)
+        except BaseException:
+            if declared is not None:
+                declared.close()
+            close(opened)
+            raise
+    return Session(opened, across_pcs(connect, listen, mode, config_file), declared, taking_part)
 
 
 class OpenError(zenoh.ZError):
@@ -238,6 +253,35 @@ def add_arguments(parser, prefix: str = ""):
                              "router (a router does not route between peers)")
     parser.add_argument(f"{p}config", default=None, metavar="FILE",
                         help="a Zenoh JSON5 configuration file instead of the endpoints")
+    parser.add_argument(f"{p}ros", action="store_true",
+                        help="take part in ROS 2 as well (rmw_zenoh, ROS 2 Jazzy): streams, transforms and parameters "
+                             "also on ROS's keys, as a ROS node (docs/guides/ros2.md); our keys stay as they are")
+    parser.add_argument(f"{p}ros-domain", type=int, default=None, metavar="ID",
+                        help="with --ros: the ROS domain id (default: ROS_DOMAIN_ID, else 0)")
+    parser.add_argument(f"{p}ros-node", default=None, metavar="NAME",
+                        help="with --ros: the program's ROS node name (default: the program's name, every character "
+                             "other than a letter, digit or _ written as _, e.g. xblick_cam)")
+
+
+@dataclasses.dataclass(frozen=True)
+class RosOptions:
+    """How a session takes part in ROS 2 (``--ros``, ``--ros-domain``, ``--ros-node``)."""
+
+    domain: int
+    node: str
+
+
+def ros_options_from_args(args, prefix: str = "", prog: str | None = None) -> RosOptions | None:
+    """The ROS options of a script's arguments (``add_arguments``); None without ``--ros``. ValueError (ros.RosError)
+    for a domain or node name ROS does not take, or for ``--ros-domain``/``--ros-node`` without ``--ros``."""
+    from . import ros
+    key = prefix.replace("-", "_")
+    domain, node = getattr(args, f"{key}ros_domain", None), getattr(args, f"{key}ros_node", None)
+    if not getattr(args, f"{key}ros", False):
+        if domain is not None or node is not None:
+            raise ros.RosError(f"--{prefix}ros-domain and --{prefix}ros-node need --{prefix}ros")
+        return None
+    return RosOptions(ros.domain_from(domain), ros.check_node_name(node or ros.node_name_of(prog or program_name())))
 
 
 def open_from_args(args, prefix: str = "", prog: str | None = None) -> Session:
@@ -253,11 +297,20 @@ def open_from_args(args, prefix: str = "", prog: str | None = None) -> Session:
     if config_file and mode != "peer":
         raise ValueError("give the mode in the Zenoh config file, not --zenoh-mode")
     prog = prog or program_name()
+    try:
+        ros_options = ros_options_from_args(args, prefix, prog)
+    except ValueError as error:
+        raise SystemExit(f"{prog}: {error}") from None
     say_across_pcs(connect, listen, mode, config_file, prog, prefix)
     try:
-        return open_session(connect=connect, listen=listen, mode=mode, config_file=config_file, program=prog)
+        session = open_session(connect=connect, listen=listen, mode=mode, config_file=config_file, program=prog,
+                               ros_options=ros_options)
     except OpenError as error:
         raise SystemExit(f"{prog}: {error}") from None
+    if session.ros is not None:
+        print(f"{prog}: in ROS 2 as node {session.ros.node.fully_qualified} on domain {session.ros.domain} "
+              "(rmw_zenoh keys besides our own)", file=sys.stderr, flush=True)
+    return session
 
 
 def say_across_pcs(connect: Sequence[str], listen: Sequence[str], mode: str, config_file: str | None, prog: str,
@@ -815,13 +868,16 @@ def close(session, timeout: float = CLOSE_TIMEOUT_S) -> bool:
     good after a query it did not finalize (seen in the tests, also with that query cancelled), and a program must
     still end. True when closed; False: it is left closing in a daemon thread, logged."""
     raw = session._session if isinstance(session, Session) else session
-    declared = None
+    declared = taking_part = None
     if isinstance(session, Session):
-        declared = session.declaration
+        declared, taking_part = session.declaration, session.ros
         object.__setattr__(session, "declaration", None)
+        object.__setattr__(session, "ros", None)
 
     def end():
         try:
+            if taking_part is not None:  # its tokens gone first, so that ROS's graph drops the node at once
+                taking_part.close()
             if declared is not None:  # gone with the session too; undeclared first, while the session still sends
                 declared.close()
         except zenoh.ZError:  # the session was closed already (by zenoh directly): nothing left to undeclare
@@ -843,14 +899,15 @@ class Session:
     at most CLOSE_TIMEOUT_S (``close``). Everything else is the session's own: attributes go to it, and
     ``isinstance(s, zenoh.Session)`` holds (zenoh.Session cannot be subclassed). ``across_pcs``: the endpoints of
     ``across_pcs`` for its options, or none; ``declaration``: its program's (declaration.py), None when it does not
-    declare."""
+    declare; ``ros``: its part in ROS 2 (ros.Ros, ``--ros``), None when it takes none."""
 
-    __slots__ = ("_session", "across_pcs", "declaration")
+    __slots__ = ("_session", "across_pcs", "declaration", "ros")
 
-    def __init__(self, session: zenoh.Session, across_pcs: Sequence[str] = (), declaration=None):
+    def __init__(self, session: zenoh.Session, across_pcs: Sequence[str] = (), declaration=None, ros=None):
         object.__setattr__(self, "_session", session)
         object.__setattr__(self, "across_pcs", list(across_pcs))
         object.__setattr__(self, "declaration", declaration)
+        object.__setattr__(self, "ros", ros)
 
     def __getattr__(self, name):
         return getattr(self._session, name)

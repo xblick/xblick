@@ -215,19 +215,26 @@ class TransformBuffer:
     transform on ``tf_static`` holds at every stamp. A transform on ``tf`` is kept per child frame in a
     :class:`PoseBuffer`: exact at its stamps, interpolated between two at most ``max_gap`` seconds apart, never
     extrapolated. :meth:`lookup` composes the chain between two frames. A child frame has one parent; a frame on
-    both topics, or one whose parent changes, is an error (raised by :meth:`check` and :meth:`lookup`)."""
+    both topics, or one whose parent changes, is an error (raised by :meth:`check` and :meth:`lookup`).
+
+    ``ros`` (a session with ``--ros``): ROS 2's global ``/tf_static`` and ``/tf`` instead of the camera's keys, as
+    tf2's buffer reads them (every camera's and robot's frames; ``tf_key`` not with it)."""
 
     def __init__(self, session: zenoh.Session, camera: str, tf_key: str | None = None, max_gap: float = 0.1,
-                 static_timeout: float = 10.0):
+                 static_timeout: float = 10.0, ros: bool = False):
+        if ros and tf_key:
+            raise ValueError("TransformBuffer: tf_key is for our keys; with ros it reads ROS's /tf")
         self.camera = topics.check_name(camera)
-        self.static_key = topics.tf_static(self.camera)
-        self.tf_key = topics.check_name(tf_key) if tf_key else topics.tf(self.camera)
+        self.static_key = "/tf_static" if ros else topics.tf_static(self.camera)
+        self.tf_key = "/tf" if ros else (topics.check_name(tf_key) if tf_key else topics.tf(self.camera))
         self.max_gap = max_gap
         self._static: dict[str, tuple[str, np.ndarray]] = {}  # child -> (parent, parent_from_child)
         self._moving: dict[str, tuple[str, PoseBuffer]] = {}  # child -> (parent, its poses by stamp)
         self._lock = threading.Lock()
-        self._static_subscriber = StaticTransformSubscriber(session, self.camera, self._on_static, static_timeout)
-        self._subscriber = _TfSubscriber(session, self.tf_key, self._on_tf)
+        self._static_subscriber = StaticTransformSubscriber(session, self.camera, self._on_static, static_timeout,
+                                                            ros=ros)
+        self._subscriber = (TransformSubscriber(session, self.camera, self._on_tf, ros=True) if ros
+                            else _TfSubscriber(session, self.tf_key, self._on_tf))
 
     def _on_static(self, message: TFMessage):
         with self._lock:
