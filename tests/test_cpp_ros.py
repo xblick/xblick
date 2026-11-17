@@ -374,6 +374,7 @@ def test_cpp_parameters_are_a_ros_node(tmp_path):
         assert sorted(client.list()) == ["codec", "fps", "pattern.auto_shift", "pattern.shift"]
         assert [v.value() for v in client.get(["fps", "codec"])] == [20.0, "jpeg"]
         assert client.describe(["codec"])[0].read_only
+        assert all(d.read_only for d in client.describe(["fps", "pattern.shift"]))  # ROS sets are off: no field editable
         (result,) = client.set({"fps": 10.0})
         assert not result.successful and result.reason == ROS_SETS_OFF
         assert not client.set_atomically({"fps": 10.0}).successful
@@ -394,6 +395,7 @@ def test_cpp_parameters_writable_through_ros(tmp_path):
     client.on_event(events.append)
     ours = ParameterClient(camera.observer, NODE)
     try:
+        assert not client.describe(["fps"])[0].read_only and client.describe(["codec"])[0].read_only
         (result,) = client.set({"fps": 10.0})
         assert result.successful and not client.last_checked
         assert ours.get(["fps"])[0].value() == 10.0

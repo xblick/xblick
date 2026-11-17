@@ -175,6 +175,7 @@ namespace xblick
                                                  const std::function<void()>& gate = {});
         std::optional<std::string> refusal(const Parameter& p, bool local) const;
         void publish_event(const std::vector<Parameter>& added, const std::vector<Parameter>& changed);
+        void declare_services(zenoh::Session& session);  // the constructor's, with a session
         void answer(const std::string& service, const zenoh::Query& query);
         // A ROS client's call on ROS's key (--ros): parameters.cpp has the rules.
         void answer_ros(const std::string& service, const ros::Service& server, const zenoh::Query& query);
@@ -187,6 +188,10 @@ namespace xblick
         std::vector<std::string> order_;  // the names as declared: apply_all's order
         std::map<std::string, std::pair<std::string, std::string>> overrides_;  // name -> (text, where from)
         std::optional<std::filesystem::path> dump_;
+        // The calls Zenoh's threads make (our queryables, the ROS services): ~Parameters closes it first and waits
+        // for the calls that run, so that none runs on a dying object (parameters.cpp).
+        struct CallGuard;
+        std::shared_ptr<CallGuard> calls_;
         std::optional<zenoh::Publisher> events_;
         std::vector<zenoh::Queryable<void>> queryables_;
         std::optional<zenoh::LivelinessToken> token_;

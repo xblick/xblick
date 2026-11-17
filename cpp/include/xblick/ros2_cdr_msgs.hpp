@@ -819,10 +819,12 @@ namespace ros2_cdr
 
             inline std::vector<std::string> read_strings(CdrReader& r)
             {
-                std::vector<std::string> v(r.count(4));
-                for (std::string& s : v)
+                // appended, not pre-sized: a forged count allocates no more than the strings the payload holds
+                const std::uint32_t n = r.count(4);
+                std::vector<std::string> v;
+                for (std::uint32_t i = 0; i < n; ++i)
                 {
-                    s = r.string();
+                    v.push_back(r.string());
                 }
                 return v;
             }
@@ -965,10 +967,13 @@ namespace ros2_cdr
             template <typename T, typename F>
             std::vector<T> read_list(CdrReader& r, F read)
             {
-                std::vector<T> items(r.count(1));
-                for (T& item : items)
+                // appended, not pre-sized: an element (a Parameter is 224 bytes) can be far larger in memory than
+                // its smallest wire form, so a forged count allocates only as many as the payload actually holds
+                const std::uint32_t n = r.count(1);
+                std::vector<T> items;
+                for (std::uint32_t i = 0; i < n; ++i)
                 {
-                    item = read(r);
+                    items.push_back(read(r));
                 }
                 return items;
             }

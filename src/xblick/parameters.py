@@ -593,6 +593,9 @@ class Parameters:
                     response = self._ros_sets_off(service, request)
                 else:
                     response = self._respond(service, request)
+                if service == P.DESCRIBE_PARAMETERS and not self._ros_node.ros.params_writable:
+                    for descriptor in response.descriptors:  # a ROS tool shows no field editable that refuses every set
+                        descriptor.read_only = True
             except Exception as error:  # noqa: BLE001 - the asker gets the reason
                 query.reply_err(f"{self.name}/{service}: {type(error).__name__}: {error}")
                 return

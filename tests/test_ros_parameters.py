@@ -78,6 +78,7 @@ def test_parameters_through_ros_keys():
         assert sorted(client.list()) == ["model", "threshold"]
         assert [v.value() for v in client.get(["threshold", "model"])] == [0.5, "base"]
         assert client.describe(["model"])[0].read_only
+        assert not client.describe(["threshold"])[0].read_only  # writable through ROS
         (result,) = client.set({"threshold": 0.7})
         assert result.successful and not client.last_checked
         assert params["threshold"] == 0.7
@@ -100,6 +101,7 @@ def test_ros_sets_are_refused_by_default():
     params.declare("threshold", 0.5, range=(0.0, 1.0))
     client = ParameterClient(net.b, "rostest/cam/boxer", timeout=2.0, ros=True)
     try:
+        assert client.describe(["threshold"])[0].read_only  # ROS sets are off: a ROS tool shows it read-only
         assert client.get(["threshold"])[0].value() == 0.5
         (result,) = client.set({"threshold": 0.7})
         assert not result.successful and result.reason == ROS_SETS_OFF
