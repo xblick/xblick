@@ -624,9 +624,9 @@ namespace xblick
         {
             // the network forms this publisher offers, on ROS's topics (a relay, rings only, offers none); RVL has no
             // image_transport format
+            // through ros::mirror, as every other mirror: a key with a part "command" never goes to ROS
             const auto publisher = [&](std::string_view suffix, const p::MessageType& type) {
-                return std::make_unique<ros::Publisher>(session, *part, part->node(), ros::topic_of(key(base_, suffix)),
-                                                        std::string(type.name));
+                return ros::mirror(session, key(base_, suffix), type);
             };
             if (offers("raw"))
             {

@@ -631,6 +631,7 @@ namespace xblick::ros
         std::mutex mutex;
         std::size_t depth = 1;
         std::deque<std::pair<std::vector<std::uint8_t>, std::vector<std::uint8_t>>> samples;  // payload, attachment
+        std::atomic<bool> said{false};  // a failed reply said once
     };
 
     Publisher::Publisher(zenoh::Session& session, Ros& ros, const NodeName& node, const std::string& topic,
@@ -652,19 +653,32 @@ namespace xblick::ros
             cache_queryable_.emplace(session.declare_queryable(
                 zenoh::KeyExpr(cache_key),
                 [cache = cache_, data](const zenoh::Query& query) {
+                    // zenoh-ext's subscriber asks with _anyke, which lets the replies carry the data key; a query
+                    // without it could take none of them: not answered (dropped at once), nothing said
+                    if (query.get_parameters().find("_anyke") == std::string_view::npos)
+                    {
+                        return;
+                    }
+                    decltype(cache->samples) samples;
+                    {
+                        std::lock_guard lock(cache->mutex);  // copied, then replied: a put is not held up
+                        samples = cache->samples;
+                    }
                     try
                     {
-                        std::lock_guard lock(cache->mutex);
-                        for (const auto& [payload, attachment] : cache->samples)
+                        for (const auto& [payload, attachment] : samples)
                         {
                             zenoh::Query::ReplyOptions reply;
                             reply.attachment = zenoh::Bytes(attachment);
                             query.reply(zenoh::KeyExpr(data), zenoh::Bytes(payload), std::move(reply));
                         }
                     }
-                    catch (const std::exception& e)  // a query that takes no reply on the data key (no _anyke)
+                    catch (const std::exception& e)  // the session closing: said once per publisher
                     {
-                        say(data + ": a history query not answered: " + e.what());
+                        if (not cache->said.exchange(true))
+                        {
+                            say(data + ": a history query not answered: " + e.what());
+                        }
                     }
                 },
                 zenoh::closures::none));

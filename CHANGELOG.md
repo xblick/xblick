@@ -28,6 +28,14 @@ parameters, and it reads theirs.
 - `_core.ros_gid`: the gid of a ROS entity as `rmw_zenoh` makes it (XXH3-128 of its token), used by both sides.
 - The guide [Durchblick and ROS 2](docs/integrations/ros2.md) and the protocol's section on `rmw_zenoh`.
 
+### Changed
+
+- C++: a ROS-only subscriber now counts in `CameraPublisher::subscribed()`, `needs_pixels()` and `ImuPublisher::subscribed()`, so frames render for it.
+
+### Fixed
+
+- C++: a request with a forged list length no longer allocates far more than the request holds.
+
 ### Known limit
 
 - With `--ros-params-writable` a ROS client's set is unchecked and uncounted: no node check, no deadline, and every node of the name executes it.

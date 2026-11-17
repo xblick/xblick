@@ -39,6 +39,14 @@ def parse(argv):
     return parser.parse_args(argv)
 
 
+def test_the_default_node_name_is_the_parsers_program(monkeypatch):
+    """Without prog the default ROS node name is the parser's prog (a node started from python -c or a test)."""
+    parser = argparse.ArgumentParser(prog="xblick-my-node")
+    session.add_arguments(parser)
+    assert session.ros_options_from_args(parser.parse_args(["--ros"])).node == "xblick_my_node"
+    assert session.ros_options_from_args(parser.parse_args(["--ros"]), prog="other").node == "other"
+
+
 def test_ros_options(monkeypatch):
     monkeypatch.delenv("ROS_DOMAIN_ID", raising=False)
     assert session.ros_options_from_args(parse([]), prog="xblick cam") is None

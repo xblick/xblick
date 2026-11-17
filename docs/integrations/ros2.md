@@ -110,7 +110,9 @@ of the name first and send nothing when more than one answers. A ROS client does
 
 Read-only access (`--params-read-only`), read-only parameters, types, ranges and choices still apply. A ROS set whose
 node blocks in its writer holds the parameters' lock, for our own calls too. Each round, a node answers at most four
-calls per ROS service, so a ROS client that floods it does not starve our own calls.
+calls per ROS service, so a ROS client that floods it does not starve our own calls (Python; C++ answers each call
+at once, [C++ and ROS 2](#c-and-ros-2)). While sets through ROS are off, a ROS client's describe shows every parameter
+read-only, so that a ROS tool offers no field that every set refuses.
 
 `ParameterClient(..., ros=True)` and `xblick param --ros --via-ros --node <ROS node>` read and set the parameters of
 any ROS node. A set goes out only after exactly one node answered a list_parameters read. This check is best effort.
@@ -186,12 +188,15 @@ The C++ API takes part in ROS 2 as the Python API does, with the same keys, toke
 ROS, and `Parameters` serves the six parameter services with the same rules as in Python. A publisher that offers only
 its rings, such as a relay's, offers nothing to ROS.
 
-Two differences remain:
+Three differences remain:
 
 - `rmw_zenoh` keeps `/tf_static` for late subscribers with zenoh-ext's advanced publisher. zenoh-c offers it only with
   its unstable API, which its standalone release lacks. The C++ publisher answers late subscribers with its own
   cache in the same format, without sequence numbers. A ROS subscriber that starts later may therefore get the
   message twice. tf2 takes it as the same transform.
+- C++ answers each ROS call at once in Zenoh's callback thread; it has no rounds and no cap per round. A ROS set whose
+  writer blocks therefore also blocks that Zenoh thread, and with it the other traffic that thread delivers. A set
+  refused because sets through ROS are off is refused before its parameters are decoded.
 - The C++ API offers no `ParameterClient` for a ROS node yet.
 
 ## Wire format

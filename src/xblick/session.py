@@ -266,6 +266,8 @@ def add_arguments(parser, prefix: str = ""):
                         help="with --ros: ROS clients may set this program's parameters (default: they read them, "
                              "sets are refused). A ROS set is unchecked and uncounted: no node check, no deadline, "
                              "and two nodes of one name both execute it while the ROS client shows one success")
+    # the program's name as the parser sees it (its prog): the default ROS node name (ros_options_from_args)
+    parser.set_defaults(**{f"{prefix.replace('-', '_')}ros_program": parser.prog})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -278,7 +280,9 @@ class RosOptions:
 
 
 def ros_options_from_args(args, prefix: str = "", prog: str | None = None) -> RosOptions | None:
-    """The ROS options of a script's arguments (``add_arguments``); None without ``--ros``. ValueError (ros.RosError)
+    """The ROS options of a script's arguments (``add_arguments``); None without ``--ros``. The node name defaults to
+    ``prog``, else the parser's prog (as the parser sees the program: a node started from ``python -c`` or a test gets
+    its parser's name), else ``program_name()``. ValueError (ros.RosError)
     for a domain or node name ROS does not take, or for ``--ros-domain``/``--ros-node`` without ``--ros``."""
     from . import ros
     key = prefix.replace("-", "_")
@@ -289,7 +293,8 @@ def ros_options_from_args(args, prefix: str = "", prog: str | None = None) -> Ro
             raise ros.RosError(f"--{prefix}ros-domain, --{prefix}ros-node and --{prefix}ros-params-writable need "
                                f"--{prefix}ros")
         return None
-    return RosOptions(ros.domain_from(domain), ros.check_node_name(node or ros.node_name_of(prog or program_name())),
+    program = prog or getattr(args, f"{key}ros_program", None) or program_name()
+    return RosOptions(ros.domain_from(domain), ros.check_node_name(node or ros.node_name_of(program)),
                       bool(writable))
 
 
@@ -305,9 +310,10 @@ def open_from_args(args, prefix: str = "", prog: str | None = None) -> Session:
         args, f"{key}config")
     if config_file and mode != "peer":
         raise ValueError("give the mode in the Zenoh config file, not --zenoh-mode")
+    given = prog
     prog = prog or program_name()
     try:
-        ros_options = ros_options_from_args(args, prefix, prog)
+        ros_options = ros_options_from_args(args, prefix, given)
     except ValueError as error:
         raise SystemExit(f"{prog}: {error}") from None
     say_across_pcs(connect, listen, mode, config_file, prog, prefix)
