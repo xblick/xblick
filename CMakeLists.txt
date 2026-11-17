@@ -79,7 +79,7 @@ if(XBLICK_CAMERA)
   find_package(PNG REQUIRED)
   add_library(xblick_camera cpp/src/msg.cpp cpp/src/camera_info_file.cpp cpp/src/image.cpp cpp/src/stream.cpp
               cpp/src/camera.cpp cpp/src/declaration.cpp cpp/src/points.cpp cpp/src/parameters.cpp
-              cpp/src/options.cpp)
+              cpp/src/options.cpp cpp/src/ros.cpp)
   add_library(xblick::xblick ALIAS xblick_camera)
   set_target_properties(xblick_camera PROPERTIES EXPORT_NAME xblick OUTPUT_NAME xblick)
   target_link_libraries(xblick_camera PUBLIC xblick_core zenohcxx::zenohc PRIVATE JPEG::JPEG PNG::PNG)
@@ -167,6 +167,9 @@ if(BUILD_TESTING)
     target_link_libraries(test_latest PRIVATE xblick_camera)
     target_include_directories(test_latest PRIVATE cpp/src)  # detail::Latest, an internal of the library
     add_test(NAME latest COMMAND test_latest)
+    add_executable(test_ros cpp/tests/test_ros.cpp)
+    target_link_libraries(test_ros PRIVATE xblick_camera)
+    add_test(NAME ros COMMAND test_ros)
   endif()
 endif()
 

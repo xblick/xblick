@@ -182,6 +182,28 @@ namespace xblick
         }
     }  // namespace
 
+    namespace
+    {
+        // A session just opened: its program's declaration, its part in ROS 2 (--ros) with one line on stderr, as
+        // Python's open_from_args says it.
+        void take_part(zenoh::Session& session, const SessionOptions& o)
+        {
+            if (o.declare)
+            {
+                detail::declare_program(session, o.program, o.version);
+            }
+            if (o.ros)
+            {
+                ros::detail::take_part(session, *o.ros);
+                const std::shared_ptr<ros::Ros> part = ros::of(session);
+                std::fprintf(stderr, "%s: in ROS 2 as node %s on domain %d (rmw_zenoh keys besides our own)\n",
+                             o.program.empty() ? "xblick" : o.program.c_str(),
+                             part->node().fully_qualified().c_str(), part->domain());
+                std::fflush(stderr);
+            }
+        }
+    }  // namespace
+
     zenoh::Session open_session(const SessionOptions& o)
     {
         if (not o.config_file.empty())
@@ -191,10 +213,7 @@ namespace xblick
                 throw std::invalid_argument("give either a Zenoh config file or connect/listen endpoints, not both");
             }
             zenoh::Session session = open_or_say_why(zenoh::Config::from_file(o.config_file), "", {});
-            if (o.declare)
-            {
-                detail::declare_program(session, o.program, o.version);
-            }
+            take_part(session, o);
             return session;
         }
         if (o.mode != "peer" and o.mode != "client")
@@ -246,10 +265,7 @@ namespace xblick
             config.insert_json5("listen/endpoints", endpoints(listen));
         }
         zenoh::Session session = open_or_say_why(std::move(config), o.mode, connect);
-        if (o.declare)
-        {
-            detail::declare_program(session, o.program, o.version);
-        }
+        take_part(session, o);
         return session;
     }
 

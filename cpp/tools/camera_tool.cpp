@@ -50,7 +50,8 @@ int main(int argc, char** argv)
     {
         zenoh::Session session = open_session({.connect = args.list("connect"), .listen = args.list("listen"),
                                                    .mode = args.get("zenoh-mode", "peer"), .program = "xblick-cpp-camera",
-                                                   .version = XBLICK_VERSION});
+                                                   .version = XBLICK_VERSION,
+                                                   .ros = tools::ros_options(args, "xblick-cpp-camera")});
         const std::string encoding = args.get("encoding", "rgb8");
         const auto size = args.list("size");
         const std::uint32_t width = size.size() == 2 ? std::stoul(size[0]) : 640;

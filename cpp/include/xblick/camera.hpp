@@ -37,6 +37,7 @@
 #include "xblick/pairing.hpp"
 #include "xblick/protocol.hpp"
 #include "xblick/ring.hpp"
+#include "xblick/ros.hpp"
 
 namespace xblick
 {
@@ -70,6 +71,10 @@ namespace xblick
         // record (program, version, the core's version, names, host, the whole command line, process id, start time).
         // The command line is visible to everything that reaches the network. false: a session that does not.
         bool declare = true;
+        // Take part in ROS 2 as well (--ros, ros.hpp): the session is a ROS node of this name on this domain
+        // (ros::of), and the publishers and parameters made with it offer themselves to ROS too
+        // (docs/integrations/ros2.md). Without it nothing of ROS is sent.
+        std::optional<ros::Options> ros;
     };
 
     // xblick/sessions/<zid>/program: a session's declaration (SessionOptions::declare).
