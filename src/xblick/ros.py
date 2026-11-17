@@ -22,9 +22,8 @@ The gid: rmw_zenoh derives an entity's gid from its token key with XXH3-128 (low
 endian). ``gid`` does the same through ``_core.ros_gid`` (the C++ core's, cpp/include/xblick/ros_gid.hpp), so a
 sample's gid is the one of its entity in ROS's graph.
 
-Type hashes (RIHS01, REP 2011): ``TYPE_HASHES`` for every type Durchblick carries to ROS. Those of types installed
-with ROS 2 Jazzy are ROS's own (its ``share/<pkg>/msg/<Name>.json``); those of vision_msgs, which a Jazzy install
-here did not have, come from ``message_hash`` over the definitions in msgdefs.py. ``message_hash`` and
+Type hashes (RIHS01, REP 2011): ``TYPE_HASHES`` for every type Durchblick carries to ROS. All are ROS's own
+(``share/<pkg>/msg/<Name>.json`` of ROS 2 Jazzy, vision_msgs those of ros-jazzy-vision-msgs 4.1.1). ``message_hash`` and
 ``service_hash`` are rosidl's algorithm, checked against every type of a ROS 2 Jazzy install by tests/test_ros.py.
 """
 
@@ -293,8 +292,8 @@ def parse_token(key: str) -> Token:
 
 # ------------------------------------------------------------------------------------------- type hashes (RIHS01)
 
-# from ROS 2 Jazzy's share/<package>/<msg|srv>/<Name>.json, except vision_msgs (computed by message_hash from
-# msgdefs.py: no Jazzy install at hand had vision_msgs); tests/test_ros.py checks both
+# from ROS 2 Jazzy's share/<package>/<msg|srv>/<Name>.json, vision_msgs from ros-jazzy-vision-msgs 4.1.1 (not part of
+# a base install); tests/test_ros.py checks them against an install and against message_hash over msgdefs.py
 TYPE_HASHES = {
     "builtin_interfaces/msg/Time": "RIHS01_b106235e25a4c5ed35098aa0a61a3ee9c9b18d197f398b0e4206cea9acf9c197",
     "diagnostic_msgs/msg/DiagnosticArray": "RIHS01_5a8a36efb05fb25070fa0fb3810290c0e6cd4862b54a8fb975a1ee8dc55a333e",

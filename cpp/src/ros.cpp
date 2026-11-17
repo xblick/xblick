@@ -380,7 +380,7 @@ namespace xblick::ros
 
     const std::map<std::string, std::string>& type_hashes()
     {
-        // Python's ros.TYPE_HASHES (ROS 2 Jazzy's share/<package>/<msg|srv>/<Name>.json, vision_msgs computed)
+        // Python's ros.TYPE_HASHES (ROS 2 Jazzy's share/<package>/<msg|srv>/<Name>.json, vision_msgs 4.1.1 included)
         static const std::map<std::string, std::string> table = {
             {"builtin_interfaces/msg/Time", "RIHS01_b106235e25a4c5ed35098aa0a61a3ee9c9b18d197f398b0e4206cea9acf9c197"},
             {"diagnostic_msgs/msg/DiagnosticArray",

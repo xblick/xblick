@@ -117,8 +117,7 @@ def test_domain_id(monkeypatch):
 
 
 def test_hash_of_msgdefs_types_is_the_table():
-    """The hash implementation over msgdefs.py gives the table's hash of every type both have (ROS's own hashes for
-    the types of a Jazzy install, the computed ones for vision_msgs)."""
+    """The hash implementation over msgdefs.py gives the table's hash of every type both have."""
     both = sorted(set(MSGDEFS) & set(ros.TYPE_HASHES))
     assert len(both) >= 14
     for t in both:
@@ -143,10 +142,24 @@ def _ros_hash(path: Path) -> str:
 
 @needs_ros
 def test_table_holds_ros_own_hashes():
+    """Every hash of the table is ROS's own; vision_msgs (not part of a base Jazzy install, package
+    ros-jazzy-vision-msgs) checked when installed."""
     for t, h in ros.TYPE_HASHES.items():
         path = JAZZY / f"{t}.json"
-        if not t.startswith("vision_msgs/"):
-            assert _ros_hash(path) == h, t
+        if t.startswith("vision_msgs/") and not path.exists():
+            continue
+        assert _ros_hash(path) == h, t
+
+
+@pytest.mark.skipif(not (JAZZY / "vision_msgs").is_dir(), reason="needs ros-jazzy-vision-msgs")
+def test_vision_msgs_definitions_are_ros_own():
+    """msgdefs.py's vision_msgs definitions hash like the installed package's, nested types included."""
+    for path in sorted((JAZZY / "vision_msgs" / "msg").glob("*.json")):
+        name = "/".join(path.with_suffix("").parts[-3:])
+        for h in json.loads(path.read_text())["type_hashes"]:
+            if h["type_name"] in MSGDEFS:
+                t = h["type_name"]
+                assert ros.message_hash(t, ros.msgdefs_lookup(t, MSGDEFS[t])) == h["hash_string"], (name, t)
 
 
 @needs_ros

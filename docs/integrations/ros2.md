@@ -213,9 +213,8 @@ type hashes that `--ros` uses.
 - The C++ programs were tested against ROS 2's own programs as well: `rclcpp` reads `xblick-cpp-camera`'s streams,
   `tf2_echo` its `/tf_static`, `rclcpp`'s parameter client its parameters, and `xblick-cpp-probe` reads an `rclcpp`
   node's image.
-- The type hashes of `vision_msgs` come from our own implementation of ROS's hash over the message definitions. It
-  gives ROS's hashes for all 252 message and service types of a Jazzy installation. A Jazzy installation with
-  `vision_msgs` was not at hand to confirm these three.
+- The type hashes of `vision_msgs` are those of `ros-jazzy-vision-msgs` 4.1.1. A typed `rclcpp` subscription
+  receives and deserialises our `Detection2DArray` and `Detection3DArray`, and those of `xblick-yolox --ros`.
 - A program is one ROS node, and each node's parameters are one more. A vision node therefore shows as two ROS
   nodes, such as `/xblick_yolox` and `/test/camera/yolox`.
 - `/clock` is not mapped: a world's clock is `/<world>/clock`. A ROS node that uses simulated time needs a remap.

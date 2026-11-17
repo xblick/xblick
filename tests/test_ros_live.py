@@ -17,8 +17,11 @@ import pytest
 
 from xblick import ros, session
 from xblick.camera import CameraPublisher, ImageSubscriber, StaticTransformPublisher, StaticTransformSubscriber
+from xblick.detections import DetectionPublisher
 from xblick.encodings import numpy_to_image
-from xblick.msg import CameraInfo, Header, Time, Transform, TransformStamped, Vector3
+from xblick.msg import (BoundingBox2D, BoundingBox3D, CameraInfo, Detection2D, Detection2DArray, Detection3D,
+                        Detection3DArray, Header, ObjectHypothesis, ObjectHypothesisWithPose, Point, Point2D, Pose,
+                        Pose2D, PoseWithCovariance, Quaternion, Time, Transform, TransformStamped, Vector3)
 from xblick.parameters import ParameterClient, Parameters
 
 JAZZY = Path("/opt/ros/jazzy")
@@ -75,24 +78,41 @@ def ros_env(tmp_path_factory):
         process.wait(10)
 
 
-@pytest.fixture(scope="module")
-def rosprobe(tmp_path_factory):
+RCLCPP_LIBRARIES = ["rclcpp", "rcl", "rcutils", "rmw", "rcpputils", "rosidl_runtime_c", "rosidl_typesupport_cpp",
+                    "rosidl_typesupport_c", "libstatistics_collector", "tracetools",
+                    "rcl_interfaces__rosidl_typesupport_cpp", "rcl_interfaces__rosidl_generator_c",
+                    "rcl_yaml_param_parser",
+                    "ament_index_cpp", "rmw_implementation", "rcl_logging_interface",
+                    "builtin_interfaces__rosidl_typesupport_cpp", "rosgraph_msgs__rosidl_typesupport_cpp",
+                    "statistics_msgs__rosidl_typesupport_cpp", "rosidl_dynamic_typesupport",
+                    "service_msgs__rosidl_typesupport_cpp", "type_description_interfaces__rosidl_typesupport_cpp"]
+
+
+def build_rclcpp(tmp_path_factory, name: str, libraries=()) -> Path:
+    """tests/ros/<name>.cpp built with g++ against /opt/ros/jazzy."""
     if shutil.which("g++") is None:
-        pytest.skip("needs g++ to build rosprobe")
-    out = tmp_path_factory.mktemp("rosprobe") / "rosprobe"
+        pytest.skip(f"needs g++ to build {name}")
+    out = tmp_path_factory.mktemp(name) / name
     includes = [f"-I{d}" for d in sorted((JAZZY / "include").iterdir()) if d.is_dir()]
-    libraries = ["rclcpp", "rcl", "rcutils", "rmw", "rcpputils", "rosidl_runtime_c", "rosidl_typesupport_cpp",
-                 "rosidl_typesupport_c", "libstatistics_collector", "tracetools",
-                 "rcl_interfaces__rosidl_typesupport_cpp", "rcl_interfaces__rosidl_generator_c",
-                 "rcl_yaml_param_parser",
-                 "ament_index_cpp", "rmw_implementation", "rcl_logging_interface",
-                 "builtin_interfaces__rosidl_typesupport_cpp", "rosgraph_msgs__rosidl_typesupport_cpp",
-                 "statistics_msgs__rosidl_typesupport_cpp", "rosidl_dynamic_typesupport",
-                 "service_msgs__rosidl_typesupport_cpp", "type_description_interfaces__rosidl_typesupport_cpp"]
-    subprocess.run(["g++", "-std=c++17", "-O1", *includes, str(Path(__file__).parent / "ros/rosprobe.cpp"), "-o",
-                    str(out), f"-L{JAZZY}/lib", f"-Wl,-rpath,{JAZZY}/lib", *[f"-l{lib}" for lib in libraries]],
+    subprocess.run(["g++", "-std=c++17", "-O1", *includes, str(Path(__file__).parent / f"ros/{name}.cpp"), "-o",
+                    str(out), f"-L{JAZZY}/lib", f"-Wl,-rpath,{JAZZY}/lib",
+                    *[f"-l{lib}" for lib in [*RCLCPP_LIBRARIES, *libraries]]],
                    check=True, timeout=600, capture_output=True)
     return out
+
+
+@pytest.fixture(scope="module")
+def rosprobe(tmp_path_factory):
+    return build_rclcpp(tmp_path_factory, "rosprobe")
+
+
+@pytest.fixture(scope="module")
+def rosvision(tmp_path_factory):
+    """tests/ros/rosvision.cpp: typed vision_msgs subscriptions (needs ros-jazzy-vision-msgs)."""
+    if not (JAZZY / "include/vision_msgs").is_dir():
+        pytest.skip("needs ros-jazzy-vision-msgs")
+    return build_rclcpp(tmp_path_factory, "rosvision", [
+        f"{pkg}__rosidl_typesupport_cpp" for pkg in ("vision_msgs", "std_msgs", "geometry_msgs")])
 
 
 def run(env, argv, timeout):
@@ -168,6 +188,37 @@ def test_rclcpp_reads_our_camera_stream(ros_env, ours, rosprobe):
         assert int(re.search(r"TOTAL (\d+)", out)[1]) > 3, out[-2000:]
     # the bytes as ours: CDR header, the frame id
     assert "GOT 1 " in image and b"live_cam".hex() in image
+
+
+def test_rclcpp_deserialises_our_detections(ros_env, ours, rosvision):
+    """Our Detection2DArray and Detection3DArray reach typed rclcpp subscriptions with every field as sent."""
+    env, _ = ros_env
+    cov = np.zeros(36)
+    cov[0] = 0.01
+    pose = Pose(Point(0.1, -0.2, 1.5), Quaternion(0.0, 0.0, 0.6, 0.8))
+    boxes3d = Detection3DArray(Header(Time(19, 20), "live_cam"), [Detection3D(
+        Header(Time(19, 20), "live_cam"), [ObjectHypothesisWithPose(ObjectHypothesis("mug", 0.75),
+                                                                    PoseWithCovariance(pose, cov))],
+        BoundingBox3D(pose, Vector3(0.08, 0.12, 0.1)), "7")])
+    boxes2d = Detection2DArray(Header(Time(21, 22), "live_cam"), [Detection2D(
+        Header(Time(21, 22), "live_cam"), [ObjectHypothesisWithPose(ObjectHypothesis("chair", 0.5))],
+        BoundingBox2D(Pose2D(Point2D(320.5, 240.25), 0.0), 40.0, 30.0), "3")])
+    pub2d = DetectionPublisher(ours, "live/cam/boxer/boxes", Detection2DArray)
+    pub3d = DetectionPublisher(ours, "live/cam/boxer/boxes_3d", Detection3DArray)
+    sender = Background(lambda: (pub2d.publish(boxes2d), pub3d.publish(boxes3d)), 0.1)
+    try:
+        got2d = run(env, [str(rosvision), "2d", "/live/cam/boxer/boxes", "3"], 30)
+        got3d = run(env, [str(rosvision), "3d", "/live/cam/boxer/boxes_3d", "3"], 30)
+    finally:
+        sender.stop()
+        pub2d.close()
+        pub3d.close()
+    for out in (got2d, got3d):
+        assert int(re.search(r"TOTAL (\d+)", out)[1]) > 3, out[-2000:]
+    assert ("frame=live_cam stamp=21.000000022 n=1 [id=3 chair:0.500 box=320.50,240.25,40.00,30.00]"
+            in got2d), got2d[-2000:]
+    assert ("frame=live_cam stamp=19.000000020 n=1 [id=7 mug:0.750 cov0=0.010 box=0.10,-0.20,1.50 "
+            "q=0.00,0.00,0.60,0.80 size=0.08,0.12,0.10]" in got3d), got3d[-2000:]
 
 
 def test_we_hear_the_talker(ros_env, ours):
