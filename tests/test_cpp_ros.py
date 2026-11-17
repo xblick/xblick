@@ -17,9 +17,11 @@ import numpy as np
 import pytest
 
 from xblick import _core, ros
-from xblick.camera import (CameraPublisher, ImageSubscriber, StaticTransformSubscriber, TransformSubscriber)
+from xblick.camera import (CameraPublisher, ImageSubscriber, StaticTransformPublisher, StaticTransformSubscriber,
+                           TransformSubscriber)
 from xblick.encodings import numpy_to_image
-from xblick.msg import CameraInfo, Header, Parameter, ParameterValue, SetParametersRequest, Time
+from xblick.msg import (CameraInfo, Header, Parameter, ParameterValue, SetParametersRequest, Time, Transform,
+                        TransformStamped, Vector3)
 from xblick.parameters import READ_ONLY_ACCESS, ROS_SETS_OFF, ParameterClient
 from xblick.points import PointCloudSubscriber
 from xblick.session import RosOptions, open_session, replies
@@ -310,6 +312,22 @@ def test_cpp_probe_reads_a_ros_topic(tmp_path):
     assert any(line["camera_info"] == {"width": W, "fx": 400.0} for line in lines)
 
 
+def test_cpp_reads_ros_tf_static_late():
+    """C++ StaticTransformSubscriber with ros (a transient-local ROS reader) gets /tf_static of a publisher that put
+    it before the reader started (its cache), as our Python reader does."""
+    port = free_port()
+    with open_session(listen=[f"tcp/127.0.0.1:{port}"], ros_options=RosOptions(DOMAIN, "py_static")) as session:
+        pose = TransformStamped(Header(Time(1, 0), "py_world"), "py_cam_body", Transform(Vector3(4.0, 0.0, 0.0)))
+        static = StaticTransformPublisher(session, "rc/py", [pose])
+        time.sleep(1.5)
+        done = subprocess.run([tool("xblick-cpp-probe"), "--connect", f"127.0.0.1:{port}", "--tf-static", "unused",
+                               "--ros", "--ros-domain", str(DOMAIN), "--timeout", "15"], capture_output=True, text=True,
+                              timeout=60)
+        static.close()
+    lines = [json.loads(line) for line in done.stdout.splitlines()]
+    assert done.returncode == 0 and {"parent": "py_world", "child": "py_cam_body", "x": 4} in lines, done.stderr
+
+
 def _seq_of(line) -> int:
     """The frame of a probe line: the published patterns' checksums are distinct for seq 1..255."""
     for seq in range(1, 256):
@@ -497,6 +515,36 @@ def test_rclcpp_reads_the_cpp_camera(ros_env, rosprobe):
     totals = [int(re.search(r"TOTAL (\d+)", out)[1]) for out in (image, info, jpeg)]
     assert min(totals) > 3, (totals, image[-1000:])
     assert b"TestCamera".hex() in image  # the frame id in the bytes rclcpp got
+
+
+@needs_jazzy
+def test_rclcpp_reads_only_the_camera_info_of_the_cpp_camera(ros_env, rosprobe):
+    """A ROS reader of camera_info alone gets it: the C++ camera counts it as a subscriber (subscribed) and sends each
+    frame's camera_info without encoding an image."""
+    env, port = ros_env
+    camera = CppOnRouter(port, "xblick-cpp-camera", *camera_args())
+    try:
+        info = run(env, [str(rosprobe), "sub", "/live/cpp/color/camera_info", "sensor_msgs/msg/CameraInfo", "3"], 30)
+    finally:
+        camera.close()
+    assert int(re.search(r"TOTAL (\d+)", info)[1]) > 3, info[-2000:]
+
+
+@needs_jazzy
+def test_cpp_reads_the_tf_static_of_a_ros_node_late(ros_env):
+    env, port = ros_env
+    process = subprocess.Popen([str(JAZZY / "lib/tf2_ros/static_transform_publisher"), "--x", "5", "--frame-id",
+                                "ros_world", "--child-frame-id", "ros_thing"], env=env, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+    try:
+        time.sleep(2.0)
+        probe = CppOnRouter(port, "xblick-cpp-probe", "--tf-static", "unused", "--timeout", "15", ready=False)
+        out, _ = probe.proc.communicate(timeout=60)
+        probe.close()
+    finally:
+        process.terminate()
+        process.wait(10)
+    assert {"parent": "ros_world", "child": "ros_thing", "x": 5} in [json.loads(line) for line in out.splitlines()], out
 
 
 @needs_jazzy

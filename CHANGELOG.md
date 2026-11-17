@@ -30,11 +30,12 @@ parameters, and it reads theirs.
 
 ### Changed
 
-- C++: a ROS-only subscriber now counts in `CameraPublisher::subscribed()`, `needs_pixels()` and `ImuPublisher::subscribed()`, so frames render for it.
+- C++: a ROS-only subscriber now counts in `CameraPublisher::subscribed()`, `needs_pixels()` and `ImuPublisher::subscribed()`, so frames render for it; a ROS reader of camera_info alone counts in `subscribed()`, not in `needs_pixels()`.
 
 ### Fixed
 
 - C++: a request with a forged list length no longer allocates far more than the request holds.
+- C++: the option structs (`SessionOptions`, `PublisherOptions`, `SubscriberOptions`, the cloud options) give every field a default, so designated initializers that leave fields out compile without `-Wmissing-field-initializers`.
 
 ### Known limit
 

@@ -51,11 +51,11 @@ namespace xblick
 
     struct SessionOptions
     {
-        std::vector<std::string> connect;  // host, host:port or a Zenoh locator such as tcp/192.0.2.10:7447
-        std::vector<std::string> listen;
+        std::vector<std::string> connect{};  // host, host:port or a Zenoh locator such as tcp/192.0.2.10:7447
+        std::vector<std::string> listen{};
         std::string mode = "peer";  // or "client" (through a router)
         bool multicast_scouting = false;
-        std::string config_file;  // a Zenoh JSON5 configuration instead of the options above
+        std::string config_file{};  // a Zenoh JSON5 configuration instead of the options above
         // Neither connect nor listen: the PC's router (127.0.0.1:7447), listening on a free loopback port, as
         // Python's session.py; false: such a session reaches nobody. A peer with connect and no listen listens on a
         // free loopback port as well (peers behind a router reach each other only directly).
@@ -63,9 +63,9 @@ namespace xblick
         // The program's name. Set (Options::session_options sets it): open_session says on stderr, as
         // "<program>: ...", when the options make a peer that connects only to other PCs (across_pcs). It is also the
         // program the session declares (empty: the name it was started by).
-        std::string program;
+        std::string program{};
         // The program's version in its declaration (empty: unknown, null in the record).
-        std::string version;
+        std::string version{};
         // The session declares its program on the network (protocol.hpp kSessions, Python's declaration.py): the
         // liveliness token xblick/sessions/<zid>/program while it is open and a queryable there that answers the
         // record (program, version, the core's version, names, host, the whole command line, process id, start time).
@@ -74,7 +74,7 @@ namespace xblick
         // Take part in ROS 2 as well (--ros, ros.hpp): the session is a ROS node of this name on this domain
         // (ros::of), and the publishers and parameters made with it offer themselves to ROS too
         // (docs/integrations/ros2.md). Without it nothing of ROS is sent.
-        std::optional<ros::Options> ros;
+        std::optional<ros::Options> ros{};
     };
 
     // xblick/sessions/<zid>/program: a session's declaration (SessionOptions::declare).
@@ -282,21 +282,21 @@ namespace xblick
 
     struct PublisherOptions
     {
-        std::string encoding;  // ROS encoding of the frames, e.g. rgb8, bgr8, 16UC1
-        std::string frame_id;
-        std::string source;  // e.g. "robot" or "sim": in every frame's attachment
-        std::optional<CameraInfo> camera_info;
+        std::string encoding{};  // ROS encoding of the frames, e.g. rgb8, bgr8, 16UC1
+        std::string frame_id{};
+        std::string source{};  // e.g. "robot" or "sim": in every frame's attachment
+        std::optional<CameraInfo> camera_info{};
         std::string codec = kJpeg;  // of image_raw/compressed
         int jpeg_quality = 85;
         std::uint32_t slots = 32;  // ring slots: a reader has slots - 1 frame periods for a frame (~1 s at 30 Hz)
-        std::optional<int> cuda_device;  // offer image_raw/cuda with a CUDA ring on this device
+        std::optional<int> cuda_device{};  // offer image_raw/cuda with a CUDA ring on this device
         // The representations offered, of "raw", "compressed", "shm" and "cuda" (needs cuda_device); empty: all (cuda
         // with cuda_device). A relay (xblick-relay) offers only its host's rings, {"shm", "cuda"}: raw, compressed
         // and camera_info come once, from the source.
-        std::vector<std::string> transports;
+        std::vector<std::string> transports{};
         // A relay's: the host id of the publisher whose stream it republishes; in the info record as "relayed_from"
         // (null otherwise). Relays relay no stream whose record has it.
-        std::string relayed_from;
+        std::string relayed_from{};
     };
 
     // A frame of another publisher's stream as that one sent it (a relay): its header (capture stamp, frame_id) and
@@ -371,11 +371,14 @@ namespace xblick
     // A camera's fixed transforms from <camera>/tf_static, as Python's StaticTransformSubscriber: those its publisher
     // answers when asked (in a thread of its own, asked again until an answer comes or timeout ends: right after a
     // session connects, a query can end at once without answers) and every later publication (a restarted camera).
+    // `ros` (a session with --ros): ROS 2's global /tf_static instead, every publisher's, also those that published
+    // before this subscriber started (their caches, transient local), `camera` unused; latest() then holds every
+    // transform received, the newest per child frame (as tf2 keeps them).
     class StaticTransformSubscriber
     {
     public:
         StaticTransformSubscriber(zenoh::Session& session, const std::string& camera,
-                                  std::chrono::milliseconds timeout = std::chrono::seconds(10));
+                                  std::chrono::milliseconds timeout = std::chrono::seconds(10), bool ros = false);
         ~StaticTransformSubscriber();
         StaticTransformSubscriber(const StaticTransformSubscriber&) = delete;
         StaticTransformSubscriber& operator=(const StaticTransformSubscriber&) = delete;
@@ -508,7 +511,7 @@ namespace xblick
         // The GPU this subscriber works on (an ordinal, as CUDA numbers them): the frames of a CUDA ring arrive on
         // it, copied from GPU to GPU if the ring is on another one. Unset: the CPU, so local Auto takes shared memory
         // (a CUDA ring only for a subscriber that works on a GPU), and the frames of a CUDA ring stay on its GPU.
-        std::optional<int> cuda_device;
+        std::optional<int> cuda_device{};
         Transport remote = Transport::Compressed;  // what Auto takes for a publisher on another host (or Raw)
         bool copy = true;                          // false: shm/cuda frames are views into the ring (check is_valid)
         bool camera_info = false;                  // also receive the stream's CameraInfo

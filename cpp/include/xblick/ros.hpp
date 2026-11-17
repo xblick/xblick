@@ -125,6 +125,7 @@ namespace xblick::ros
     inline const Qos kStreamQos{.depth = 1};                                   // our streams
     inline const Qos kTfQos{.depth = 100};                                     // /tf, as tf2's broadcaster
     inline const Qos kTfStaticQos{.durability = kTransientLocal, .depth = 1};  // /tf_static, as tf2's static one
+    inline const Qos kTfStaticReadQos{.durability = kTransientLocal, .depth = 100};  // tf2's static listener
     inline const Qos kParametersQos{.depth = 1000};                            // rmw_qos_profile_parameters
 
     // ---------------------------------------------------------------------------------------------------- tokens
@@ -154,7 +155,7 @@ namespace xblick::ros
     struct Options
     {
         int domain = kDefaultDomain;
-        std::string node;
+        std::string node{};
         bool params_writable = false;  // ROS clients may set parameters; by default ROS's sets are refused
     };
     // The options of a command line's values; none without --ros. RosError for --ros-domain, --ros-node or
@@ -264,7 +265,9 @@ namespace xblick::ros
     };
 
     // A ROS subscription: callback(payload, attachment) for each sample, in Zenoh's thread. A sample without ROS's
-    // attachment is dropped with one warning line, as ROS drops it. Volatile only.
+    // attachment is dropped with one warning line, as ROS drops it. Transient local (/tf_static): also the last
+    // `depth` samples of every publisher with a publication cache, those there at the start and those that come
+    // later (zenoh-ext's AdvancedSubscriber's history; a sample can come twice).
     class Subscriber
     {
     public:
@@ -277,8 +280,11 @@ namespace xblick::ros
         const std::string& key() const { return entity_.key; }
 
     private:
+        struct State;
         Entity entity_;
+        std::shared_ptr<State> state_;
         std::optional<zenoh::Subscriber<void>> subscriber_;
+        std::optional<zenoh::Subscriber<void>> history_;  // transient local: the publishers' cache tokens
         std::optional<zenoh::LivelinessToken> token_;
     };
 

@@ -5,6 +5,7 @@
 //                        [--view] [--frames 10] [--timeout 10] [--camera-info] [--points [--local cuda]]
 //                        [--max-hz 5]
 //   xblick-cpp-probe --connect host:7447 --params <namespace>/<name> [--set NAME:=VALUE]
+//   xblick-cpp-probe --connect host:7447 --tf-static <camera> [--ros] [--timeout 10]
 //
 // --params: a node's parameters (parameters.hpp, ParameterClient): with --set that change first (a line with its
 // result and "checked": its node checked node and deadline), then a line per parameter (name, type, value, read_only,
@@ -14,6 +15,7 @@
 #include <chrono>
 #include <csignal>
 #include <map>
+#include <thread>
 
 #include "xblick/camera.hpp"
 #include "xblick/version.hpp"
@@ -241,6 +243,28 @@ namespace
         return 0;
     }
 
+    // --tf-static CAMERA: the camera's fixed transforms (with --ros: ROS's /tf_static, CAMERA unused), one line per
+    // transform once they came, within --timeout
+    int probe_tf_static(zenoh::Session& session, const xblick::tools::Args& args)
+    {
+        using namespace xblick;
+        const auto timeout = std::chrono::duration<double>(std::stod(args.get("timeout", "10")));
+        StaticTransformSubscriber fixed(session, args.get("tf-static", ""),
+                                        std::chrono::duration_cast<std::chrono::milliseconds>(timeout), args.flag("ros"));
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline and fixed.received() == 0)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        const auto got = fixed.latest();
+        for (const TransformStamped& t : got ? got->transforms : std::vector<TransformStamped>{})
+        {
+            std::cout << "{\"parent\":" << quoted(t.header.frame_id) << ",\"child\":" << quoted(t.child_frame_id)
+                      << ",\"x\":" << t.transform.translation.x << "}" << std::endl;
+        }
+        return got ? 0 : 2;
+    }
+
     int probe_parameters(zenoh::Session& session, const xblick::tools::Args& args)
     {
         using namespace xblick;
@@ -306,6 +330,10 @@ int main(int argc, char** argv)
         if (args.flag("params"))
         {
             return probe_parameters(session, args);
+        }
+        if (args.flag("tf-static"))
+        {
+            return probe_tf_static(session, args);
         }
         SubscriberOptions options;
         options.transport = transports.at(name);

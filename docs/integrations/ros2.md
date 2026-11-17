@@ -76,6 +76,7 @@ A reader reads a ROS topic only when you ask for it. It then needs a session wit
 | `ImageSubscriber(..., transport="ros")`, `xblick hz --transport ros`, `xblick snapshot --transport ros` | `/<stream>/image_raw`, with `camera_info=True` also `/<stream>/camera_info` |
 | `PointCloudSubscriber(..., transport="ros")` | `/<stream>/cloud` |
 | C++: `Transport::Ros` of `ImageSubscriber` (with `camera_info`) and `PointCloudSubscriber`, `xblick-cpp-probe --transport ros` | the same topics |
+| C++: `StaticTransformSubscriber(..., ros = true)`, `xblick-cpp-probe --tf-static --ros` | `/tf_static`, also of publishers that started before it |
 | `DetectionSubscriber(..., ros_type=Detection3DArray)` | `/<key>` of that type |
 | `TransformBuffer(..., ros=True)`, `TransformSubscriber(..., ros=True)`, `StaticTransformSubscriber(..., ros=True)` | `/tf` and `/tf_static` |
 | `ParameterClient(..., ros=True)`, `xblick param --ros --via-ros` | the parameter services of a ROS node |

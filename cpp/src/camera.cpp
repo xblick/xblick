@@ -802,6 +802,8 @@ namespace xblick
         std::optional<zenoh::Subscriber<void>> subscriber;
         std::atomic<bool> closed{false};
         std::thread asker;
+        std::unique_ptr<ros::Subscriber> ros_subscriber;  // ros: ROS's /tf_static
+        bool merge = false;  // ros: every transform received, the newest per child frame
 
         void deliver(const std::string& encoding, std::vector<std::uint8_t> payload)
         {
@@ -813,7 +815,22 @@ namespace xblick
                     throw ProtocolError(key + ": the publisher sends '" + encoding + "', this subscriber reads '" +
                                         p::kTFMessageType.encoding() + "'");
                 }
-                transforms = TFMessage::deserialize(payload);
+                TFMessage message = TFMessage::deserialize(payload);
+                if (merge and transforms)
+                {
+                    for (TransformStamped& t : message.transforms)
+                    {
+                        auto& known = transforms->transforms;
+                        const auto same = std::find_if(known.begin(), known.end(), [&](const TransformStamped& k) {
+                            return k.child_frame_id == t.child_frame_id;
+                        });
+                        same == known.end() ? known.push_back(std::move(t)) : void(*same = std::move(t));
+                    }
+                }
+                else
+                {
+                    transforms = std::move(message);
+                }
                 ++received;
             }
             catch (...)
@@ -824,10 +841,28 @@ namespace xblick
     };
 
     StaticTransformSubscriber::StaticTransformSubscriber(zenoh::Session& session, const std::string& camera,
-                                                         std::chrono::milliseconds timeout)
+                                                         std::chrono::milliseconds timeout, bool ros)
         : impl_(std::make_unique<Impl>())
     {
         Impl& m = *impl_;
+        if (ros)
+        {
+            const std::shared_ptr<ros::Ros> part = ros::of(session);
+            if (not part)
+            {
+                throw std::invalid_argument("reading ROS 2's /tf_static needs a session with --ros");
+            }
+            m.key = "/tf_static";
+            m.merge = true;
+            Impl* self = &m;
+            m.ros_subscriber = std::make_unique<ros::Subscriber>(
+                session, *part, part->node(), "/tf_static", std::string(p::kTFMessageType.name),
+                [self](std::vector<std::uint8_t>&& payload, const ros::Attachment&) {
+                    self->deliver(p::kTFMessageType.encoding(), std::move(payload));
+                },
+                ros::kTfStaticReadQos);
+            return;
+        }
         m.key = check_name(camera) + "/" + std::string(p::kTfStatic);
         Impl* self = &m;
         m.subscriber.emplace(session.declare_subscriber(
@@ -867,6 +902,7 @@ namespace xblick
             impl_->asker.join();
         }
         impl_->subscriber.reset();
+        impl_->ros_subscriber.reset();
     }
 
     std::optional<TFMessage> StaticTransformSubscriber::latest() const
@@ -974,7 +1010,10 @@ namespace xblick
     bool CameraPublisher::subscribed() const
     {
         const Impl& m = *impl_;
-        return m.wants_raw() or m.wants_compressed() or matching(m.shm) or matching(m.cuda);
+        // a ROS camera_info reader counts too: its message is each frame's, with the frame's header (stamp), so a
+        // frame must be published for it; needs_pixels() leaves it out, and publish() then encodes no image
+        return m.wants_raw() or m.wants_compressed() or matching(m.shm) or matching(m.cuda) or
+               m.ros_wants(m.ros_info);
     }
 
     std::string CameraPublisher::info_record() const

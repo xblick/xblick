@@ -82,14 +82,14 @@ namespace xblick
 
     struct CloudPublisherOptions
     {
-        PointLayout layout;
-        std::string frame_id;
-        std::string source;  // e.g. "robot" or "sim": in every cloud's attachment
+        PointLayout layout{};
+        std::string frame_id{};
+        std::string source{};  // e.g. "robot" or "sim": in every cloud's attachment
         std::uint32_t slots = 4;  // ring slots: a reader has slots - 1 cloud periods for a cloud
-        std::optional<int> cuda_device;  // offer cloud/cuda with a CUDA ring on this device
+        std::optional<int> cuda_device{};  // offer cloud/cuda with a CUDA ring on this device
         // offer cloud/compressed: the points lie on these rays (the layout: x, y, z and at most rgb). Every cloud is
         // checked against them; one that does not lie on them throws std::invalid_argument.
-        std::optional<CloudRays> rays;
+        std::optional<CloudRays> rays{};
         double range_step = 0.001;         // metres per step of a range (16 bits: 65.5 m at 1 mm)
         std::string color_codec = "jpeg";  // of the colours: jpeg, or png (exact and slower)
         int jpeg_quality = 95;
@@ -143,7 +143,7 @@ namespace xblick
         Transport local = Transport::Auto;
         // with local Auto: the GPU this subscriber works on (an ordinal, as CUDA numbers them); unset: the CPU, so
         // Auto takes shared memory (a CUDA ring only for a subscriber that works on a GPU)
-        std::optional<int> cuda_device;
+        std::optional<int> cuda_device{};
         bool copy = true;  // false: shm/cuda clouds are views into the ring (check is_valid)
         double max_hz = 0.0;  // at most so many clouds a second, the newest (SubscriberOptions::max_hz); 0: all
     };

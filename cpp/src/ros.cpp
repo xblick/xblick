@@ -725,49 +725,103 @@ namespace xblick::ros
         publisher_->put(zenoh::Bytes(std::vector<std::uint8_t>(payload.begin(), payload.end())), std::move(options));
     }
 
-    Subscriber::Subscriber(zenoh::Session& session, Ros& ros, const NodeName& node, const std::string& topic,
-                           const std::string& type_name, Callback callback, const Qos& qos)
-        : entity_(ros, node, kSubscription, topic, type_name, qos, ros.next_id())
+    // What a subscription's callbacks share (Zenoh's threads may still call them while it goes): the reader's
+    // callback, and closed, set first by ~Subscriber.
+    struct Subscriber::State
     {
-        if (qos.durability == kTransientLocal)
+        Callback callback;
+        std::string topic;
+        std::atomic<bool> warned{false};
+        std::atomic<bool> closed{false};
+
+        // A sample of the topic or of a publisher's history: to the callback with ROS's attachment, else dropped
+        // with one line, as ROS drops it.
+        void take(const zenoh::Sample& sample)
         {
-            throw RosError(topic + ": a transient-local ROS subscription is not offered by the C++ API");
-        }
-        auto warned = std::make_shared<std::atomic<bool>>(false);
-        subscriber_.emplace(session.declare_subscriber(
-            zenoh::KeyExpr(entity_.key),
-            [callback = std::move(callback), warned, topic](const zenoh::Sample& sample) {
+            if (closed.load())
+            {
+                return;
+            }
+            try
+            {
+                const auto a = sample.get_attachment();
+                const std::vector<std::uint8_t> bytes = a ? a->get().as_vector() : std::vector<std::uint8_t>{};
+                Attachment attachment;
                 try
                 {
-                    const auto a = sample.get_attachment();
-                    const std::vector<std::uint8_t> bytes = a ? a->get().as_vector() : std::vector<std::uint8_t>{};
-                    Attachment attachment;
-                    try
+                    attachment = decode_attachment(bytes);
+                }
+                catch (const RosError& error)
+                {
+                    if (not warned.exchange(true))
                     {
-                        attachment = decode_attachment(bytes);
+                        say(topic + ": a sample dropped, as ROS drops it: " + error.what());
                     }
-                    catch (const RosError& error)
+                    return;
+                }
+                callback(sample.get_payload().as_vector(), attachment);
+            }
+            catch (const std::exception& e)  // a bad sample must not end the subscription
+            {
+                say(topic + ": a sample its reader could not take: " + e.what());
+            }
+        }
+    };
+
+    Subscriber::Subscriber(zenoh::Session& session, Ros& ros, const NodeName& node, const std::string& topic,
+                           const std::string& type_name, Callback callback, const Qos& qos)
+        : entity_(ros, node, kSubscription, topic, type_name, qos, ros.next_id()), state_(std::make_shared<State>())
+    {
+        state_->callback = std::move(callback);
+        state_->topic = topic;
+        const std::shared_ptr<State> state = state_;
+        subscriber_.emplace(session.declare_subscriber(
+            zenoh::KeyExpr(entity_.key), [state](const zenoh::Sample& sample) { state->take(sample); },
+            zenoh::closures::none));
+        if (qos.durability == kTransientLocal)
+        {
+            // the history of every publisher of the topic with zenoh-ext's publication cache (rmw_zenoh's
+            // transient-local publishers, and ours): each one's liveliness token <key>/@adv/pub/<zid>/<id>/<meta>,
+            // those there now and those that come later, and a query of that key for its last `depth` samples, as
+            // zenoh-ext's AdvancedSubscriber with detect_late_publishers asks it (_max, _anyke). A sample can come
+            // twice (live and from the history); its reader takes it again (tf2: the same transform).
+            const std::string params = "_max=" + std::to_string(std::max(qos.depth, 1)) + ";_anyke";
+            zenoh::Session::LivelinessSubscriberOptions options;
+            options.history = true;
+            history_.emplace(session.liveliness_declare_subscriber(
+                zenoh::KeyExpr(entity_.key + "/@adv/pub/**"),
+                [state, &session, params](const zenoh::Sample& token) {
+                    if (state->closed.load() or token.get_kind() != Z_SAMPLE_KIND_PUT)
                     {
-                        if (not warned->exchange(true))
-                        {
-                            say(topic + ": a sample dropped, as ROS drops it: " + error.what());
-                        }
                         return;
                     }
-                    callback(sample.get_payload().as_vector(), attachment);
-                }
-                catch (const std::exception& e)  // a bad sample must not end the subscription
-                {
-                    say(topic + ": a sample its reader could not take: " + e.what());
-                }
-            },
-            zenoh::closures::none));
+                    try
+                    {
+                        session.get(
+                            token.get_keyexpr(), params,
+                            [state](const zenoh::Reply& reply) {
+                                if (reply.is_ok())
+                                {
+                                    state->take(reply.get_ok());
+                                }
+                            },
+                            [] {});
+                    }
+                    catch (const std::exception& e)  // the session closing
+                    {
+                        say(state->topic + ": a publisher's history not asked for: " + e.what());
+                    }
+                },
+                zenoh::closures::none, std::move(options)));
+        }
         token_.emplace(session.liveliness_declare_token(zenoh::KeyExpr(entity_.token_key)));
     }
 
     Subscriber::~Subscriber()
     {
+        state_->closed.store(true);
         token_.reset();
+        history_.reset();
         subscriber_.reset();
     }
 
