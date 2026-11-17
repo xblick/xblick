@@ -616,7 +616,9 @@ def _param(args) -> int:
             return 0
         if not args.node:
             raise SystemExit("xblick param: --node <namespace>/<name> (or --nodes)")
-        client = parameters.ParameterClient(z, args.node, args.timeout)
+        if args.via_ros and z.ros is None:
+            raise SystemExit("xblick param: --via-ros needs --ros (the session's part in ROS 2)")
+        client = parameters.ParameterClient(z, args.node, args.timeout, ros=args.via_ros)
         if args.set:
             names = [s.partition(":=")[0] for s in args.set]
             if any(":=" not in s for s in args.set):
@@ -854,6 +856,9 @@ def build_parser(prog: str = "xblick") -> argparse.ArgumentParser:
     what.add_argument("--dump", default=None, metavar="FILE", help="write them as a ROS params file")
     p.add_argument("--atomically", action="store_true", help="with --set: all or none")
     p.add_argument("--timeout", type=float, default=2.0)
+    p.add_argument("--via-ros", action="store_true",
+                   help="with --ros: the ROS node /<--node>'s parameters through ROS 2's keys, e.g. --node talker; a "
+                        "set goes without node and deadline (ROS has neither)")
     zsession.add_arguments(p)
     p.set_defaults(run=_param)
 
