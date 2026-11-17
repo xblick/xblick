@@ -18,9 +18,9 @@ them on its own keys, with its own attachment, and announces every entity by a l
 * a service is a queryable declared ``complete`` (a ROS client queries with target ALL_COMPLETE and reaches no other
   queryable); its reply carries the request's sequence number and client gid with the reply's own timestamp.
 
-The gid: rmw_zenoh derives an entity's gid from its token key with XXH3-128. Durchblick uses the first 16 bytes of
-the key's SHA-256 instead (``gid``): ROS reads it from the attachment and does not check it against the token, so
-nothing depends on it, but a tool that compares a sample's publisher gid with the graph's would not find it.
+The gid: rmw_zenoh derives an entity's gid from its token key with XXH3-128 (low 64 bits, then high 64 bits, little
+endian). ``gid`` does the same through ``_core.ros_gid`` (the C++ core's, cpp/include/xblick/ros_gid.hpp), so a
+sample's gid is the one of its entity in ROS's graph.
 
 Type hashes (RIHS01, REP 2011): ``TYPE_HASHES`` for every type Durchblick carries to ROS. Those of types installed
 with ROS 2 Jazzy are ROS's own (its ``share/<pkg>/msg/<Name>.json``); those of vision_msgs, which a Jazzy install
@@ -180,9 +180,9 @@ def decode_attachment(data) -> tuple[int, int, bytes]:
 
 
 def gid(token_key: str) -> bytes:
-    """The gid of an entity: the first 16 bytes of the SHA-256 of its token key (rmw_zenoh: XXH3-128; module
-    docstring)."""
-    return hashlib.sha256(token_key.encode()).digest()[:GID_SIZE]
+    """The gid of an entity, as rmw_zenoh makes it: XXH3-128 of its token key (module docstring)."""
+    from . import _core
+    return _core.ros_gid(token_key)
 
 
 # ------------------------------------------------------------------------------------------------------------- QoS

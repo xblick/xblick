@@ -148,10 +148,10 @@ def test_cpp_domain_from_the_environment_is_pythons(value, monkeypatch):
 
 def test_cpp_gid_is_rmw_zenohs():
     """The C++ gid (XXH3-128 of the token, ros_gid.hpp) is the one rmw_zenoh put into the talker's samples, and
-    _core.ros_gid is the same function. Python's ros.gid is a SHA-256 prefix until it uses _core.ros_gid."""
+    _core.ros_gid and Python's ros.gid are the same function."""
     gid = bytes.fromhex(CHATTER_ATTACHMENT)[17:].hex()
     (got,) = cpp_wire([["gid", TALKER_CHATTER]])
-    assert got == gid == _core.ros_gid(TALKER_CHATTER).hex()
+    assert got == gid == _core.ros_gid(TALKER_CHATTER).hex() == ros.gid(TALKER_CHATTER).hex()
 
 
 def test_cpp_commanding_is_pythons():

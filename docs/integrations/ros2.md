@@ -210,9 +210,6 @@ type hashes that `--ros` uses.
 - The type hashes of `vision_msgs` come from our own implementation of ROS's hash over the message definitions. It
   gives ROS's hashes for all 252 message and service types of a Jazzy installation. A Jazzy installation with
   `vision_msgs` was not at hand to confirm these three.
-- The C++ side writes each entity's gid as `rmw_zenoh` does, XXH3-128 of its token (`_core.ros_gid`). The Python side
-  still writes a SHA-256 of its token. ROS reads the gid and does not check it, but a tool that compares a sample's
-  gid with the graph's finds no match for a Python entity.
 - A program is one ROS node, and each node's parameters are one more. A vision node therefore shows as two ROS
   nodes, such as `/xblick_yolox` and `/test/camera/yolox`.
 - `/clock` is not mapped: a world's clock is `/<world>/clock`. A ROS node that uses simulated time needs a remap.

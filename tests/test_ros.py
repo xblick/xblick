@@ -66,6 +66,7 @@ def test_attachment_of_a_talker_sample():
     seq, stamp, gid = ros.decode_attachment(CHATTER_ATTACHMENT)
     assert seq == 3 and stamp > 1_700_000_000 * 10**9 and len(gid) == 16
     assert ros.encode_attachment(seq, stamp, gid) == CHATTER_ATTACHMENT
+    assert ros.gid(TALKER_CHATTER) == gid  # rmw_zenoh's gid of the publisher's token: XXH3-128
     for bad in (b"", CHATTER_ATTACHMENT[:-1], CHATTER_ATTACHMENT[:16] + b"\x0f" + CHATTER_ATTACHMENT[17:],
                 b'{"v":1,"seq":1}'):
         with pytest.raises(ros.RosError):
