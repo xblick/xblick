@@ -738,15 +738,25 @@ def test_a_command_reaches_every_queryable_of_its_key():
     files = [*root.glob("src/xblick/**/*.py"), *root.glob("cpp/**/*.cpp"), *root.glob("cpp/**/*.hpp")]
     assert len(files) > 20
     pattern = re.compile(r"\bcomplete\s*=(?!=)|\.complete\b|QueryTarget|query_target|Z_QUERY_TARGET|\.target\s*=(?!=)|"
-                         r"\btarget\s*=\s*zenoh")
+                         r"\btarget\s*=\s*zenoh|[\"']complete[\"']\s*:|[\"']target[\"']\s*:")
+    # each allowed once, in ros.py, whose entities refuse a key that does not start with the domain id (ros._Entity)
     ros_keys_only = {"src/xblick/ros.py": {
-        "self._declared = self._raw.declare_queryable(self.key, complete=True)",
-        "self._declared = self._raw.declare_querier(self.key, target=zenoh.QueryTarget.ALL_COMPLETE)",
-        'return {"payload": bytes(payload), "target": zenoh.QueryTarget.ALL_COMPLETE,'}}
-    found = [f"{f.relative_to(root)}:{n}: {line.strip()}" for f in files
-             for n, line in enumerate(f.read_text().splitlines(), 1) if pattern.search(line)
-             and line.strip() not in ros_keys_only.get(str(f.relative_to(root)), ())]
+        "self._declared = self._raw.declare_queryable(self.key, complete=True)": 1,
+        "self._declared = self._raw.declare_querier(self.key, target=zenoh.QueryTarget.ALL_COMPLETE)": 1,
+        'return {"payload": bytes(payload), "target": zenoh.QueryTarget.ALL_COMPLETE,': 1}}
+    found, allowed = [], {}
+    for f in files:
+        name = str(f.relative_to(root))
+        for n, line in enumerate(f.read_text().splitlines(), 1):
+            if not pattern.search(line):
+                continue
+            if line.strip() in ros_keys_only.get(name, {}):
+                allowed[(name, line.strip())] = allowed.get((name, line.strip()), 0) + 1
+            else:
+                found.append(f"{name}:{n}: {line.strip()}")
     assert found == [], "\n".join(found)
+    assert allowed == {(f, line): count for f, lines in ros_keys_only.items() for line, count in lines.items()}
+    assert "if not re.match(r\"\\d+/\", self.key)" in (root / "src/xblick/ros.py").read_text()
 
 
 # ------------------------------------------------------------------------ commands: node and deadline (0.5.13)

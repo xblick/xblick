@@ -1579,14 +1579,17 @@ class Player(Paced):
 
     def _ros_publisher(self, out: str, encoding: str):
         """With --ros: ROS's publisher of a played key: a camera's, robot's or world's tf on /tf, a camera's tf_static
-        on /tf_static, a controller's command/tf on its own topic as every other key (ros.mirror)."""
+        on /tf_static, every other key on its own topic (ros.mirror). A command key (ros.commanding, e.g. a simulated
+        robot's command/joints and command/tf) is never offered: None."""
         if getattr(self.session, "ros", None) is None:
             return None
+        if ros.commanding(out):
+            return ros.mirror(self.session, out, encoding)  # says it is not offered; None
         parts = out.split("/")
         if parts[-1] == topics.TF_STATIC:
-            return ros.mirror_tf(self.session, static=True)
-        if parts[-1] == topics.TF and (len(parts) < 2 or parts[-2] != topics.COMMAND):
-            return ros.mirror_tf(self.session)
+            return ros.mirror_tf(self.session, static=True, key=out)
+        if parts[-1] == topics.TF:
+            return ros.mirror_tf(self.session, key=out)
         return ros.mirror(self.session, out, encoding)
 
     def _answer_static(self, key: str, query: zenoh.Query):

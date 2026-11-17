@@ -120,7 +120,8 @@ def open_session(connect: Sequence[str] = (), listen: Sequence[str] = (), mode: 
     if ros_options is not None:
         from . import ros
         try:
-            taking_part = ros.Ros(opened, ros_options.domain, ros_options.node)
+            taking_part = ros.Ros(opened, ros_options.domain, ros_options.node,
+                                  params_writable=ros_options.params_writable)
         except BaseException:
             if declared is not None:
                 declared.close()
@@ -261,6 +262,10 @@ def add_arguments(parser, prefix: str = ""):
     parser.add_argument(f"{p}ros-node", default=None, metavar="NAME",
                         help="with --ros: the program's ROS node name (default: the program's name, every character "
                              "other than a letter, digit or _ written as _, e.g. xblick_cam)")
+    parser.add_argument(f"{p}ros-params-writable", action="store_true",
+                        help="with --ros: ROS clients may set this program's parameters (default: they read them, "
+                             "sets are refused). A ROS set is unchecked and uncounted: no node check, no deadline, "
+                             "and two nodes of one name both execute it while the ROS client shows one success")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -269,6 +274,7 @@ class RosOptions:
 
     domain: int
     node: str
+    params_writable: bool = False  # --ros-params-writable: ROS clients may set parameters
 
 
 def ros_options_from_args(args, prefix: str = "", prog: str | None = None) -> RosOptions | None:
@@ -277,11 +283,14 @@ def ros_options_from_args(args, prefix: str = "", prog: str | None = None) -> Ro
     from . import ros
     key = prefix.replace("-", "_")
     domain, node = getattr(args, f"{key}ros_domain", None), getattr(args, f"{key}ros_node", None)
+    writable = getattr(args, f"{key}ros_params_writable", False)
     if not getattr(args, f"{key}ros", False):
-        if domain is not None or node is not None:
-            raise ros.RosError(f"--{prefix}ros-domain and --{prefix}ros-node need --{prefix}ros")
+        if domain is not None or node is not None or writable:
+            raise ros.RosError(f"--{prefix}ros-domain, --{prefix}ros-node and --{prefix}ros-params-writable need "
+                               f"--{prefix}ros")
         return None
-    return RosOptions(ros.domain_from(domain), ros.check_node_name(node or ros.node_name_of(prog or program_name())))
+    return RosOptions(ros.domain_from(domain), ros.check_node_name(node or ros.node_name_of(prog or program_name())),
+                      bool(writable))
 
 
 def open_from_args(args, prefix: str = "", prog: str | None = None) -> Session:
@@ -748,7 +757,9 @@ def ask_once(session: zenoh.Session, selector: str, timeout: float, to: CommandT
 
     Once per queryable: two queryables on the key (two nodes, two bridges) both get it and both may execute it. This
     holds because Zenoh's default query target (BestMatching) reaches every matching queryable while none is declared
-    complete, and no Durchblick queryable is (tests/test_queries.py pins both). The
+    complete, and no Durchblick queryable on our keys is (tests/test_queries.py pins both). The ROS 2 services of a
+    session with ``--ros`` (ros.py) are complete, as rmw_zenoh's, and a ROS request goes with target ALL_COMPLETE; their
+    keys start with the ROS domain id and never match one of ours. The
     callers check first, as far as the protocol lets them, that one node serves the key (``count``): a best-effort
     check that catches two nodes that both answer a read, not a guarantee.
 

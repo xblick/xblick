@@ -1,7 +1,7 @@
 """ROS 2 on Zenoh: the keys, type names, type hashes, attachments, QoS strings and liveliness tokens of rmw_zenoh_cpp
 0.2.13 (ROS 2 Jazzy, Zenoh 1.10.1), so that a program started with ``--ros`` takes part in ROS 2 as well
-(docs/integrations/ros2.md). Durchblick's payloads are the CDR bytes ROS 2 writes already (protocol.md); ROS needs them on
-its own keys, with its own attachment, and announces every entity by a liveliness token.
+(docs/integrations/ros2.md). Durchblick's payloads are the CDR bytes ROS 2 writes already (protocol.md); ROS needs
+them on its own keys, with its own attachment, and announces every entity by a liveliness token.
 
 * data key: ``<domain>/<topic without the leading />/<pkg>::msg::dds_::<Name>_/RIHS01_<type hash>``;
   a service's key the same with the service's name and ``<pkg>::srv::dds_::<Name>_`` and the service type's hash;
@@ -476,11 +476,13 @@ def _raw(session):
 class Ros:
     """A session's part in ROS 2 (``--ros``): ``domain``, and the nodes it shows ROS (its own ``node``, made at the
     start, and those ``add_node`` adds: a node's parameters). Entity ids count up per session, as rmw_zenoh's per
-    context."""
+    context. ``params_writable`` (``--ros-params-writable``): ROS clients may set the parameters of this session's
+    nodes; by default the ROS parameter services answer reads only and refuse sets."""
 
-    def __init__(self, session, domain: int, node: str, namespace: str = "/"):
+    def __init__(self, session, domain: int, node: str, namespace: str = "/", params_writable: bool = False):
         self.session = session
         self.domain = domain
+        self.params_writable = params_writable
         self.zid = str(_raw(session).info.zid())
         self._ids = itertools.count()
         self._lock = threading.Lock()
@@ -526,13 +528,24 @@ class Ros:
                               "(--frame-id)")
 
 
+def commanding(key: str) -> bool:
+    """True for a key that carries what a robot is told: a part ``command`` (a controller's
+    ``<robot>/controller/<instance>/command``, a simulated robot's ``<robot>/command/joints`` and ``command/tf``).
+    Such a key is never offered to ROS, whatever its type: a ROS driver could take its targets."""
+    from .topics import COMMAND
+    return COMMAND in str(key).strip("/").split("/")
+
+
 def mirror(session, key: str, encoding, topic: str | None = None, qos: Qos = STREAM_QOS) -> RosPublisher | None:
     """The ROS publisher that mirrors one of our keys when ``session`` takes part in ROS (``--ros``), else None.
     ``encoding``: the key's Zenoh encoding (``application/cdr;<ROS type>``); ``topic``: ROS's topic, by default the
-    key's (``topic_of``). A key whose type ROS has no hash for (Durchblick's own types, JSON, moveit_msgs) is not
-    offered: one warning line, None. RosError for a key that is no ROS name."""
+    key's (``topic_of``). A command key (``commanding``) and a key whose type ROS has no hash for (Durchblick's own
+    types, JSON, moveit_msgs) are not offered: one warning line, None. RosError for a key that is no ROS name."""
     taking_part = getattr(session, "ros", None)
     if taking_part is None:
+        return None
+    if commanding(key):
+        log.warning(f"{key}: not offered to ROS (a command key: what a robot is told never goes to ROS)")
         return None
     topic = topic or topic_of(key)
     schema = str(encoding).partition(";")
@@ -543,11 +556,15 @@ def mirror(session, key: str, encoding, topic: str | None = None, qos: Qos = STR
     return taking_part.node.publisher(topic, type_name, qos)
 
 
-def mirror_tf(session, static: bool = False) -> RosPublisher | None:
+def mirror_tf(session, static: bool = False, key: str = "") -> RosPublisher | None:
     """The publisher on ROS's global ``/tf`` (``/tf_static`` with ``static``, transient local) when ``session`` takes
-    part in ROS, else None. Its ``put`` checks the frames for a second parent (``Ros.check_tf``)."""
+    part in ROS, else None; None too for a command key (``commanding``, one warning line). Its ``put`` checks the
+    frames for a second parent (``Ros.check_tf``)."""
     taking_part = getattr(session, "ros", None)
     if taking_part is None:
+        return None
+    if commanding(key):
+        log.warning(f"{key}: not offered to ROS (a command key: what a robot is told never goes to ROS)")
         return None
     from .msg import TFMessage
     publisher = taking_part.node.publisher("/tf_static" if static else "/tf", TFMessage.TYPE,
@@ -627,6 +644,8 @@ class _Entity:
         self.qos = qos
         self.token = node.entity_token(kind, name, type_name, qos)
         self.key = data_key(node.ros.domain, name, type_name, self.token.type_hash)
+        if not re.match(r"\d+/", self.key):  # a ROS key starts with the domain: no key of ours does (topics.check_name)
+            raise RosError(f"{self.key!r} is no rmw_zenoh key")
         self.gid = gid(self.token.key())
         self._raw = _raw(node.ros.session)
         self._declared = None
@@ -725,6 +744,11 @@ class RosService(_Entity):
         super().__init__(node, SERVICE, name, type_name, qos)
         self._declared = self._raw.declare_queryable(self.key, complete=True)
         self._announce()
+
+    @property
+    def closed(self) -> bool:
+        """Closed (``close``): its queries end; a server stops reading it."""
+        return self._declared is None
 
     def try_recv(self):
         return self._declared.try_recv()

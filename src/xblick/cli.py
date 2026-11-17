@@ -623,11 +623,13 @@ def _param(args) -> int:
             names = [s.partition(":=")[0] for s in args.set]
             if any(":=" not in s for s in args.set):
                 raise SystemExit("xblick param: --set NAME:=VALUE")
-            descriptors = dict(zip(names, client.describe(names)))
+            described = client.describe(names)
+            descriptors = dict(zip(names, described))
             values = {}
             for item in args.set:
                 name, _, given = item.partition(":=")
-                if descriptors[name].type == ParameterType.NOT_SET:
+                if name not in descriptors or len(described) != len(names) \
+                        or descriptors[name].type == ParameterType.NOT_SET:
                     raise SystemExit(f"xblick param: {args.node} has no parameter {name}")
                 values[name] = parameters.from_text(descriptors[name], given)
             results = ([client.set_atomically(values)] if args.atomically else client.set(values))

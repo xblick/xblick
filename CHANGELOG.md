@@ -21,13 +21,15 @@ parameters, and it reads theirs.
 - `--ros`, `--ros-domain` and `--ros-node` in every command and in every node that opens its session with `open_from_args`, and as read-only node parameters.
 - With `--ros`: images, camera_info, JPEG and PNG compressed images, point clouds, detections, diagnostics and robot state on ROS's keys, while a ROS subscriber is there.
 - With `--ros`: transforms on ROS's global `/tf` and `/tf_static`, the static ones also for ROS subscribers that start later; a frame with two parents in one program is one error line.
-- With `--ros`: each node's parameters as a ROS node's services, so that `ros2 param` works; `xblick param --via-ros` and `ParameterClient(ros=True)` for a ROS node's parameters.
+- With `--ros`: each node's parameters as a ROS node's services, read only unless `--ros-params-writable`, so that `ros2 param` works; `xblick param --via-ros` and `ParameterClient(ros=True)` for a ROS node's parameters.
+- `CountedPublisher.ros_matched`: a ROS subscriber of the key's mirror (`matched` stays our key's).
 - Readers of ROS topics: transport `ros` for images and clouds (`xblick hz`, `xblick snapshot`), `DetectionSubscriber(ros_type=...)`, `TransformBuffer(ros=True)`.
 - The guide [Durchblick and ROS 2](docs/integrations/ros2.md) and the protocol's section on `rmw_zenoh`.
 
 ### Known limit
 
-- A set by a ROS client carries no node and no deadline, so the node executes it without these checks.
+- With `--ros-params-writable` a ROS client's set is unchecked and uncounted: no node check, no deadline, and every node of the name executes it.
+- Keys with a part `command` never go to ROS.
 - The C++ API and programs have no `--ros` yet.
 
 Compatible with 0.5.14: without `--ros` no byte on the wire changes.
