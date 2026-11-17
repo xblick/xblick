@@ -21,6 +21,7 @@
 #include "xblick/ray_cloud.hpp"
 #include "xblick/rectify.hpp"
 #include "xblick/ring.hpp"
+#include "xblick/ros_gid.hpp"
 #include "xblick/rvl.hpp"
 #include "xblick/version.hpp"
 
@@ -60,6 +61,10 @@ NB_MODULE(_core, m)
     m.def("cpp_cache_dir", [](const std::string& node) { return xblick::cache_dir(node).string(); });
     m.def("cpp_data_dir", [](const std::string& node) { return xblick::data_dir(node).string(); });
     m.def("cpp_config_dir", [] { return xblick::config_dir().string(); });
+    m.def("ros_gid", [](const std::string& token_key) {
+        const xblick::ros::Gid gid = xblick::ros::gid(token_key);
+        return nb::bytes(reinterpret_cast<const char*>(gid.data()), gid.size());
+    }, "token_key"_a, "rmw_zenoh's gid of a ROS entity: XXH3-128 of its liveliness token key (ros_gid.hpp)");
     m.def("rvl_encode", [](InArray pixels) {
               if (pixels.ndim() != 2 or pixels.dtype() != nb::dtype<std::uint16_t>())
               {

@@ -24,6 +24,10 @@ This repository contains or follows material of others:
   Proceedings of the ACM International Conference on Interactive Surfaces and Spaces (ISS), 2017. Its byte layout
   follows the "rvl" format of ROS's compressed_depth_image_transport.
 
+- cpp/third_party/xxhash/xxhash.h: xxHash 0.8.3 (Cyan4973/xxHash), unchanged, under the BSD 2-Clause licence
+  (licenses/xxhash-LICENSE). Its XXH3-128 gives the gids of ROS 2 entities as rmw_zenoh makes them
+  (cpp/src/ros_gid.cpp); the C++ library and the wheels' module xblick._core contain it.
+
 - The wheels of the Python package xblick contain the module xblick._core, built with nanobind (wjakob/nanobind) and
   the hash map robin-map (Tessil/robin-map) that nanobind compiles in. nanobind is under the BSD 3-Clause licence
   (licenses/nanobind-LICENSE), robin-map under the MIT licence (licenses/robin-map-LICENSE).
