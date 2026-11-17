@@ -261,6 +261,30 @@ namespace xblick::detail
         return item;
     }
 
+    std::unique_ptr<ros::Subscriber> ros_subscriber(zenoh::Session& session, const std::string& key,
+                                                    const p::MessageType& type, std::shared_ptr<Latest> latest,
+                                                    int route)
+    {
+        const std::shared_ptr<ros::Ros> part = ros::of(session);
+        if (not part)
+        {
+            throw std::invalid_argument("transport ros reads the stream's ROS 2 topic: it needs a session with --ros");
+        }
+        const std::string topic = ros::topic_of(key);
+        const std::string encoding = type.encoding();
+        return std::make_unique<ros::Subscriber>(
+            session, *part, part->node(), topic, std::string(type.name),
+            [latest, topic, encoding, route](std::vector<std::uint8_t>&& payload, const ros::Attachment&) {
+                auto made = std::make_shared<Item>();
+                made->payload = std::move(payload);
+                made->key = topic;
+                made->encoding = encoding;  // a ROS sample is zenoh/bytes: its type is the topic's
+                made->receive_ns = now_ns();
+                made->transport = Transport::Ros;
+                latest->offer(std::move(made), route);
+            });
+    }
+
     void check_encoding(const Item& item, const p::MessageType& type)
     {
         if (item.encoding != type.encoding())
@@ -338,6 +362,7 @@ namespace xblick::detail
         want_.reset();
         std::lock_guard lock(mutex_);
         subscriber_.reset();
+        ros_subscriber_.reset();
     }
 
     void Subscription::recheck()
@@ -378,9 +403,17 @@ namespace xblick::detail
             }
             latest_->move(route);
             auto target = latest_;
-            subscriber_.emplace(session_.declare_subscriber(
-                zenoh::KeyExpr(key_of(t, gpu)), [target, t, route](const zenoh::Sample& s) { target->put(s, t, route); },
-                zenoh::closures::none));
+            if (t == Transport::Ros)  // requested only, never chosen: no subscriber before it
+            {
+                ros_subscriber_ = ros_subscriber(session_, key_of(t, gpu),
+                                                 kind_ == "points" ? p::kPointCloud2Type : p::kImageType, target, route);
+            }
+            else
+            {
+                subscriber_.emplace(session_.declare_subscriber(
+                    zenoh::KeyExpr(key_of(t, gpu)),
+                    [target, t, route](const zenoh::Sample& s) { target->put(s, t, route); }, zenoh::closures::none));
+            }
             transport_ = t;
             using_ = std::make_pair(t, gpu);
         }

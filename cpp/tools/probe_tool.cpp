@@ -1,7 +1,7 @@
 // xblick-cpp-probe: a C++ subscriber that prints one JSON line per frame (encoding, size, sequence number,
 // checksum of the pixels), for checking C++ against Python and as an example of the C++ API.
 //
-//   xblick-cpp-probe --connect host:7447 --base test/camera/color --transport auto|raw|compressed|shm|cuda
+//   xblick-cpp-probe --connect host:7447 --base test/camera/color --transport auto|raw|compressed|shm|cuda|ros
 //                        [--view] [--frames 10] [--timeout 10] [--camera-info] [--points [--local cuda]]
 //                        [--max-hz 5]
 //   xblick-cpp-probe --connect host:7447 --params <namespace>/<name> [--set NAME:=VALUE]
@@ -293,7 +293,8 @@ int main(int argc, char** argv)
         const std::string name = args.get("transport", "auto");
         const std::map<std::string, Transport> transports = {{"auto", Transport::Auto}, {"raw", Transport::Raw},
                                                              {"compressed", Transport::Compressed},
-                                                             {"shm", Transport::Shm}, {"cuda", Transport::Cuda}};
+                                                             {"shm", Transport::Shm}, {"cuda", Transport::Cuda},
+                                                             {"ros", Transport::Ros}};
         if (not transports.count(name))
         {
             throw std::invalid_argument("--transport " + name);

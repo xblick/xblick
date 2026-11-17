@@ -365,6 +365,7 @@ namespace xblick
         std::string key_;
         std::vector<std::uint8_t> payload_;
         std::optional<zenoh::Queryable<void>> queryable_;
+        std::unique_ptr<ros::Publisher> ros_;  // --ros: on ROS's /tf_static, kept for late ROS subscribers
     };
 
     // A camera's fixed transforms from <camera>/tf_static, as Python's StaticTransformSubscriber: those its publisher
@@ -410,6 +411,7 @@ namespace xblick
 
     private:
         zenoh::Publisher publisher_;
+        std::unique_ptr<ros::Publisher> ros_;  // --ros: /<camera>/imu
     };
 
     // How a camera's publishers are doing, on <camera>/diagnostics (protocol.hpp), as ROS's /diagnostics: publish one
@@ -423,6 +425,7 @@ namespace xblick
 
     private:
         zenoh::Publisher publisher_;
+        std::unique_ptr<ros::Publisher> ros_;  // --ros: /<camera>/diagnostics
         std::string zid_;
         std::int64_t seq_ = 0;
     };
@@ -442,6 +445,7 @@ namespace xblick
 
     private:
         zenoh::Publisher publisher_;
+        std::unique_ptr<ros::Publisher> ros_;  // --ros: /<key>, for a ROS type and no command key
     };
 
     // A camera's moving transforms on <camera>/tf (protocol.hpp), as ROS's /tf: its pose in the world (parent frame
@@ -454,6 +458,7 @@ namespace xblick
 
     private:
         zenoh::Publisher publisher_;
+        std::unique_ptr<ros::Publisher> ros_;  // --ros: ROS's /tf
     };
 
     // A robot's state below its namespace (protocol.hpp): <robot>/joint_states, <robot>/tf, <robot>/odom and
@@ -473,6 +478,9 @@ namespace xblick
         std::string robot_;
         zenoh::Publisher joint_states_, tf_, odom_;
         std::map<std::string, zenoh::Publisher> wrenches_;
+        // --ros: /<robot>/joint_states, /tf, /<robot>/odom, /<robot>/wrench/<sensor>
+        std::unique_ptr<ros::Publisher> ros_joint_states_, ros_tf_, ros_odom_;
+        std::map<std::string, std::unique_ptr<ros::Publisher>> ros_wrenches_;
     };
 
     // ---------------------------------------------------------------------------------------- subscriber
@@ -484,6 +492,9 @@ namespace xblick
         Raw,         // sensor_msgs/Image
         Shm,         // host ring, same host only
         Cuda,        // CUDA ring, same host only; frames in device memory
+        // The stream's ROS 2 topic (/<base>/image_raw, a cloud's /<base>/cloud) of a ROS publisher, for a session
+        // with --ros (ros.hpp); never chosen by Auto. Its frames carry no seq, source or publish time.
+        Ros,
     };
 
     const char* to_string(Transport transport);

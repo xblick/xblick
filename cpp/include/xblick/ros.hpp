@@ -283,12 +283,13 @@ namespace xblick::ros
     };
 
     // A ROS service: a queryable on ROS's key, declared complete (ROS clients ask with target ALL_COMPLETE), its
-    // queries handed to `handler` in Zenoh's thread; the query is dropped when the handler returns. reply() answers
+    // queries handed to `handler` (with the service, for its reply) in Zenoh's thread; the query is dropped when the
+    // handler returns. reply() answers
     // one with ROS's attachment (the request's sequence number and client gid, the reply's time).
     class Service
     {
     public:
-        using Handler = std::function<void(const zenoh::Query&)>;
+        using Handler = std::function<void(const zenoh::Query&, const Service&)>;
         Service(zenoh::Session& session, Ros& ros, const NodeName& node, const std::string& name,
                 const std::string& type_name, Handler handler, const Qos& qos = kParametersQos);
         ~Service();

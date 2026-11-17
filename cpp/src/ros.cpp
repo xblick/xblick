@@ -765,10 +765,10 @@ namespace xblick::ros
         options.complete = true;  // ROS clients query with target ALL_COMPLETE (ros.hpp)
         queryable_.emplace(session.declare_queryable(
             zenoh::KeyExpr(entity_.key),
-            [handler = std::move(handler), name](const zenoh::Query& query) {
+            [this, handler = std::move(handler), name](const zenoh::Query& query) {
                 try
                 {
-                    handler(query);
+                    handler(query, *this);  // entity_ is set: a call during the construction can be answered
                 }
                 catch (const std::exception& e)  // nothing escapes into Zenoh's thread
                 {

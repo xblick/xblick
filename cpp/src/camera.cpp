@@ -422,6 +422,8 @@ namespace xblick
         detail::RingWriters rings;
         std::int64_t seq = 0;
         std::vector<std::string> offered;  // PublisherOptions::transports, checked (all if it was empty)
+        // --ros: image_raw, image_raw/compressed (jpeg, png) and camera_info on ROS's keys (null: not offered)
+        std::unique_ptr<ros::Publisher> ros_raw, ros_compressed, ros_info;
         // Last, so destroyed first, also when the constructor throws: Zenoh's threads answer <base>/info (and rays)
         // from the members above, and undeclaring waits for a callback that runs (zenoh-c 1.10). Declared before them,
         // a query during the destruction read freed members (a CUDA ring's server takes up to 200 ms to stop;
@@ -480,7 +482,7 @@ namespace xblick
                 put(*shm, d.serialize(), attachment);
                 sent.push_back(shm_key);
             }
-            if (matching(raw))
+            if (matching(raw) or ros_wants(ros_raw))
             {
                 Image m;
                 m.header = header;
@@ -489,17 +491,41 @@ namespace xblick
                 m.encoding = o.encoding;
                 m.step = step;
                 m.data = std::span<const std::uint8_t>(pixels, static_cast<std::size_t>(step) * image.height);
-                put(*raw, m.serialize(), attachment);
-                sent.push_back(key(base, p::kImageRaw));
+                send(raw, ros_raw, m.serialize(), attachment, key(base, p::kImageRaw), sent);
             }
-            if (matching(compressed))
+            if (matching(compressed) or ros_wants(ros_compressed))
             {
-                put(*compressed,
-                    (jpeg.empty() ? compress(image, o.encoding, o.codec, o.jpeg_quality, header)
-                                  : jpeg_message(jpeg, o.encoding, header))
-                        .serialize(),
-                    attachment);
-                sent.push_back(key(base, p::kCompressed));
+                send(compressed, ros_compressed,
+                     (jpeg.empty() ? compress(image, o.encoding, o.codec, o.jpeg_quality, header)
+                                   : jpeg_message(jpeg, o.encoding, header))
+                         .serialize(),
+                     attachment, key(base, p::kCompressed), sent);
+            }
+        }
+
+        static bool ros_wants(const std::unique_ptr<ros::Publisher>& publisher)
+        {
+            return publisher and publisher->matched();
+        }
+
+        // somebody takes image_raw, image_raw/compressed: ours or ROS's
+        bool wants_raw() const { return matching(raw) or ros_wants(ros_raw); }
+        bool wants_compressed() const { return matching(compressed) or ros_wants(ros_compressed); }
+
+        // A sample made once (encoded, serialized) to our key and to ROS's, each that has subscribers.
+        static void send(std::optional<zenoh::Publisher>& ours, const std::unique_ptr<ros::Publisher>& theirs,
+                         std::vector<std::uint8_t>&& payload, const detail::FrameAttachment& attachment,
+                         const std::string& our_key, std::vector<std::string>& sent)
+        {
+            if (ros_wants(theirs))
+            {
+                theirs->put(payload);  // copied into its sample
+                sent.push_back(theirs->key());
+            }
+            if (matching(ours))
+            {
+                put(*ours, std::move(payload), attachment);
+                sent.push_back(our_key);
             }
         }
 
@@ -551,12 +577,11 @@ namespace xblick
         void publish_camera_info(const std::string& base, const Header& header,
                                  const detail::FrameAttachment& attachment, std::vector<std::string>& sent)
         {
-            if (o.camera_info and matching(camera_info))
+            if (o.camera_info and (matching(camera_info) or ros_wants(ros_info)))
             {
                 CameraInfo info = *o.camera_info;
-                info.header = header;
-                put(*camera_info, info.serialize(), attachment);
-                sent.push_back(key(base, p::kCameraInfo));
+                info.header = header;  // ROS's too: each frame's camera_info with the image's header
+                send(camera_info, ros_info, info.serialize(), attachment, key(base, p::kCameraInfo), sent);
             }
         }
     };
@@ -595,6 +620,27 @@ namespace xblick
         {
             m.camera_info = declare(session, key(base_, p::kCameraInfo), p::kCameraInfoType);
         }
+        if (const std::shared_ptr<ros::Ros> part = ros::of(session))
+        {
+            // the network forms this publisher offers, on ROS's topics (a relay, rings only, offers none); RVL has no
+            // image_transport format
+            const auto publisher = [&](std::string_view suffix, const p::MessageType& type) {
+                return std::make_unique<ros::Publisher>(session, *part, part->node(), ros::topic_of(key(base_, suffix)),
+                                                        std::string(type.name));
+            };
+            if (offers("raw"))
+            {
+                m.ros_raw = publisher(p::kImageRaw, p::kImageType);
+            }
+            if (offers("compressed") and (m.o.codec == kJpeg or m.o.codec == kPng))
+            {
+                m.ros_compressed = publisher(p::kCompressed, p::kCompressedImageType);
+            }
+            if (m.o.camera_info and (m.ros_raw or m.ros_compressed))
+            {
+                m.ros_info = publisher(p::kCameraInfo, p::kCameraInfoType);
+            }
+        }
         const std::string info_key = key(base_, p::kInfo);
         m.info_queryable = session.declare_queryable(
             zenoh::KeyExpr(info_key),
@@ -605,52 +651,74 @@ namespace xblick
 
     CameraPublisher::~CameraPublisher() = default;  // Impl's queryable and token go first (its last members)
 
+    namespace
+    {
+        // A sample to ROS's mirror of a key while a ROS subscriber is there (no mirror: nothing).
+        void to_ros(const std::unique_ptr<ros::Publisher>& mirror, const std::vector<std::uint8_t>& payload)
+        {
+            if (mirror and mirror->matched())
+            {
+                mirror->put(payload);
+            }
+        }
+    }  // namespace
+
     ImuPublisher::ImuPublisher(zenoh::Session& session, const std::string& camera)
-        : publisher_(declare(session, check_name(camera) + "/" + std::string(p::kImu), p::kImuType))
+        : publisher_(declare(session, check_name(camera) + "/" + std::string(p::kImu), p::kImuType)),
+          ros_(ros::mirror(session, check_name(camera) + "/" + std::string(p::kImu), p::kImuType))
     {
     }
 
     bool ImuPublisher::subscribed() const
     {
-        return publisher_.get_matching_status().matching;
+        return publisher_.get_matching_status().matching or (ros_ and ros_->matched());
     }
 
     void ImuPublisher::publish(const Imu& sample)
     {
-        publisher_.put(zenoh::Bytes(sample.serialize()));
+        std::vector<std::uint8_t> payload = sample.serialize();
+        to_ros(ros_, payload);
+        publisher_.put(zenoh::Bytes(std::move(payload)));
     }
 
     DiagnosticsPublisher::DiagnosticsPublisher(zenoh::Session& session, const std::string& camera)
         : publisher_(
               declare(session, check_name(camera) + "/" + std::string(p::kDiagnostics), p::kDiagnosticArrayType)),
+          ros_(ros::mirror(session, check_name(camera) + "/" + std::string(p::kDiagnostics), p::kDiagnosticArrayType)),
           zid_(session.get_zid().to_string())
     {
     }
 
     void DiagnosticsPublisher::publish(const DiagnosticArray& diagnostics)
     {
-        put(publisher_, diagnostics.serialize(), detail::attachment(++seq_, "", zid_));
+        std::vector<std::uint8_t> payload = diagnostics.serialize();
+        to_ros(ros_, payload);
+        put(publisher_, std::move(payload), detail::attachment(++seq_, "", zid_));
     }
 
     MessagePublisher::MessagePublisher(zenoh::Session& session, const std::string& key,
                                        const protocol::MessageType& type)
-        : publisher_(declare(session, check_name(key), type))
+        : publisher_(declare(session, check_name(key), type)), ros_(ros::mirror(session, check_name(key), type))
     {
     }
 
     void MessagePublisher::put(const std::vector<std::uint8_t>& payload)
     {
+        to_ros(ros_, payload);
         publisher_.put(zenoh::Bytes(payload));
     }
 
     TransformPublisher::TransformPublisher(zenoh::Session& session, const std::string& camera)
-        : publisher_(declare(session, check_name(camera) + "/" + std::string(p::kTf), p::kTFMessageType))
+        : publisher_(declare(session, check_name(camera) + "/" + std::string(p::kTf), p::kTFMessageType)),
+          ros_(ros::mirror_tf(session, false, check_name(camera) + "/" + std::string(p::kTf)))
     {
     }
 
     void TransformPublisher::publish(const TFMessage& transforms)
     {
-        publisher_.put(zenoh::Bytes(transforms.serialize()));
+        std::vector<std::uint8_t> payload = transforms.serialize();
+        to_ros(ros_, payload);
+        publisher_.put(zenoh::Bytes(std::move(payload)));
     }
 
     RobotStatePublisher::RobotStatePublisher(zenoh::Session& session, const std::string& robot)
@@ -658,23 +726,32 @@ namespace xblick
           robot_(check_name(robot)),
           joint_states_(declare(session, robot_ + "/" + std::string(p::kJointStates), p::kJointStateType)),
           tf_(declare(session, robot_ + "/" + std::string(p::kTf), p::kTFMessageType)),
-          odom_(declare(session, robot_ + "/" + std::string(p::kOdom), p::kOdometryType))
+          odom_(declare(session, robot_ + "/" + std::string(p::kOdom), p::kOdometryType)),
+          ros_joint_states_(ros::mirror(session, robot_ + "/" + std::string(p::kJointStates), p::kJointStateType)),
+          ros_tf_(ros::mirror_tf(session, false, robot_ + "/" + std::string(p::kTf))),
+          ros_odom_(ros::mirror(session, robot_ + "/" + std::string(p::kOdom), p::kOdometryType))
     {
     }
 
     void RobotStatePublisher::joint_states(const JointState& message)
     {
-        joint_states_.put(zenoh::Bytes(message.serialize()));
+        std::vector<std::uint8_t> payload = message.serialize();
+        to_ros(ros_joint_states_, payload);
+        joint_states_.put(zenoh::Bytes(std::move(payload)));
     }
 
     void RobotStatePublisher::tf(const TFMessage& message)
     {
-        tf_.put(zenoh::Bytes(message.serialize()));
+        std::vector<std::uint8_t> payload = message.serialize();
+        to_ros(ros_tf_, payload);
+        tf_.put(zenoh::Bytes(std::move(payload)));
     }
 
     void RobotStatePublisher::odom(const Odometry& message)
     {
-        odom_.put(zenoh::Bytes(message.serialize()));
+        std::vector<std::uint8_t> payload = message.serialize();
+        to_ros(ros_odom_, payload);
+        odom_.put(zenoh::Bytes(std::move(payload)));
     }
 
     void RobotStatePublisher::wrench(const std::string& sensor, const WrenchStamped& message)
@@ -684,8 +761,11 @@ namespace xblick
         {
             const std::string key = check_name(robot_ + "/" + std::string(p::kWrench) + "/" + sensor);
             it = wrenches_.emplace(sensor, declare(session_, key, p::kWrenchStampedType)).first;
+            ros_wrenches_.emplace(sensor, ros::mirror(session_, key, p::kWrenchStampedType));
         }
-        it->second.put(zenoh::Bytes(message.serialize()));
+        std::vector<std::uint8_t> payload = message.serialize();
+        to_ros(ros_wrenches_.at(sensor), payload);
+        it->second.put(zenoh::Bytes(std::move(payload)));
     }
 
     StaticTransformPublisher::StaticTransformPublisher(zenoh::Session& session, const std::string& camera,
@@ -705,6 +785,11 @@ namespace xblick
         zenoh::Session::PutOptions options;
         options.encoding = zenoh::Encoding(p::kTFMessageType.encoding());
         session.put(zenoh::KeyExpr(key_), zenoh::Bytes(payload_), std::move(options));
+        ros_ = ros::mirror_tf(session, true, key_);
+        if (ros_)
+        {
+            ros_->put(payload_);  // kept in its cache for later ROS subscribers
+        }
     }
 
     struct StaticTransformSubscriber::Impl
@@ -889,7 +974,7 @@ namespace xblick
     bool CameraPublisher::subscribed() const
     {
         const Impl& m = *impl_;
-        return matching(m.raw) or matching(m.compressed) or matching(m.shm) or matching(m.cuda);
+        return m.wants_raw() or m.wants_compressed() or matching(m.shm) or matching(m.cuda);
     }
 
     std::string CameraPublisher::info_record() const
@@ -1027,17 +1112,17 @@ namespace xblick
             m.publish_host(base_, HostImage{slot, image.height, image.width, 0}, header, attachment, sent, jpeg,
                            &in_shm);
         }
-        else if (matching(m.raw) or (matching(m.compressed) and jpeg.empty()))
+        else if (m.wants_raw() or (m.wants_compressed() and jpeg.empty()))
         {
             std::vector<std::uint8_t> host(nbytes);  // one download for every CPU representation
             ring.read_host(w.slot, host.data(), nbytes);
             m.publish_host(base_, HostImage{host.data(), image.height, image.width, 0}, header, attachment, sent,
                            jpeg);
         }
-        else if (matching(m.compressed))
+        else if (m.wants_compressed())
         {
-            put(*m.compressed, jpeg_message(jpeg, m.o.encoding, header).serialize(), attachment);
-            sent.push_back(key(base_, p::kCompressed));
+            m.send(m.compressed, m.ros_compressed, jpeg_message(jpeg, m.o.encoding, header).serialize(), attachment,
+                   key(base_, p::kCompressed), sent);
         }
         m.publish_camera_info(base_, header, attachment, sent);
         return sent;
@@ -1046,7 +1131,7 @@ namespace xblick
     bool CameraPublisher::needs_pixels() const
     {
         const Impl& m = *impl_;
-        return matching(m.raw) or matching(m.shm) or matching(m.cuda);
+        return m.wants_raw() or matching(m.shm) or matching(m.cuda);
     }
 
     std::vector<std::string> CameraPublisher::publish_jpeg(std::span<const std::uint8_t> jpeg,
@@ -1062,10 +1147,10 @@ namespace xblick
         ++m.seq;
         const detail::FrameAttachment attachment = m.attachment();
         std::vector<std::string> sent;
-        if (matching(m.compressed))
+        if (m.wants_compressed())
         {
-            put(*m.compressed, jpeg_message(jpeg, m.o.encoding, header).serialize(), attachment);
-            sent.push_back(key(base_, p::kCompressed));
+            m.send(m.compressed, m.ros_compressed, jpeg_message(jpeg, m.o.encoding, header).serialize(), attachment,
+                   key(base_, p::kCompressed), sent);
         }
         m.publish_camera_info(base_, header, attachment, sent);
         return sent;
@@ -1082,6 +1167,7 @@ namespace xblick
             case Transport::Raw: return "raw";
             case Transport::Shm: return "shm";
             case Transport::Cuda: return "cuda";
+            case Transport::Ros: return "ros";
         }
         return "?";
     }
@@ -1094,6 +1180,7 @@ namespace xblick
             {
                 case Transport::Compressed: return p::kCompressedImageType;
                 case Transport::Raw: return p::kImageType;
+                case Transport::Ros: return p::kImageType;
                 case Transport::Shm: return p::kShmImageType;
                 case Transport::Cuda: return p::kCudaImageType;
                 case Transport::Auto: break;
@@ -1107,6 +1194,7 @@ namespace xblick
             {
                 case Transport::Compressed: return p::kCompressed;
                 case Transport::Raw: return p::kImageRaw;
+                case Transport::Ros: return p::kImageRaw;
                 case Transport::Shm: return p::kShm;
                 case Transport::Cuda: return p::kCuda;
                 case Transport::Auto: break;
@@ -1495,6 +1583,7 @@ namespace xblick
         std::atomic<std::uint64_t> decoded{0};
         std::shared_ptr<detail::Latest> info_latest;
         std::optional<zenoh::Subscriber<void>> info_subscriber;
+        std::unique_ptr<ros::Subscriber> ros_info_subscriber;  // transport Ros: /<base>/camera_info
 
         Impl(zenoh::Session& session, const std::string& base, SubscriberOptions options)
             : o(options), subscription(session, base, "image", o.transport, o.local, o.remote, suffix_of, o.cuda_device)
@@ -1512,7 +1601,8 @@ namespace xblick
         {
             throw std::invalid_argument("local: Auto, Shm or Cuda");
         }
-        if (not options.copy and (options.transport == Transport::Compressed or options.transport == Transport::Raw))
+        if (not options.copy and (options.transport == Transport::Compressed or options.transport == Transport::Raw or
+                                  options.transport == Transport::Ros))
         {
             throw std::invalid_argument("copy = false is for the shm and cuda transports (and auto)");
         }
@@ -1520,7 +1610,13 @@ namespace xblick
         Impl& m = *impl_;
         m.subscription.limit_rate(options.max_hz);
         m.subscription.keep_recent(options.keep_recent);
-        if (options.camera_info)
+        if (options.camera_info and options.transport == Transport::Ros)
+        {
+            m.info_latest = std::make_shared<detail::Latest>();
+            m.ros_info_subscriber = detail::ros_subscriber(session, key(m.subscription.base(), p::kCameraInfo),
+                                                           p::kCameraInfoType, m.info_latest, 0);
+        }
+        else if (options.camera_info)
         {
             m.info_latest = std::make_shared<detail::Latest>();
             auto target = m.info_latest;
@@ -1533,6 +1629,7 @@ namespace xblick
     ImageSubscriber::~ImageSubscriber()
     {
         impl_->info_subscriber.reset();
+        impl_->ros_info_subscriber.reset();
     }
 
     std::optional<Transport> ImageSubscriber::transport() const
@@ -1661,7 +1758,7 @@ namespace xblick
             ++m.decoded;
             return f;
         }
-        if (t == Transport::Raw)
+        if (t == Transport::Raw or t == Transport::Ros)
         {
             const Image message = Image::deserialize(item.payload);
             if (message.is_bigendian)

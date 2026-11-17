@@ -180,6 +180,10 @@ namespace xblick
         CloudPublisherOptions o;
         std::string host;
         std::optional<zenoh::Publisher> raw, shm, cuda, compressed;
+        // --ros: the plain cloud on ROS's /<base>/cloud, whatever forms our readers take (null: not offered)
+        std::unique_ptr<ros::Publisher> ros_raw;
+
+        bool wants_raw() const { return matching(raw) or (ros_raw and ros_raw->matched()); }
         std::string shm_key, cuda_key;  // the rings' keys: with the host, the CUDA ring's with its GPU too
         RaysLayout compressed_layout;
         std::shared_ptr<const RaysState> rays;  // cloud/compressed: null for a publisher without rays
@@ -334,7 +338,7 @@ namespace xblick
                 const Written in_shm = host_ring.commit(n);
                 publish_host(base, slot, height, width, is_dense, header, attachment, sent, &in_shm);
             }
-            else if (matching(raw) or matching(compressed))
+            else if (wants_raw() or matching(compressed))
             {
                 std::vector<std::uint8_t> host(n);
                 ring.read_host(w.slot, host.data(), n);
@@ -358,7 +362,7 @@ namespace xblick
                 put(*shm, d.serialize(), attachment);
                 sent.push_back(shm_key);
             }
-            if (matching(raw))
+            if (wants_raw())
             {
                 PointCloud2 m;
                 m.header = header;
@@ -369,8 +373,17 @@ namespace xblick
                 m.row_step = width * o.layout.point_step;
                 m.data = std::span<const std::uint8_t>(points, n);
                 m.is_dense = is_dense;
-                put(*raw, m.serialize(), attachment);
-                sent.push_back(key(base, p::kCloud));
+                std::vector<std::uint8_t> payload = m.serialize();
+                if (ros_raw and ros_raw->matched())
+                {
+                    ros_raw->put(payload);
+                    sent.push_back(ros_raw->key());
+                }
+                if (matching(raw))
+                {
+                    put(*raw, std::move(payload), attachment);
+                    sent.push_back(key(base, p::kCloud));
+                }
             }
             if (matching(compressed))
             {
@@ -389,6 +402,7 @@ namespace xblick
         check_layout(m.o.layout);
         m.host = host_id();
         m.raw = declare(session, key(base_, p::kCloud), p::kPointCloud2Type);
+        m.ros_raw = ros::mirror(session, key(base_, p::kCloud), p::kPointCloud2Type);
         m.shm_key = detail::ring_key(base_, p::kCloudShm, m.host);
         m.shm = declare(session, m.shm_key, p::kShmPointCloud2Type);
         if (m.o.cuda_device)
@@ -430,7 +444,7 @@ namespace xblick
     bool PointCloudPublisher::subscribed() const
     {
         const Impl& m = *impl_;
-        return matching(m.raw) or matching(m.shm) or matching(m.cuda) or matching(m.compressed);
+        return m.wants_raw() or matching(m.shm) or matching(m.cuda) or matching(m.compressed);
     }
 
     std::string PointCloudPublisher::info_record() const
@@ -565,6 +579,7 @@ namespace xblick
             switch (t)
             {
                 case Transport::Raw: return p::kPointCloud2Type;
+                case Transport::Ros: return p::kPointCloud2Type;
                 case Transport::Shm: return p::kShmPointCloud2Type;
                 case Transport::Cuda: return p::kCudaPointCloud2Type;
                 case Transport::Compressed: return p::kCompressedPointCloud2Type;
@@ -578,6 +593,7 @@ namespace xblick
             switch (t)
             {
                 case Transport::Raw: return p::kCloud;
+                case Transport::Ros: return p::kCloud;
                 case Transport::Shm: return p::kCloudShm;
                 case Transport::Cuda: return p::kCloudCuda;
                 case Transport::Compressed: return p::kCloudCompressed;
@@ -680,7 +696,8 @@ namespace xblick
         {
             throw std::invalid_argument("local: Auto, Shm or Cuda");
         }
-        if (not options.copy and (options.transport == Transport::Raw or options.transport == Transport::Compressed))
+        if (not options.copy and (options.transport == Transport::Raw or options.transport == Transport::Compressed or
+                                  options.transport == Transport::Ros))
         {
             throw std::invalid_argument("copy = false is for the shm and cuda transports (and auto)");
         }
@@ -798,7 +815,7 @@ namespace xblick
             return c;
         }
 
-        if (t == Transport::Raw)
+        if (t == Transport::Raw or t == Transport::Ros)
         {
             const PointCloud2 message = PointCloud2::deserialize(item.payload);
             if (message.is_bigendian)
