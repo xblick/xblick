@@ -23,7 +23,7 @@ Keys (protocol.hpp), the node's key ``<namespace>/<name>`` (its fully qualified 
 With a session that takes part in ROS 2 (``--ros``, ros.py) the node is a ROS node as well, ``/<namespace>/<name>``:
 the same six services on rmw_zenoh's keys (``/<namespace>/<name>/get_parameters``, ...) and its events on ROS's
 ``/parameter_events``, so that ``ros2 param`` works on it. A ROS client's call carries no node and no deadline (ROS
-has neither): a set by a ROS client is executed as a set without a target is, unchecked (docs/guides/ros2.md); our
+has neither): a set by a ROS client is executed as a set without a target is, unchecked (docs/integrations/ros2.md); our
 own callers keep using our keys with the check. ``ParameterClient(..., ros=True)`` reads and sets a ROS node's
 parameters through ROS's keys.
 """

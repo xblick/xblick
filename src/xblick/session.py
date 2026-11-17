@@ -100,7 +100,7 @@ def open_session(connect: Sequence[str] = (), listen: Sequence[str] = (), mode: 
 
     ``ros_options`` (``--ros``): the session takes part in ROS 2 as well (``Session.ros``, ros.py): a ROS node of
     that name on that domain, and the publishers, subscribers and parameters made with the session offer themselves
-    to ROS too (docs/guides/ros2.md). Without it nothing of ROS is sent."""
+    to ROS too (docs/integrations/ros2.md). Without it nothing of ROS is sent."""
     from . import declaration
 
     config = make_config(connect, listen, mode, multicast_scouting, config_file, local_router)
@@ -255,7 +255,7 @@ def add_arguments(parser, prefix: str = ""):
                         help="a Zenoh JSON5 configuration file instead of the endpoints")
     parser.add_argument(f"{p}ros", action="store_true",
                         help="take part in ROS 2 as well (rmw_zenoh, ROS 2 Jazzy): streams, transforms and parameters "
-                             "also on ROS's keys, as a ROS node (docs/guides/ros2.md); our keys stay as they are")
+                             "also on ROS's keys, as a ROS node (docs/integrations/ros2.md); our keys stay as they are")
     parser.add_argument(f"{p}ros-domain", type=int, default=None, metavar="ID",
                         help="with --ros: the ROS domain id (default: ROS_DOMAIN_ID, else 0)")
     parser.add_argument(f"{p}ros-node", default=None, metavar="NAME",

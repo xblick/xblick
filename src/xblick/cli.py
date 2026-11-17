@@ -720,8 +720,9 @@ def build_parser(prog: str = "xblick") -> argparse.ArgumentParser:
             p.add_argument("--timeout", type=float, default=5.0)
         else:
             p.add_argument("--seconds", type=float, default=0.0, help="stop after this time (default: never)")
-        p.add_argument("--transport", choices=("auto", "compressed", "raw", "shm"), default="auto",
-                       help="auto: shared memory on the publisher's host, else compressed")
+        p.add_argument("--transport", choices=("auto", "compressed", "raw", "shm", "ros"), default="auto",
+                       help="auto: shared memory on the publisher's host, else compressed; ros (with --ros): the "
+                            "stream's ROS 2 image topic /<stream>/image_raw")
         zsession.add_arguments(p)
         p.set_defaults(run=run)
 

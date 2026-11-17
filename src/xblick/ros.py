@@ -1,6 +1,6 @@
 """ROS 2 on Zenoh: the keys, type names, type hashes, attachments, QoS strings and liveliness tokens of rmw_zenoh_cpp
 0.2.13 (ROS 2 Jazzy, Zenoh 1.10.1), so that a program started with ``--ros`` takes part in ROS 2 as well
-(docs/guides/ros2.md). Durchblick's payloads are the CDR bytes ROS 2 writes already (protocol.md); ROS needs them on
+(docs/integrations/ros2.md). Durchblick's payloads are the CDR bytes ROS 2 writes already (protocol.md); ROS needs them on
 its own keys, with its own attachment, and announces every entity by a liveliness token.
 
 * data key: ``<domain>/<topic without the leading />/<pkg>::msg::dds_::<Name>_/RIHS01_<type hash>``;
