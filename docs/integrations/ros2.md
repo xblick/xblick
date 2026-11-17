@@ -28,6 +28,7 @@ Start a command or a node with `--ros`. The program then sends on our keys as be
 | `--ros` | take part in ROS 2 as well |
 | `--ros-domain ID` | the ROS domain id. The default is `ROS_DOMAIN_ID`, else 0. |
 | `--ros-node NAME` | the ROS node name. The default is the program's name with every other character written as `_`, such as `xblick_test_camera`. |
+| `--ros-params-writable` | ROS clients may set the program's parameters. Without it they read them, and their sets are refused. A ROS set is unchecked and uncounted: see [Parameters and services](#parameters-and-services). |
 
 The options work in every `xblick` command and in every node that opens its session with `session.open_from_args`.
 A node also shows them as read-only parameters. Without `--ros` the program sends nothing for ROS. A test checks this
@@ -39,8 +40,9 @@ with a digit. A key that breaks this rule stops the program with one line when i
 
 ### What ROS 2 receives
 
-A publisher sends the ROS form only while a ROS subscriber is there. Our rings and compressed forms keep working
-between our programs.
+A publisher sends the ROS form only while a ROS subscriber is there. The fixed transforms on `/tf_static` are the
+exception: a publisher puts them into its cache whether or not a subscriber is there. Our rings and compressed forms
+keep working between our programs.
 
 | Our key | ROS topic | ROS type |
 | --- | --- | --- |
@@ -56,8 +58,12 @@ between our programs.
 | a node's parameter events | `/parameter_events` | `rcl_interfaces/msg/ParameterEvent` |
 
 Some keys have no ROS type, and ROS does not get them. These are the ring descriptors, the RVL depth form, the
-ray-table clouds, JSON keys and `moveit_msgs/RobotState`, a controller's command. Each such key gives one warning line
-at the start.
+ray-table clouds and JSON keys. Each such key gives one warning line at the start.
+
+A key that tells a robot what to do never goes to ROS, whatever its type. Every key with a part `command` counts as
+such a key: a controller's `<robot>/controller/<instance>/command`, and a simulated robot's `<robot>/command/joints`
+and `<robot>/command/tf`. This holds for the live publishers and for `xblick play`. Each such key gives one warning
+line.
 
 ### What a program reads from ROS 2
 
@@ -87,16 +93,25 @@ before it in the same way.
 ## Parameters and services
 
 A node with `--ros` is also the ROS node `/<namespace>/<name>` with the six parameter services of ROS 2. `ros2 param
-list`, `get` and `set` work on it.
+list`, `get` and `describe` work on it. Its ROS services refuse every set with a reason, unless the node was started
+with `--ros-params-writable`.
 
 A set is a command. Our own callers send it on our keys with the node and the deadline in the attachment, and the
-node checks both ([protocol](../concepts/protocol.md#a-commands-node-and-deadline)). A ROS client sends its set on
-ROS's key, and ROS has no node and no deadline. The node therefore executes a ROS client's set without these two
-checks. This is the behaviour of a set without a target on our keys. Read-only access (`--params-read-only`),
-read-only parameters, types, ranges and choices still apply.
+node checks both ([protocol](../concepts/protocol.md#a-commands-node-and-deadline)). Our callers also count the nodes
+of the name first and send nothing when more than one answers. A ROS client does none of this. With
+`--ros-params-writable` a ROS client's set is therefore unchecked and uncounted:
+
+- The node executes it without a node check and without a deadline.
+- Every node of that name gets it and executes it. Two nodes of one name both change, and the ROS client shows one
+  success.
+
+Read-only access (`--params-read-only`), read-only parameters, types, ranges and choices still apply. A ROS set whose
+node blocks in its writer holds the parameters' lock, for our own calls too. Each round, a node answers at most four
+calls per ROS service, so a ROS client that floods it does not starve our own calls.
 
 `ParameterClient(..., ros=True)` and `xblick param --ros --via-ros --node <ROS node>` read and set the parameters of
-any ROS node. A set goes out only after one node answered a read. It goes out once and carries no deadline.
+any ROS node. A set goes out only after exactly one node answered a list_parameters read. This check is best effort.
+The set then goes out once and carries no deadline.
 
 Our other services are offered to ROS only where a ROS service type fits exactly. None does today.
 

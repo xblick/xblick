@@ -46,7 +46,10 @@ def test_ros_options(monkeypatch):
     monkeypatch.setenv("ROS_DOMAIN_ID", "12")
     assert session.ros_options_from_args(parse(["--ros", "--ros-node", "eye"]), prog="x").domain == 12
     assert session.ros_options_from_args(parse(["--ros", "--ros-domain", "3"]), prog="x").domain == 3
-    for argv in (["--ros-domain", "3"], ["--ros-node", "eye"], ["--ros", "--ros-node", "a-b"],
+    assert not session.ros_options_from_args(parse(["--ros"]), prog="x").params_writable
+    assert session.ros_options_from_args(parse(["--ros", "--ros-params-writable"]), prog="x").params_writable
+    for argv in (["--ros-domain", "3"], ["--ros-node", "eye"], ["--ros-params-writable"],
+                 ["--ros", "--ros-node", "a-b"],
                  ["--ros", "--ros-domain", "-1"]):
         with pytest.raises(ValueError):
             session.ros_options_from_args(parse(argv), prog="x")
@@ -200,3 +203,56 @@ def test_a_tf_frame_with_two_parents_is_one_error_line(caplog):
             p.close()
     finally:
         net.close()
+
+
+def test_command_keys_never_go_to_ros(caplog):
+    """What a robot is told (a part ``command``) is never offered to ROS, whatever its type: a simulated robot's
+    command/joints and command/tf, a controller's command; also through xblick play."""
+    from types import SimpleNamespace
+
+    from xblick import topics
+    from xblick.camera import CountedPublisher, cdr_encoding
+    from xblick.msg import JointState, RobotState, TFMessage
+    from xblick.recording import Player
+
+    net = Network(with_ros=True)
+    keys = [(topics.command("robot", "joints"), JointState), (topics.command("robot", "tf"), TFMessage),
+            (topics.controller_command("robot", "arms"), RobotState)]
+    try:
+        for key, kind in keys:
+            assert ros.commanding(key)
+            assert ros.mirror(net.a, key, cdr_encoding(kind)) is None
+            assert ros.mirror_tf(net.a, key=key) is None
+            publisher = CountedPublisher(net.a, key, cdr_encoding(kind), ros_tf=kind is TFMessage)
+            assert publisher._ros is None and not publisher.ros_matched
+            publisher.close()
+            assert Player._ros_publisher(SimpleNamespace(session=net.a), key, str(cdr_encoding(kind))) is None
+        assert any("a command key" in r.getMessage() for r in caplog.records)
+        assert not ros.commanding("robot/joint_states") and not ros.commanding("rostest/cam/tf")
+        assert not [t for t in net.tokens if "command" in t]
+    finally:
+        net.close()
+
+
+def test_matched_is_our_key_and_ros_matched_ros():
+    """CountedPublisher.matched means a subscriber of our key, as before; a ROS subscriber shows in ros_matched."""
+    from xblick.camera import CountedPublisher, cdr_encoding
+    from xblick.msg import JointState
+
+    endpoint = f"tcp/127.0.0.1:{free_port()}"
+    a = session.open_session(listen=[endpoint], ros_options=session.RosOptions(DOMAIN, "xblick_a"))
+    b = session.open_session(connect=[endpoint], ros_options=session.RosOptions(DOMAIN, "xblick_b"))
+    publisher = CountedPublisher(a, "rostest/robot/joint_states", cdr_encoding(JointState))
+    try:
+        ros_reader = b.ros.node.subscriber("/rostest/robot/joint_states", JointState.TYPE, lambda *_: None)
+        wait_until(lambda: publisher.ros_matched)
+        time.sleep(0.3)
+        assert not publisher.matched
+        ours = b.declare_subscriber("rostest/robot/joint_states", lambda s: None)
+        wait_until(lambda: publisher.matched)
+        ours.undeclare()
+        ros_reader.close()
+    finally:
+        publisher.close()
+        b.close()
+        a.close()

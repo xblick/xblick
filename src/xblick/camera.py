@@ -167,19 +167,24 @@ class CountedPublisher:
         self._publisher = session.declare_publisher(self.key, encoding=encoding,
                                                     congestion_control=congestion(blocking))
         self._sent = SentCount(session, self._publisher) if blocking else None
-        self._ros = ros.mirror_tf(session) if ros_tf else ros.mirror(session, self.key, encoding)
+        self._ros = ros.mirror_tf(session, key=self.key) if ros_tf else ros.mirror(session, self.key, encoding)
 
     @property
     def matched(self) -> bool:
-        """True if a subscriber of the key is known (Zenoh's matching status), ROS's too."""
-        return self._publisher.matching_status.matching or (self._ros is not None and self._ros.matched)
+        """True if a subscriber of our key is known (Zenoh's matching status); ROS's subscribers: ``ros_matched``."""
+        return self._publisher.matching_status.matching
+
+    @property
+    def ros_matched(self) -> bool:
+        """True if a subscriber of the ROS topic this key is mirrored to is known (``--ros``); False without one."""
+        return self._ros is not None and self._ros.matched
 
     def put(self, payload: bytes):
         self.seq += 1
         self._publisher.put(payload, attachment=_attachment(self.seq, self.source))
         if self._sent is not None:
             self._sent.count(self.seq)
-        if self._ros is not None and self._ros.matched:
+        if self.ros_matched:
             self._ros.put(payload)
 
     def close(self):
