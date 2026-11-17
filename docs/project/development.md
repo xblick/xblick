@@ -24,6 +24,7 @@ cmake -S . -B build/cpp -G Ninja -DCMAKE_PREFIX_PATH=/opt/zenoh \
       -DXBLICK_CUDA_INCLUDE_DIR=$(uv run python -c "import nvidia, os; print(os.path.join(list(nvidia.__path__)[0], 'cu13', 'include'))")
 cmake --build build/cpp && ctest --test-dir build/cpp
 XBLICK_CPP_BUILD=build/cpp uv run pytest tests/test_cpp_interop.py        # C++ against Python
+XBLICK_CPP_BUILD=build/cpp uv run pytest tests/test_cpp_ros.py            # --ros: C++ against Python and ROS 2
 ```
 
 ## Build the point cloud node

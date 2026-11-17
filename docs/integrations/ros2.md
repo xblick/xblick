@@ -31,6 +31,8 @@ Start a command or a node with `--ros`. The program then sends on our keys as be
 | `--ros-params-writable` | ROS clients may set the program's parameters. Without it they read them, and their sets are refused. A ROS set is unchecked and uncounted: see [Parameters and services](#parameters-and-services). |
 
 The options work in every `xblick` command and in every node that opens its session with `session.open_from_args`.
+In C++ they come with `Options::add_session_options()` and in the C++ programs `xblick-cpp-camera`, `xblick-cpp-probe`
+and `xblick-points` ([C++ and ROS 2](#c-and-ros-2)).
 A node also shows them as read-only parameters. Without `--ros` the program sends nothing for ROS. A test checks this
 on the wire.
 
@@ -73,6 +75,7 @@ A reader reads a ROS topic only when you ask for it. It then needs a session wit
 | --- | --- |
 | `ImageSubscriber(..., transport="ros")`, `xblick hz --transport ros`, `xblick snapshot --transport ros` | `/<stream>/image_raw`, with `camera_info=True` also `/<stream>/camera_info` |
 | `PointCloudSubscriber(..., transport="ros")` | `/<stream>/cloud` |
+| C++: `Transport::Ros` of `ImageSubscriber` (with `camera_info`) and `PointCloudSubscriber`, `xblick-cpp-probe --transport ros` | the same topics |
 | `DetectionSubscriber(..., ros_type=Detection3DArray)` | `/<key>` of that type |
 | `TransformBuffer(..., ros=True)`, `TransformSubscriber(..., ros=True)`, `StaticTransformSubscriber(..., ros=True)` | `/tf` and `/tf_static` |
 | `ParameterClient(..., ros=True)`, `xblick param --ros --via-ros` | the parameter services of a ROS node |
@@ -174,6 +177,23 @@ untested.
 The test camera's frames are `world`, `TestCamera` (`--frame-id`) and `TestCamera_optical`, the images' frame. The
 names in step 4 depend on the node. `ros2 topic list` and `ros2 node list` show the real ones.
 
+## C++ and ROS 2
+
+The C++ API takes part in ROS 2 as the Python API does, with the same keys, tokens, QoS and attachment
+([C++](../reference/cpp-api.md#ros-2)). A test compares both sides byte for byte. A session opened with
+`SessionOptions::ros` mirrors `CameraPublisher`, `PointCloudPublisher`, `TransformPublisher`,
+`StaticTransformPublisher`, `RobotStatePublisher`, `DiagnosticsPublisher`, `ImuPublisher` and `MessagePublisher` to
+ROS, and `Parameters` serves the six parameter services with the same rules as in Python. A publisher that offers only
+its rings, such as a relay's, offers nothing to ROS.
+
+Two differences remain:
+
+- `rmw_zenoh` keeps `/tf_static` for late subscribers with zenoh-ext's advanced publisher. zenoh-c offers it only with
+  its unstable API, which its standalone release lacks. The C++ publisher answers late subscribers with its own
+  cache in the same format, without sequence numbers. A ROS subscriber that starts later may therefore get the
+  message twice. tf2 takes it as the same transform.
+- The C++ API offers no `ParameterClient` for a ROS node yet.
+
 ## Wire format
 
 The [protocol](../concepts/protocol.md#ros-2-on-rmw_zenoh) page lists the keys, the attachment, the tokens and the
@@ -184,13 +204,15 @@ type hashes that `--ros` uses.
 - Tested with ROS 2 Jazzy and `rmw_zenoh_cpp` 0.2.13 on one PC: ROS 2's `listener` and `talker`,
   `static_transform_publisher`, `tf2_echo`, `parameter_blackboard` and an `rclcpp` node built for the tests. The
   `ros2` command line, `rviz2` and two PCs are not tested.
-- Only the Python API takes part. The C++ API and the C++ programs (`xblick-cpp-camera`, `xblick-points`) have no
-  `--ros` yet.
+- The C++ programs were tested against ROS 2's own programs as well: `rclcpp` reads `xblick-cpp-camera`'s streams,
+  `tf2_echo` its `/tf_static`, `rclcpp`'s parameter client its parameters, and `xblick-cpp-probe` reads an `rclcpp`
+  node's image.
 - The type hashes of `vision_msgs` come from our own implementation of ROS's hash over the message definitions. It
   gives ROS's hashes for all 252 message and service types of a Jazzy installation. A Jazzy installation with
   `vision_msgs` was not at hand to confirm these three.
-- Each entity's gid is a SHA-256 of its token, while `rmw_zenoh` uses XXH3-128. ROS reads the gid and does not check
-  it, but a tool that compares a sample's gid with the graph's finds no match.
+- The C++ side writes each entity's gid as `rmw_zenoh` does, XXH3-128 of its token (`_core.ros_gid`). The Python side
+  still writes a SHA-256 of its token. ROS reads the gid and does not check it, but a tool that compares a sample's
+  gid with the graph's finds no match for a Python entity.
 - A program is one ROS node, and each node's parameters are one more. A vision node therefore shows as two ROS
   nodes, such as `/xblick_yolox` and `/test/camera/yolox`.
 - `/clock` is not mapped: a world's clock is `/<world>/clock`. A ROS node that uses simulated time needs a remap.

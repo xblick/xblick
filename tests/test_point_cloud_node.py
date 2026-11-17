@@ -18,10 +18,10 @@ import pytest
 
 from xblick import _core
 from xblick.camera import CameraPublisher, StaticTransformPublisher
-from xblick.msg import (CameraInfo, DiagnosticArray, Header, Quaternion, Time, Transform, TransformStamped,
+from xblick.msg import (CameraInfo, DiagnosticArray, Header, Quaternion, Transform, TransformStamped,
                         Vector3)
 from xblick.points import PointCloudSubscriber, unpack_rgb
-from xblick.session import open_session
+from xblick.session import RosOptions, open_session
 
 BUILD = os.environ.get("XBLICK_CPP_BUILD")
 PROGRAM = Path(BUILD) / "xblick-points" if BUILD else None
@@ -443,5 +443,26 @@ def test_max_hz_limits_the_pair(node, max_hz, offset_ms):
         assert unpaired <= 1 and abs(colours - clouds) <= 1.5, (unpaired, colours, clouds)
         assert clouds >= 0.8 * min(max_hz, 30) * len(reports)
     finally:
+        camera.close()
+        session.close()
+
+
+def test_the_cloud_through_ros(node):
+    """xblick-points with --ros: the plain cloud on ROS's /t/k/points/cloud, computed while only a ROS subscriber takes
+    it, read by our reader with transport ros (docs/integrations/ros2.md)."""
+    port = free_port()
+    session = open_session(listen=[f"127.0.0.1:{port}"])
+    camera = Camera(session, cuda=False)
+    node(port, "--color", "t/k/color", "--ros", "--ros-domain", "94")
+    reader = open_session(connect=[f"127.0.0.1:{port}"], ros_options=RosOptions(94, "py_points"))
+    try:
+        sub = PointCloudSubscriber(reader, "t/k/points", "ros")
+        got = first_cloud(sub)
+        assert got.seq is None and got.header.frame_id == "Depth" and got.stamp_ns in camera.stamps
+        points = got.numpy()
+        check_colour(points, *check_geometry(points))
+        sub.close()
+    finally:
+        reader.close()
         camera.close()
         session.close()

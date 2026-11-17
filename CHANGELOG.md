@@ -24,13 +24,15 @@ parameters, and it reads theirs.
 - With `--ros`: each node's parameters as a ROS node's services, read only unless `--ros-params-writable`, so that `ros2 param` works; `xblick param --via-ros` and `ParameterClient(ros=True)` for a ROS node's parameters.
 - `CountedPublisher.ros_matched`: a ROS subscriber of the key's mirror (`matched` stays our key's).
 - Readers of ROS topics: transport `ros` for images and clouds (`xblick hz`, `xblick snapshot`), `DetectionSubscriber(ros_type=...)`, `TransformBuffer(ros=True)`.
+- The C++ API and programs (`xblick-cpp-camera`, `xblick-cpp-probe`, `xblick-points`) take part the same way: the options in `Options::add_session_options`, `SessionOptions::ros`, `Transport::Ros`.
+- `_core.ros_gid`: the gid of a ROS entity as `rmw_zenoh` makes it (XXH3-128 of its token); the C++ side uses it.
 - The guide [Durchblick and ROS 2](docs/integrations/ros2.md) and the protocol's section on `rmw_zenoh`.
 
 ### Known limit
 
 - With `--ros-params-writable` a ROS client's set is unchecked and uncounted: no node check, no deadline, and every node of the name executes it.
 - Keys with a part `command` never go to ROS.
-- The C++ API and programs have no `--ros` yet.
+- C++: a ROS subscriber that starts late may get a `/tf_static` message twice (zenoh-c's standalone build has no advanced publisher).
 
 Compatible with 0.5.14: without `--ros` no byte on the wire changes.
 

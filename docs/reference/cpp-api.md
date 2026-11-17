@@ -181,6 +181,26 @@ also the one to the read before the command, carries `xblick::answer_attachment(
 uses `xblick::target_of` on the read's answer and the overload of `ask_once` with a `CommandTarget`. Python has the
 same functions in `xblick.session`.
 
+## ROS 2
+
+A session takes part in ROS 2 when it is opened with `SessionOptions::ros`
+([Durchblick and ROS 2](../integrations/ros2.md)). `Options::add_session_options()` adds `--ros`, `--ros-domain`,
+`--ros-node` and `--ros-params-writable` with the rules of Python, and `session_options()` fills in `ros`:
+
+```cpp
+xblick::Options options("xblick-mycam", "my camera");
+options.add_session_options();  // also --ros, --ros-domain, --ros-node, --ros-params-writable
+options.parse(argc, argv);
+zenoh::Session session = xblick::open_session(options.session_options());
+// or without Options: .ros = xblick::ros::Options{.domain = 0, .node = "my_camera"}
+```
+
+The session is then a ROS node, and its publishers and parameters offer themselves to ROS while a ROS subscriber or
+client is there. `ImageSubscriber` and `PointCloudSubscriber` read a stream's ROS topic with `Transport::Ros`.
+`xblick::ros::of(session)` is the session's part in ROS 2, null without `--ros`. `xblick/ros.hpp` also has the keys,
+names, tokens, QoS strings and the attachment of `rmw_zenoh`, and `ros::Publisher`, `ros::Subscriber` and `ros::Service`
+for topics and services of your own.
+
 ## Messages
 
 `xblick/msg.hpp` contains the message types with the names of ROS. Tests compare their bytes with the ROS
@@ -198,4 +218,5 @@ definitions (vision_msgs 4.1.1, in `tests/data/vision_msgs`).
 | `pairing.hpp` | `partner_of`, `partner_period_ns`: a partner stream's sample of a primary frame, by stamp |
 | `paths.hpp` | `cache_dir`, `data_dir`, `config_dir`, `check_node_name`: where a node keeps its files ([Where files are](files.md)), in `xblick::core` |
 | `protocol.hpp` | topic names, message types and versions |
+| `ros.hpp`, `ros_gid.hpp` | ROS 2 on `rmw_zenoh`: keys, tokens, attachment, the session's part ([ROS 2](#ros-2)); the gid in `xblick::core` |
 | `ring.hpp`, `cuda_ring.hpp` | the rings |
