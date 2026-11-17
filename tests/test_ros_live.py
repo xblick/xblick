@@ -233,22 +233,34 @@ def test_tf_static_of_ros_to_our_late_reader(ros_env, ours):
 
 
 def test_ros_parameter_client_on_our_node(ros_env, ours, rosprobe):
-    env, _ = ros_env
+    """rclcpp's parameter client on our node: reads; a set refused by default; with --ros-params-writable taken, and an
+    out-of-range one refused."""
+    env, port = ros_env
     params = Parameters(ours, "boxer", "live/cam")
     params.declare("max_boxes", 10, range=(1, 100))
     params.declare("model", "base", read_only=True)
     try:
         listed = run(env, [str(rosprobe), "params", "/live/cam/boxer", "list"], 30)
         got = run(env, [str(rosprobe), "params", "/live/cam/boxer", "get", "max_boxes"], 30)
-        set_ok = run(env, [str(rosprobe), "params", "/live/cam/boxer", "set", "max_boxes", "42"], 30)
-        set_refused = run(env, [str(rosprobe), "params", "/live/cam/boxer", "set", "max_boxes", "500"], 30)
+        set_off = run(env, [str(rosprobe), "params", "/live/cam/boxer", "set", "max_boxes", "42"], 30)
+        value_off = params["max_boxes"]
     finally:
-        params_value = params["max_boxes"]
         params.close()
+    with session.open_session(connect=[f"tcp/127.0.0.1:{port}"], ros_options=session.RosOptions(
+            DOMAIN, "xblick_live_writable", params_writable=True)) as writable:
+        params = Parameters(writable, "boxer", "live/cam2")
+        params.declare("max_boxes", 10, range=(1, 100))
+        try:
+            set_ok = run(env, [str(rosprobe), "params", "/live/cam2/boxer", "set", "max_boxes", "42"], 30)
+            set_refused = run(env, [str(rosprobe), "params", "/live/cam2/boxer", "set", "max_boxes", "500"], 30)
+        finally:
+            value_on = params["max_boxes"]
+            params.close()
     assert "NAME max_boxes" in listed and "NAME model" in listed, listed[-2000:]
     assert "VALUE max_boxes 10" in got, got[-2000:]
+    assert "SET 0 sets through ROS 2 are off" in set_off and value_off == 10, set_off
     assert "SET 1" in set_ok and "SET 0" in set_refused, set_ok + set_refused
-    assert params_value == 42
+    assert value_on == 42
 
 
 def test_our_parameter_client_on_a_ros_node(ros_env, ours):
