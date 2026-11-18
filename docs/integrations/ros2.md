@@ -220,3 +220,4 @@ type hashes that `--ros` uses.
 - `/clock` is not mapped: a world's clock is `/<world>/clock`. A ROS node that uses simulated time needs a remap.
 - To make the streams visible to ROS 2 nodes that read rings in place, ROS 2 Lyrical's buffer backends
   (`rosidl::Buffer`) would be needed. [Alternatives](../project/alternatives.md) describes these projects.
+- [ROS 2 by default](../project/ros-roadmap.md) collects what a later step without `--ros` would change.
