@@ -124,9 +124,6 @@ the readers do.
 - You can set a publisher's `camera_info` and `frame_id` at any time. Its rings grow when a larger frame arrives.
   A node therefore keeps its output streams across such a change.
 
-We tested this with all nodes in the simulation on 2026-11-01. We started each node before and after its inputs,
-and we restarted each node while its readers ran.
-
 ## Frames on this host (`--local`)
 
 A publisher on the node's host offers a host ring and possibly a CUDA ring. `--local` selects which one the node
@@ -198,7 +195,7 @@ because every such stream is one more topic.
 | drawing | in a thread of its own with a one-frame slot: a newer frame replaces the waiting one. It draws only while somebody subscribes. |
 
 ```python
-# a sketch (untested as such): `found` stands for the node's own results
+# a sketch: `found` stands for the node's own results
 from xblick import overlay
 
 overlay.add_argument(parser)

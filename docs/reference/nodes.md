@@ -135,7 +135,7 @@ How we measured, on 2026-11-02:
   time in which a kernel executes. A node at 50 % therefore does not use half of the GPU's throughput.
 - The content of the scene decides much of a node's load. The column "Condition" states it.
 
-The camera nodes and `xblick-k4abt` are not measured, because they need the device. The default set of one
+The table leaves out the camera nodes and `xblick-k4abt`, because they need the device. The default set of one
 robot's vision setup (robot mask, Boxer, nvblox, SAM 3, Fast-FoundationStereo) holds 13 GiB.
 
 ## 6D object poses on a turntable

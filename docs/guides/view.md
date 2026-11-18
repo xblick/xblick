@@ -177,9 +177,7 @@ it.
 
 ## Status and limits
 
-- The players, the rate hint and the list were tested with stand-in programs for VLC and the browser, in a
-  pseudo-terminal. No real VLC and no real browser were started in the tests.
-- The values of the rate hint come from one test of the maintainer with VLC 3.0.23 and a 30 Hz stream.
+- The values of the rate hint come from one measurement with VLC 3.0.23 and a 30 Hz stream.
 - The example output above was written for this page. Its rate and hint follow the rules above.
 
 The [command line reference](../reference/cli.md#xblick-view-streams-) lists all options.

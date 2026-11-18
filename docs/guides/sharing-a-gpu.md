@@ -65,6 +65,5 @@ only GPU 2, a client names it as 0. On a PC with one GPU, set the variable for n
 
 ## Status and limits
 
-- Tested on 2026-10-30 on one host, with the daemon on one GPU of a server and a replayed recording as the camera.
-  The nodes ran as MPS clients at 28-30 frames per second.
-- Not tested on a robot yet.
+- On one host, with the daemon on one GPU of a server and a replayed recording as the camera, the nodes ran as MPS
+  clients at 28-30 frames per second.

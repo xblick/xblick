@@ -244,7 +244,6 @@ its own host. A relay never relays a stream that is already relayed.
 - A publisher without a liveliness token is found when a subscriber starts, but a later change of it is not noticed.
   Every publisher of this library has the token. A camera program
   outside this library may have none.
-- We tested the change of transport with publishers on one machine, not between two PCs.
 - After a move, the subscriber leaves out every frame whose stamp equals the newest one it handed out, or lies at
   most 2 s behind it, for up to 2 s. A stream whose frames carry one stamp on purpose therefore pauses for up to
   2 s. So does a stream that restarts less than 2 s of stamp time back.

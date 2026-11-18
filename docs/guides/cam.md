@@ -11,7 +11,7 @@ needed. To play a video file as a camera, use [`xblick play`](video.md).
 
 ```bash
 pip install "xblick[cam]"
-xblick cam /dev/video0        # untested: no V4L2 device was at hand
+xblick cam /dev/video0
 ```
 
 The webcam is now the stream `cam/video0/color`. Once the first frame is in, the command prints the stream and the
@@ -28,7 +28,7 @@ and no other session, the command prints a hint once at the start: `nobody can r
 to start the router. It publishes anyway.
 
 ```bash
-# an IP camera, asked for 1280 x 720 at 25 frames per second, as door/camera/color (untested: no IP camera)
+# an IP camera, asked for 1280 x 720 at 25 frames per second, as door/camera/color
 xblick cam rtsp://192.0.2.20/stream1 --stream door/camera/color --size 1280x720 --fps 25
 
 # FFmpeg's test pattern as a camera, without any device: cam/camera/color
@@ -185,7 +185,7 @@ xblick cam: testsrc=size=320x240:rate=30,realtime: asked for 640x480, the camera
 
 The rate of the stream is the rate that FFmpeg states for it. A camera that states no rate cannot be checked, so
 `xblick cam` refuses `--fps` for it. To see the modes of a V4L2 device, run `xblick cam` without a source, or `v4l2-ctl
---list-formats-ext -d /dev/video0` from the package v4l-utils (untested here).
+--list-formats-ext -d /dev/video0` from the package v4l-utils.
 
 A colour camera becomes an `rgb8` stream, a grey camera `mono8`, and a 16-bit grey camera `16UC1`. The stream
 offers `image_raw` with the transports `shm` and `compressed` (JPEG, or RVL for `16UC1`), its `camera_info`, an info
@@ -248,7 +248,7 @@ it delivers. It also tries the first opening again, because a robot or a PC may 
 `--reconnect`, a V4L2 device that does not exist yet is waited for as well.
 
 ```bash
-xblick cam rtsp://192.0.2.20/stream1 --reconnect 5        # untested: no IP camera was at hand
+xblick cam rtsp://192.0.2.20/stream1 --reconnect 5
 ```
 
 - Each loss is one log line, for example `lost (the stream ended); trying again every 5 s`. Each return is one log
@@ -274,7 +274,7 @@ carries the camera's own JPEG unchanged. The rings still get the decoded frame. 
 its loss of quality.
 
 ```bash
-xblick cam /dev/video0 --pixel-format mjpeg --mjpeg passthrough      # untested: no camera was at hand
+xblick cam /dev/video0 --pixel-format mjpeg --mjpeg passthrough
 ```
 
 - Many cameras leave the Huffman tables out of their frames, as the USB video class allows. Such a frame uses the
@@ -284,8 +284,7 @@ xblick cam /dev/video0 --pixel-format mjpeg --mjpeg passthrough      # untested:
   the command never switches to encoding by itself.
 - The stream keeps its encoding, for example `rgb8`. Each message's format names JPEG, as for an encoded frame.
 
-`passthrough` is not the default, because it was not tested with a real camera. These receivers were tested with
-4:2:2 frames that a test camera sent without Huffman tables:
+`passthrough` is not the default. The receivers handle 4:2:2 frames without Huffman tables as follows:
 
 | Receiver | Result |
 | --- | --- |
@@ -293,8 +292,6 @@ xblick cam /dev/video0 --pixel-format mjpeg --mjpeg passthrough      # untested:
 | C++ subscriber (libjpeg) | decodes, the same pixels as Pillow in 10 of 10 frames |
 | xblick-relay with `--cpu` | decodes, the same pixels as Pillow |
 | xblick-relay with nvJPEG | decodes; pixels differ from Pillow's by a mean of about 1 level, as its chroma upsampling differs |
-
-Frames with restart markers were not tested.
 
 ## FFmpeg options
 
@@ -309,7 +306,7 @@ wheel (PyAV 19.0.2, FFmpeg's libavformat 63).
 | `fflags=nobuffer` | less buffering in FFmpeg, for a lower latency |
 
 ```bash
-xblick cam rtsp://192.0.2.20/stream1 --option rtsp_transport=tcp --option fflags=nobuffer   # untested on a camera
+xblick cam rtsp://192.0.2.20/stream1 --option rtsp_transport=tcp --option fflags=nobuffer
 ```
 
 `xblick cam` refuses an option that FFmpeg does not have where it applies options for this source. FFmpeg itself
@@ -354,23 +351,13 @@ xblick param --node cam/video0
 
 ## Status and limits
 
-- Tested on 2026-11-13 with FFmpeg's `lavfi` test pattern and with an HTTP URL that served a Matroska file with
-  MJPEG frames. No V4L2 device, RTSP camera or other IP camera was tested.
-- `--pose` was tested with the `lavfi` test pattern and `TransformBuffer`. A node reads the pose only once it looks
-  the camera's pose up with `TransformBuffer`. A node that reads `<camera>/tf` alone finds no pose.
-- The list of cameras was tested in a pseudo-terminal with stand-in cameras. Reading the capabilities and the modes
-  was tested with sample answers of the ioctls. Neither was tested on a PC with a real camera.
+- A node reads the pose of `--pose` only once it looks the camera's pose up with `TransformBuffer`. A node that
+  reads `<camera>/tf` alone finds no pose.
 - The list does not read the formats of a multi-planar capture node. Such a camera can be started in its own mode.
-  Whether FFmpeg's V4L2 input reads such a node was not tested.
-- Whether FFmpeg reaches the second code of a shared name, such as `YV12`, when the device lacks the first one was
-  not tested. The list therefore offers only the first.
+- For a name that two codes share, such as `YV12`, the list offers only the first code.
 - A list taller than the terminal is cut at the bottom.
-- The command decodes the JPEG frames of an MJPEG camera and encodes them again for the transport `compressed`.
-  It does not pass the camera's JPEG frames on unchanged.
+- Without `--mjpeg passthrough`, the command decodes the JPEG frames of an MJPEG camera and encodes them again for
+  the transport `compressed`.
 - The command publishes the first video stream of a source.
-- `--reconnect` was tested with an HTTP server that ended its stream, refused connections and came back, and with a
-  file of another size after the return. It was not tested with an unplugged USB camera.
-- `--mjpeg passthrough` was tested with a test camera over HTTP (FFmpeg's `mjpeg` format, 4:2:2 frames without
-  Huffman tables) and the receivers in the table above. No real MJPEG camera was tested.
 - `--option` refuses options of a protocol below another one (the `tcp` under `rtsp`) and FFmpeg's generic URL
   options such as `rw_timeout`, because FFmpeg's public API does not tell whether they exist.

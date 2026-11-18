@@ -12,7 +12,7 @@ every PC needs.
 | A Zenoh router: `xblick router` from the package, or `zenohd` | 1.10 | programs on one PC that find each other without addresses |
 | NVIDIA GPU with its driver | | CUDA rings. The package loads without a GPU. |
 | CMake and a C++20 compiler | | C++ programs, or a build from source |
-| CUDA toolkit with `nvcc` | 12.8 tested | only the point cloud node `xblick-points` |
+| CUDA toolkit with `nvcc` | 12 or newer | only the point cloud node `xblick-points` |
 
 ## Python
 

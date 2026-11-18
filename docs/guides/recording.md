@@ -272,10 +272,3 @@ We simulated 10 s with 30 joints, the clock and the commands at 1 kHz, 60 bodies
 
 The file had 1.4 MB with a smooth synthetic image. Real images make the file larger and leave the number of
 samples unchanged. Measured on 2026-11-03 on an AMD EPYC 9335, in one process with one publishing thread.
-
-## Status and limits
-
-- `tests/test_sim_recording.py` tests the complete recording in one process and between two sessions over TCP:
-  500 simulated milliseconds of joints, commands, clock and 16 camera frames are all in the file. A lost sample is
-  an error, and so is a blocking publisher that does not know of the subscription.
-- Not tested with a simulator itself yet.

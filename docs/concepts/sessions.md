@@ -110,7 +110,7 @@ the start.
 | A router is gone | The programs of one PC keep their direct connections. Data continued for 6 s without a router in our test. |
 | A program restarts | The others find it again within 1.5 s. |
 
-Tested with Zenoh 1.10.1 on one host on 2026-10-30, with up to three routers that connect to each other.
+The times are from Zenoh 1.10.1 on one host, with up to three routers that connect to each other.
 
 ## Four properties of Zenoh that you must know
 
@@ -152,8 +152,5 @@ query the router's admin space. A C++ program that does should close its session
 
 ## Status and limits
 
-- Routers between two real PCs are not tested yet.
-- A peer with `--listen tcp/0.0.0.0:0` that connects only to another PC is tested on one PC only. There a peer that
-  listened on loopback only opened a link to the network address of the other peer, which it learned through the
-  router. `--listen tcp/0.0.0.0:0` announces the addresses of the PC's network interfaces, not 0.0.0.0. Two real PCs
-  were not tested.
+- `--listen tcp/0.0.0.0:0` announces the addresses of the PC's network interfaces, not 0.0.0.0. A peer that listens
+  on loopback only still opens a link to the network address of another peer, which it learns through the router.

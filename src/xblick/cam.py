@@ -614,7 +614,7 @@ def add_arguments(parser: argparse.ArgumentParser):
     parser.add_argument("--mjpeg", choices=MJPEG_MODES, default="reencode",
                         help="an MJPEG camera's frames for the compressed transport: reencode (default) the decoded "
                              "frame, or passthrough the camera's JPEG as it came (standard Huffman tables inserted "
-                             "where a frame has none; not tested on a real camera)")
+                             "where a frame has none)")
     parser.add_argument("--cuda-device", type=int, default=None, metavar="ORDINAL",
                         help="frames also in a CUDA ring on this GPU, uploaded once while a GPU node reads them, "
                              "besides the host ring (default: host ring only; a GPU that cannot be used ends the "

@@ -54,6 +54,10 @@ device.
 10. **Use an analogy only where it shortens the explanation.** One analogy per concept, in one or two sentences, in
     the text and never in a heading. Then return to the real terms.
 11. **No em dashes, no rhetorical questions, no exclamation marks, no praise of our own work.**
+12. **State requirements, not what we tested.** Write "CUDA toolkit 12 or newer", not "tested with 12.8". A
+    statement of what we tested or did not test is outdated with the next change. Name a version, a device or a
+    combination only where it does not work or is incompatible and the reader needs to know it. A point that still
+    needs a check goes into an issue of the repository, not into the page.
 
 ## Structure
 
@@ -64,7 +68,7 @@ device.
 - Put numbers that the reader compares into a table.
 - Put history into `CHANGELOG.md`. A page describes the current version. Do not write "since 0.3.30" or "before
   0.3.6" in a page, unless a reader on a supported older version needs it.
-- Put open work and untested states into one section "Status and limits" at the end of the page.
+- Put open work and known limits into one section "Status and limits" at the end of the page.
 - Every page starts with its title and one or two sentences that say what the reader finds there.
 
 ## A node repository
@@ -89,7 +93,7 @@ README sections, in this order. Leave out a section that has no content.
 5. **Run.** The shortest command that produces a result, then the options that most users change.
 6. **Why it is fast.** Before and after in one sentence, the three or four changes in a table, one link to
    `docs/performance.md`.
-7. **Limits.** What the node cannot do and what we have not tested.
+7. **Limits.** What the node cannot do, and which versions or devices it does not work with.
 8. **Documentation.** Links to the pages in `docs/` and to Durchblick's concept pages.
 9. **Licence and credits.**
 
@@ -109,7 +113,7 @@ Write it tersely. Fragments are acceptable here, because the reader is a model t
 
 ## Check before you commit
 
-- Every relative link resolves. Every code block was run, or it is marked as untested.
+- Every relative link resolves. Every code block was run, or it is marked as a sketch.
 - No fact from the old text is lost. No fact is new unless you verified it in the code.
 - No sentence has more than 30 words.
 - Search for `;`, ` (` and `not ` and check each hit against rules 4 and 5.

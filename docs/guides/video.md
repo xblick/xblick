@@ -166,16 +166,16 @@ State of the node READMEs on 2026-11-05.
 
 | Node | Needs | On a plain colour video |
 | --- | --- | --- |
-| xblick-sam3 | colour with `camera_info` | yes (tested, see below) |
+| xblick-sam3 | colour with `camera_info` | yes (see the results below) |
 | xblick-insightface | colour | yes |
 | xblick-vjepa2 | colour | yes |
 | xblick-tapnext | colour, depth, and an xblick-sam3 on the stream | with `--no-depth` (2D only), and with SAM 3 or `--no-segmenter` (points by hand) |
-| xblick-boxer | colour, depth (`--no-depth` guesses distances), and the pose of the camera | with `--pose` (not tested). Without it the node skips every frame ("no pose"). |
+| xblick-boxer | colour, depth (`--no-depth` guesses distances), and the pose of the camera | with `--pose`. Without it the node skips every frame ("no pose"). |
 | xblick-gem-x | colour and depth, paired | no. Yes with a 16-bit depth video beside it. |
 | xblick-foundationpose, xblick-nemo, xblick-any6d, xblick-recgen, xblick-sam3d-objects | colour and depth | no. Yes with a depth video. |
-| xblick-fast-foundationstereo | a rectified stereo pair `<camera>/left` and `<camera>/right` | from two videos with their calibration files (tested, see below) |
+| xblick-fast-foundationstereo | a rectified stereo pair `<camera>/left` and `<camera>/right` | from two videos with their calibration files (see the results below) |
 | xblick-ivt | a rectified stereo pair as above | from two videos with their calibration files |
-| xblick-mapping (cuVSLAM, nvblox) | stereo or RGB-D. nvblox also needs the pose of the camera. | not tested |
+| xblick-mapping (cuVSLAM, nvblox) | stereo or RGB-D. nvblox also needs the pose of the camera. | no |
 
 ## A stereo pair from two videos
 
@@ -230,7 +230,7 @@ Without a router, start the playback with `--listen tcp/127.0.0.1:<port>`. Give 
 tcp/127.0.0.1:<port>`. Each of them also listens on a free loopback port, and the programs find each other through the
 playback. Connect the terminal interface with `c` to the same address.
 
-## Tested
+## Results
 
 On 2026-11-05 on a server with a private router and two GPUs.
 

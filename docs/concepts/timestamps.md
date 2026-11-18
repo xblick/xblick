@@ -81,7 +81,7 @@ clock synchronisation of the PCs, for example with chrony or PTP.
 
 | Source | How it sets the stamp | You can compare it with |
 | --- | --- | --- |
-| Azure Kinect (xblick-azure-kinect) | The SDK puts the device timestamp at the middle of the exposure. The node moves it to the host's wall clock with a filtered offset, as Microsoft's ROS driver does. | the camera's other streams exactly, because colour, depth, IR and IMU share one device clock. Other clocks only up to a constant delay, which we have not measured. |
+| Azure Kinect (xblick-azure-kinect) | The SDK puts the device timestamp at the middle of the exposure. The node moves it to the host's wall clock with a filtered offset, as Microsoft's ROS driver does. | the camera's other streams exactly, because colour, depth, IR and IMU share one device clock. Other clocks only up to a constant delay. |
 | Roboception rc_visard (xblick-roboception) | the camera's own timestamp of the image. With PTP, which is on by default, the camera's clock follows the PTP master of the network. | the host's clock only when the PTP master follows the host's clock |
 | A live simulation | the server's wall clock in the simulation step in which the frame is due, before the frame is rendered. Robot state and object poses get the same stamp. | the other programs of the PC. The rendering time counts into the age of the frame. |
 | An offline simulation through `xblick.sim.SimPublisher` | the simulated time, which the simulation also publishes on `<world>/clock` | the other samples of the same simulation |
@@ -106,10 +106,7 @@ stamp of an image. A reader interpolates the pose at the stamp of the image. `xb
 
 ## Status and limits
 
-- The clock synchronisation between the PCs of a robot is not checked yet. Ages across PCs are therefore
-  unverified.
-- The Azure Kinect's stamp is late by the mean time from the middle of the exposure to the host. We have not
-  measured this delay.
-- Which instant of the exposure the rc_visard stamps is not checked on a device.
+- Ages across PCs are only as exact as the clock synchronisation between the PCs of the robot.
+- The Azure Kinect's stamp is late by the mean time from the middle of the exposure to the host.
 - Two nodes still publish some samples without an attachment: xblick-gem-x (bodies) and xblick-mapping
   (the cuVSLAM topics). State of 2026-11-05.

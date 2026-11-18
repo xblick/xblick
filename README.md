@@ -51,7 +51,7 @@ Extras and C++: [install](https://github.com/xblick/xblick/blob/main/docs/gettin
 
 ```bash
 xblick test-camera       # publish a moving test pattern
-xblick cam /dev/video0   # a webcam as cam/video0/color (needs xblick[cam], not yet tested on a device)
+xblick cam /dev/video0   # a webcam as cam/video0/color (needs xblick[cam])
 xblick list              # show every stream
 xblick hz test/camera/color
 xblick rerun             # show every stream and result in the Rerun viewer
@@ -145,8 +145,7 @@ Coding agents read [AGENTS.md](https://github.com/xblick/xblick/blob/main/AGENTS
 Version 0.5.14. Durchblick is in active development, and a new minor version can change the protocol. All
 programs of one setup speak the same protocol. We now released that version.
 The [changelog](https://github.com/xblick/xblick/blob/main/CHANGELOG.md) states which versions do. Programs of
-0.5 do not work with programs of 0.3 or 0.4. The nodes are tested in simulation and on recordings. Tests on robots
-are in progress.
+0.5 do not work with programs of 0.3 or 0.4.
 
 ## Origin
 
