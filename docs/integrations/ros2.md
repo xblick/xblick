@@ -1,8 +1,8 @@
 # Durchblick and ROS 2
 
 Durchblick uses the message types and conventions of ROS 2, and it needs no ROS installation. With the option `--ros`
-a program also takes part in ROS 2 on `rmw_zenoh`. This page states what is compatible, what `--ros` adds and how
-you try it with ROS 2's own tools.
+a program also takes part in ROS 2 Jazzy with `rmw_zenoh_cpp` 0.2.13, the version we test. This page states what is
+compatible, what `--ros` adds and how you try it with ROS 2's own tools.
 
 ## What is identical
 
@@ -22,6 +22,11 @@ is started without `--ros`.
 
 Start a command or a node with `--ros`. The program then sends on our keys as before and also on the keys of
 `rmw_zenoh_cpp` 0.2.13, the RMW of ROS 2 Jazzy on Zenoh 1.10. In ROS 2 it is a node of its own.
+
+The keys and the attachment are `rmw_zenoh_cpp`'s format, which ROS 2 itself does not define. Other versions of
+`rmw_zenoh_cpp` are untested. Nodes on another RMW, such as one on DDS, do not use Zenoh and see nothing. Humble's
+`rmw_zenoh_cpp` puts no type hash into its keys, so a Humble node never matches ours. Jazzy's releases 0.2.0 to 0.2.3
+used another attachment ([ROS 2 by default](../project/ros-roadmap.md#which-versions-use-these-33-bytes)).
 
 | Option | Meaning |
 | --- | --- |

@@ -39,9 +39,10 @@ What follows from the key format:
   receives nothing.
 - A ROS key starts with the domain. Every program would need a domain, and `ROS_DOMAIN_ID` (default 0) would decide
   who sees whom. Our keys have no domain today.
-- ROS names allow letters, digits and `_`, and no part may start with a digit. A key that breaks this rule stops a
-  program with `--ros` at start. All default keys of the ten Python nodes and of the Azure Kinect and rc_visard
-  programs pass this rule (checked with `ros.topic_of` on their branches `ros2`).
+- ROS names allow letters, digits and `_`, and no part may start with a digit. Most of our publishers check the same
+  rule for their keys, with or without `--ros` ([Topic names](#topic-names)). A key that breaks it and reaches a ROS
+  mirror stops a program with `--ros` at start. All default keys of the ten Python nodes and of the Azure Kinect
+  and rc_visard programs pass this rule (checked with `ros.topic_of` on their branches `ros2`).
 - A recording keeps each channel's Zenoh key, encoding and info record ([recording](../guides/recording.md)).
   Recordings made before a change of keys hold our keys. `xblick play --ros` already maps them to ROS keys, so
   playback of old recordings stays possible if `play` keeps that mapping.
@@ -104,8 +105,38 @@ To carry our fields inside ROS's attachment, these parts would change:
 3. Our readers of a ROS key parse the rest as our fields, and they treat a sample without it as a ROS sample.
 4. If our own keys used the same layout, `parse_attachment` in both languages would need to skip the 33 bytes first.
 
-That rmw_zenoh ignores the extra bytes is a property of 0.2.13 that it does not document. Other versions are
-untested.
+That rmw_zenoh ignores the extra bytes is a property of its code that it does not document. The same decoding code
+is in the releases for Humble, Kilted and Rolling (next section). Only 0.2.13 was tested live.
+
+### Which versions use these 33 bytes
+
+ROS 2 requires metadata of each message, not a byte layout. An RMW fills `rmw_message_info_t` with the publisher's
+gid, the sequence numbers and the source and reception times. How these travel is the RMW's own choice. A DDS RMW
+has no Zenoh attachment at all. The 33 bytes are therefore rmw_zenoh's format, and they are not a ROS 2 format.
+
+The layout in rmw_zenoh's tags (`rmw_zenoh_cpp/src/detail/attachment_helpers.cpp`, compared by its source):
+
+| rmw_zenoh | ROS 2 | Attachment |
+| --- | --- | --- |
+| 0.1.0 | Humble | a name before each field: `"sequence_number"`, `"source_timestamp"`, `"source_gid"` |
+| 0.1.12 (branch `humble`) | Humble | the 33 bytes |
+| 0.2.0 to 0.2.3 | Jazzy | a name before each field, as 0.1.0 |
+| 0.2.4 to 0.2.13 (branch `jazzy`) | Jazzy | the 33 bytes |
+| 0.6.10 (branch `kilted`) | Kilted | the 33 bytes, the same code as 0.2.13 |
+| 0.14.1 (branch `rolling`) | Rolling | the 33 bytes, the same reading and writing code |
+
+The layout changed once within Jazzy, between 0.2.3 and 0.2.4. A subscriber of one layout that gets the other cannot
+deserialise it, and our probe showed that such a failure aborts the subscriber process. Humble's rmw_zenoh writes
+`TypeHashNotSupported` where Jazzy's key holds the type hash (`rmw_publisher_data.cpp` on branch `humble`). Our keys
+therefore never match a Humble node.
+
+What follows:
+
+- Our compatibility is "tested with `rmw_zenoh_cpp` 0.2.13 on Jazzy", not "ROS 2".
+- A program could check the version of the ROS side before it publishes on ROS keys. rmw_zenoh's tokens carry no
+  version, so such a check needs another source, such as an option or a test of the attachment of a received sample.
+- Only a test matrix tells which versions work: Jazzy, Kilted and Rolling, in container images or RoboStack
+  environments. None of these exists yet.
 
 ## Discovery
 
@@ -191,9 +222,102 @@ both on other ports. Two PCs are untested.
 
 ## The cost of the double publication
 
-A mirror sends only while a ROS subscriber is there, except `/tf_static`. While one is there, every sample is put
-twice, on our key and on ROS's key. Every ROS entity also holds a liveliness token, with or without a subscriber. We
-have not measured the cost in time, bandwidth or memory.
+A mirror sends only while Zenoh reports a subscriber of its ROS key, except `/tf_static`. The code checks this before
+each put (`ros_matched` in `camera.py`, `matched` in `detections.py`, `diagnostics.py`, `points.py` and
+`parameters.py`). Any Zenoh subscriber of the key counts, so a storage or recorder on `**` also starts the mirrors.
+While a subscriber is there, every sample is put twice, on our key and on ROS's key. Every ROS entity also holds a
+liveliness token, with or without a subscriber. We have not measured the cost in time, bandwidth or memory.
+
+## ROS and our programs on the same topics
+
+Our key and ROS's key for one topic can never be equal, because ROS's key also holds the domain, the type and the
+hash. "The same topic" therefore means two keys that a program connects. Three variants exist.
+
+| Variant | What it does | Wire | Version |
+| --- | --- | --- | --- |
+| 1. Readers take both | A reader subscribes to our key and to the ROS topic of the same name. It takes ours when both arrive, and ROS's when only a ROS publisher exists, such as a ROS camera driver. | unchanged | fits 0.5 |
+| 2. Publishers serve both by default | `--ros` is on by default. The ROS copy goes out only while a subscriber of its key is there. | our keys unchanged, ROS keys added | a changed default |
+| 3. One key for both | Programs publish only on ROS's key, with ROS's 33 bytes and our fields after them. | changed | 0.6 |
+
+Variant 1 in detail:
+
+- Our form carries more: rings, RVL, the ray-table clouds and our attachment fields. A reader therefore prefers it.
+- Two copies of one frame arrive when a program publishes both. The reader has to drop one, for example by the
+  header's stamp and frame id. No such code exists today.
+- A frame read from ROS has no `seq`, `source` or publish time.
+
+Variant 2 in detail:
+
+- The cost is the tokens of every program, plus the copies while a subscriber is there.
+- The domain is 0 unless `ROS_DOMAIN_ID` says otherwise. Our programs would then appear in every ROS 2 system on the
+  same network and domain, for example in `ros2 node list` and in rviz.
+
+Variant 3 depends on the undocumented tolerance of the 33-byte reader for a longer attachment. It needs the version
+matrix of the previous section first.
+
+Rules for every variant:
+
+- A key with a part `command` never goes to ROS (`ros.commanding`, used by `ros.mirror`, `ros.mirror_tf` and
+  `xblick play`). This rule covers the sending side only. A reader that takes ROS topics would need the same rule, so
+  that no robot command is taken from a ROS topic.
+- Forms without a ROS type stay on our keys only.
+
+## Topic names
+
+A ROS topic is another name for one of our keys: the key `cam/x/color` is the topic `/cam/x/color` (`ros.topic_of`).
+
+### Characters
+
+Our rule (`topics.check_name`): each part of a key consists of letters, digits and `_` and does not start with a
+digit (`[A-Za-z_][A-Za-z0-9_]*`). Leading and trailing `/` are removed. The publishers of streams, clouds,
+detections, poses, parameters and the controller manager check their keys with it, with or without `--ros`. A key
+`cam-1/color` or `0cam/color` is therefore refused today. Internal keys such as `xblick/sessions/<zid>/program` do
+not pass this check, since a Zenoh id may start with a digit.
+
+ROS's rule for a full topic name (`rmw_validate_full_topic_name` in `rmw`, Jazzy):
+
+- It starts with `/` and does not end with `/`.
+- It has no `//`.
+- It uses letters, digits, `_` and `/` only, and no part starts with a digit.
+- It has at most 247 characters (`RMW_TOPIC_MAX_NAME_LENGTH`).
+
+Before a name gets there, `rcl` also expands `~` (the node's name) and `{}` substitutions. A part that starts with `_`
+makes the name hidden: `ros2 topic list` does not show it without `--include-hidden-topics` (rclpy,
+`topic_or_service_is_hidden`). The design article
+[Topic and service names](https://design.ros2.org/articles/topic_and_service_names.html) also asks for no repeated
+`_`, but `rcl` and `rmw` do not check it.
+
+Both rules allow the same characters per part. The differences are these:
+
+| Name | Ours | ROS |
+| --- | --- | --- |
+| a part that starts with `_` | allowed | allowed, the topic is hidden |
+| `__` in a part | allowed | allowed by the code, against the design article |
+| more than 247 characters | allowed | refused |
+
+All default keys of the ten Python nodes and of the Azure Kinect and rc_visard programs pass `ros.topic_of`. No
+default name would change if ROS's rule applied to all names. Such a rule would change what we accept, and no byte
+on the wire.
+
+### Layout
+
+A camera stream is one key base for us, with its forms below it. ROS splits it into sibling topics by the
+convention of `image_transport`: `image_raw`, `image_raw/compressed` and `camera_info`. Our mapping to ROS follows
+that convention ([guide](../integrations/ros2.md#what-ros-2-receives)). The reverse direction reads a foreign ROS
+camera by the same convention, which `ImageSubscriber(..., transport="ros")` does. For other ROS types there is no
+general rule that groups topics into one stream.
+
+Other differences of layout:
+
+- Transforms: ours are per camera, robot and world. ROS has one `/tf` and one `/tf_static`.
+- Clouds: ROS gets the plain `PointCloud2` on `/<stream>/cloud`. Our compressed and ray-table forms have no ROS topic.
+
+### What a ROS name carries beyond the name
+
+- The type: one name with two types is two ROS keys, and a subscriber sees only the one of its type.
+- The domain: the same name in two domains is two topics.
+- Names with a role in ROS: `/rosout`, `/parameter_events`, `/tf`, `/tf_static`, `/clock` and `/diagnostics`, and
+  the parameter services below each node's name. A key of ours with such a name would mean something to ROS tools.
 
 ## A possible path in steps
 
@@ -218,5 +342,5 @@ Each step is an option, with what it changes.
 - A node with parameters shows as two ROS nodes, the program's and its parameters'.
 - `/clock` is `/<world>/clock`, and diagnostics go to `/<camera>/diagnostics`. ROS tools expect `/clock` and
   `/diagnostics`.
-- A key with `-` or a part that starts with a digit cannot become a ROS name. A default would have to reject or rename
-  such keys.
+- A key that does not pass `topics.check_name` may hold `-` or a part that starts with a digit. It cannot become a ROS
+  name. A default would have to reject or rename such keys.
