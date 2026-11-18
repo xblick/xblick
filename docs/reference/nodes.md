@@ -81,7 +81,8 @@ Topics are relative to `<camera>/`.
 
 | Repository | Method | Publishes |
 | --- | --- | --- |
-| [xblick-azure-kinect](https://github.com/xblick/xblick-azure-kinect) | the Azure Kinect camera. `xblick-k4abt` adds its body tracking. | `color`, `depth`, `depth_to_color`, `ir`, `imu`, `bodies` |
+| [xblick-azure-kinect](https://github.com/xblick/xblick-azure-kinect) | the Azure Kinect camera | `color`, `depth`, `depth_to_color`, `ir`, `imu` |
+| [xblick-k4abt](https://github.com/xblick/xblick-k4abt) | Azure Kinect body tracking, from the depth and IR streams of xblick-azure-kinect | `bodies` |
 | [xblick-roboception](https://github.com/xblick/xblick-roboception) | the Roboception rc_visard stereo camera | `left`, `right`, `depth` |
 | [xblick-relay](https://github.com/xblick/xblick-relay) | the streams that nodes on this PC read from other PCs, in the rings of this PC. One relay per PC. | each relayed stream under its own name |
 | a simulation | head camera, stereo pair, true object poses | the topics of the robot's cameras, `sim/objects/tf` |
