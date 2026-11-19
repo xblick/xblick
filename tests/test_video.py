@@ -443,6 +443,9 @@ def test_a_video_with_a_display_matrix_comes_out_upright(tmp_path, degrees, hfli
     and --size of the turned frame. Its meaning as PyAV writes it: turned counter-clockwise, then mirrored."""
     from xblick import video
 
+    if not hasattr(av.video.stream.VideoStream, "set_display_rotation"):
+        pytest.skip(f"PyAV {av.__version__} cannot write a display matrix (VideoStream.set_display_rotation is new in "
+                    "PyAV 19); reading one works from PyAV 14 on")
     path = tmp_path / "turned.mp4"
     with av.open(str(path), "w") as out:
         s = out.add_stream("libx264", rate=10)
