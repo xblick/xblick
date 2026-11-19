@@ -1830,8 +1830,9 @@ class XblickApp(App):
             self.notify("xblick rerun runs already: stop it first", severity="error")
             return
         if importlib.util.find_spec("rerun") is None:
-            self.notify("xblick rerun needs the extra: pip install 'xblick[rerun]'", severity="error",
-                        timeout=10)
+            from .extras import missing_extra
+
+            self.notify(missing_extra("xblick rerun needs the Rerun SDK", "rerun"), severity="error", timeout=10)
             return
         try:
             selection = self.selection()

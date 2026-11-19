@@ -92,7 +92,7 @@ e.g. xblick-vslam's ``test/camera/vslam/tf``, or ``<camera>/tf`` to compare with
 The viewer has no way to tell the bridge which streams it shows: the bridge subscribes to every stream it bridges for
 as long as it is in the selection, and their publishers render and encode for it all that time (a publisher that
 renders only while somebody subscribes, like the teleoperation server's head camera, renders while the bridge shows
-it). Needs the extra ``rerun`` (``pip install 'xblick[rerun]'``).
+it). Needs the extra ``rerun``.
 """
 
 from __future__ import annotations
@@ -157,7 +157,9 @@ def import_rerun():
     except ModuleNotFoundError as error:
         if error.name != "rerun":
             raise
-        raise SystemExit("xblick rerun needs the Rerun SDK: pip install 'xblick[rerun]'") from error
+        from .extras import missing_extra
+
+        raise SystemExit(missing_extra("xblick rerun needs the Rerun SDK", "rerun")) from error
     return rerun
 
 

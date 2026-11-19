@@ -58,8 +58,9 @@ def import_av():
     try:
         import av
     except ImportError:
-        raise ImportError("xblick cam needs PyAV: install xblick[cam] (pip install 'xblick[cam]', "
-                          "or uv sync --extra cam)") from None
+        from .extras import missing_extra
+
+        raise ImportError(missing_extra("xblick cam needs PyAV", "cam")) from None
     return av
 
 

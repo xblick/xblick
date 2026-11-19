@@ -14,7 +14,9 @@ names, frame ids and poses only once per video. A video's calibration file (Came
 it is; a video with ``--pose`` has its fixed pose on its camera's ``tf_static``, as ``xblick cam --pose``.
 
 Decoding is PyAV's (FFmpeg inside its wheels), the extra ``xblick[video]``; image sequences (a directory or a
-glob of PNG/JPEG files) are read with Pillow. A colour video becomes ``rgb8``, a grey one ``mono8``, a 16-bit grey one
+glob of PNG/JPEG files) are read with Pillow. A video's display matrix (a phone's portrait video) and an image's EXIF
+orientation (a phone's portrait photo) are applied: the frames come out upright, and their size and CameraInfo are those
+of the upright frames. A colour video becomes ``rgb8``, a grey one ``mono8``, a 16-bit grey one
 (e.g. FFV1 ``gray16le`` in Matroska: depth in mm) ``16UC1``.
 """
 
@@ -53,8 +55,9 @@ def import_av():
     try:
         import av
     except ImportError:
-        raise ImportError("playing videos needs PyAV: install xblick[video] (pip install 'xblick[video]', "
-                          "or uv sync --extra video)") from None
+        from .extras import missing_extra
+
+        raise ImportError(missing_extra("playing videos needs PyAV", "video")) from None
     return av
 
 
@@ -96,9 +99,45 @@ def _out_size(width: int, height: int, size: tuple[int, int] | None, scale: floa
     return width, height
 
 
+FIXED_ONE = 1 << 16  # 1.0 in a display matrix's 16.16 fixed-point numbers
+
+
+def display_turn(frame, av, path) -> tuple[bool, bool, bool]:
+    """How a decoded frame is shown, from its display matrix (FFmpeg's ``AV_FRAME_DATA_DISPLAYMATRIX``):
+    (transposed, rows reversed, columns reversed), applied in this order by :func:`turned`. The matrix maps a pixel
+    (x, y) to x' = a x + c y, y' = b x + d y (a, b, c, d: its elements 0, 1, 3, 4). Without one: as decoded. A matrix
+    that turns by an angle other than a multiple of 90 degrees or scales is a VideoError."""
+    try:
+        data = frame.side_data[av.sidedata.sidedata.Type.DISPLAYMATRIX]
+    except KeyError:
+        return False, False, False
+    a, b, _, c, d = np.frombuffer(bytes(data), np.int32)[:5].tolist()
+    if sorted(map(abs, (a, b, c, d))) != [0, 0, FIXED_ONE, FIXED_ONE] or (a == 0) != (d == 0):
+        raise VideoError(f"{path}: its display matrix turns it by {frame.rotation} degrees or scales it: only turns "
+                         "by multiples of 90 degrees and mirrors are applied")
+    if a != 0:
+        return False, d < 0, a < 0
+    return True, b < 0, c < 0
+
+
+def turned(image: np.ndarray, turn: tuple[bool, bool, bool]) -> np.ndarray:
+    """``image`` (rows, columns[, channels]) as :func:`display_turn` says it is shown."""
+    transposed, rows, columns = turn
+    if not (transposed or rows or columns):
+        return image
+    if transposed:
+        image = image.swapaxes(0, 1)
+    if rows:
+        image = image[::-1]
+    if columns:
+        image = image[:, ::-1]
+    return np.ascontiguousarray(image)
+
+
 class VideoFile:
     """A video file's first video stream: its frames as arrays, ``(seconds from start, array)``, from ``start`` to
-    ``end`` (seconds of the file), each pass (``frames()``) from the beginning."""
+    ``end`` (seconds of the file), each pass (``frames()``) from the beginning. Its frames are turned and mirrored as
+    its display matrix says (:func:`display_turn`), and ``width``/``height`` (and ``size``) are the turned frame's."""
 
     FORMATS = {"gray16le": ("gray16le", "16UC1"), "gray16be": ("gray16le", "16UC1"), "gray": ("gray", "mono8"),
                "gray8": ("gray", "mono8")}
@@ -111,7 +150,10 @@ class VideoFile:
             stream = container.streams.video[0]
             context = stream.codec_context
             self.format, self.encoding = self.FORMATS.get(context.pix_fmt or "", ("rgb24", "rgb8"))
-            self.width, self.height = _out_size(context.width, context.height, size, scale)
+            first = next(container.decode(stream), None)
+            self.turn = display_turn(first, self.av, path) if first is not None else (False, False, False)
+            shown = (context.height, context.width) if self.turn[0] else (context.width, context.height)
+            self.width, self.height = _out_size(*shown, size, scale)
             rate = fps or (float(stream.average_rate) if stream.average_rate else None)
             if not rate:
                 raise VideoError(f"{path}: no frame rate in the file: give --fps")
@@ -154,18 +196,20 @@ class VideoFile:
                         continue
                 if self.end is not None and t >= self.end:
                     return
-                image = frame.reformat(width=self.width, height=self.height, format=self.format).to_ndarray()
-                yield t - self.start, image
+                decoded = (self.height, self.width) if self.turn[0] else (self.width, self.height)
+                image = frame.reformat(width=decoded[0], height=decoded[1], format=self.format).to_ndarray()
+                yield t - self.start, turned(image, self.turn)
 
 
 class ImageSequence:
-    """Image files (a directory's, sorted by name, or a glob's) at ``fps`` frames a second."""
+    """Image files (a directory's, sorted by name, or a glob's) at ``fps`` frames a second, each turned as its EXIF
+    orientation says; the first one's size (turned) is the stream's."""
 
     def __init__(self, given: str, start: float = 0.0, end: float | None = None, size=None, scale=None,
                  fps: float | None = None):
-        from PIL import Image
+        from PIL import Image, ImageOps
 
-        self.Image = Image
+        self.Image, self.ImageOps = Image, ImageOps
         path = Path(given)
         names = (sorted(p for p in path.iterdir() if p.suffix.lower() in IMAGE_SUFFIXES) if path.is_dir()
                  else sorted(Path(p) for p in glob.glob(str(given))))
@@ -183,7 +227,8 @@ class ImageSequence:
         self.duration = max(0.0, (min(length, end) if end is not None else length) - start)
 
     def _read(self, name: Path, size):
-        image = self.Image.open(name)
+        """The image upright: turned and mirrored as its EXIF orientation says (a phone's portrait photo)."""
+        image = self.ImageOps.exif_transpose(self.Image.open(name))
         mode = image.mode if image.mode in ("I;16", "L") else "RGB"
         if not hasattr(self, "_mode"):
             self._mode = mode

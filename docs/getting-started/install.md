@@ -40,6 +40,10 @@ Optional features have extras:
 | `xblick[cam]` | live cameras that FFmpeg opens, as camera streams: `xblick cam` |
 | `xblick[relay]` | the [relay](../concepts/transports.md#relays) program, started by `xblick relay` |
 
+To install the command `xblick` as a uv tool, run `uv tool install "xblick[rerun,record]"`. Each `uv tool install`
+replaces the extras of the previous one, so name every extra you want. A command whose extra is missing names the
+extra and prints the command that installs it for your installation.
+
 In a uv project, add the package with `uv add xblick`. To use a commit that is not released, depend on the
 repository at that commit. uv then builds the package from source:
 

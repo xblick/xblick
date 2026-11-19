@@ -118,7 +118,7 @@ Reference check: `tools/check_references.sh` (no internal or robot-framework nam
 | `src/xblick/camera.py`, `points.py`, `detections.py`, `session.py` | Python API: streams, sessions |
 | `src/xblick/node.py`, `history.py`, `tensors.py`, `rgbd.py`, `parameters.py` | helpers for nodes |
 | `src/xblick/declaration.py`, `cpp/src/declaration.cpp` | every program's declaration (`xblick/sessions/<zid>/program`), opened with the session |
-| `src/xblick/cli.py`, `tui.py`, `tui_nodes.py`, `tui_graph.py`, `rerun_bridge.py`, `recording.py`, `video.py`, `cam.py`, `v4l2.py`, `pick.py` | tools |
+| `src/xblick/cli.py`, `tui.py`, `tui_nodes.py`, `tui_graph.py`, `rerun_bridge.py`, `recording.py`, `video.py`, `cam.py`, `v4l2.py`, `pick.py`, `extras.py` (the message of a missing extra) | tools |
 | `src/xblick/robot.py`, `sim.py`, `controller.py`, `poses.py`, `mps.py` | robot state, simulation, controller link, poses, MPS |
 | `tests/`, `cpp/tests/` | Python and C++ tests |
 | `tools/` | `check_references.sh` (+ `reference_allowlist.txt`), `install_zenoh.sh`, `gen_msgdefs.py`, `setup_python.sh`, `tui_screenshots.py`, `release_notes.sh` |

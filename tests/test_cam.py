@@ -182,8 +182,7 @@ def test_without_pyav_the_command_names_the_extra(monkeypatch, capsys):
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", no_av)
-    with pytest.raises(SystemExit, match=r"xblick cam: xblick cam needs PyAV: install xblick\[cam\] "
-                                         r"\(pip install 'xblick\[cam\]'"):
+    with pytest.raises(SystemExit, match=r"xblick cam: xblick cam needs PyAV: the extra cam, which is not installed"):
         cli.main(["cam", "/dev/video0", "--stream", "t/x/color"])
 
 
