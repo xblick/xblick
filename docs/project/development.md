@@ -29,7 +29,11 @@ XBLICK_ROS_LYRICAL_IMAGE=<image> uv run pytest tests/test_ros_lyrical.py  # --ro
 ```
 
 `tests/test_ros_lyrical.py` runs only when `XBLICK_ROS_LYRICAL_IMAGE` names a docker image with ROS 2 Lyrical,
-`rmw_zenoh_cpp`, `image_tools` and `ros2cli`. The docstring of the test file names the packages.
+`rmw_zenoh_cpp`, `image_tools` and `ros2cli`. `tests/ros/lyrical.Dockerfile` builds such an image:
+
+```bash
+docker build -t xblick-test-lyrical -f tests/ros/lyrical.Dockerfile tests/ros
+```
 
 ## Build the point cloud node
 

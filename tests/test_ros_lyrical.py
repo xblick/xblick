@@ -4,8 +4,7 @@ Lyrical's publishers send Image, CompressedImage and PointCloud2 on buffer keys 
 readers must take; the other direction goes on the plain key.
 
 Skipped unless XBLICK_ROS_LYRICAL_IMAGE names a docker image with ROS 2 Lyrical in /opt/ros/lyrical, rmw_zenoh_cpp,
-image_tools and ros2cli, such as ``ros:lyrical-ros-base`` with ``apt-get install ros-lyrical-rmw-zenoh-cpp
-ros-lyrical-image-tools``. The C++ case also needs XBLICK_CPP_BUILD (as tests/test_cpp_ros.py)."""
+image_tools and ros2cli. tests/ros/lyrical.Dockerfile builds such an image. The C++ case also needs XBLICK_CPP_BUILD (as tests/test_cpp_ros.py)."""
 
 import json
 import os
