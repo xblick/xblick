@@ -24,7 +24,7 @@ parameters, and it reads theirs.
 - With `--ros`: each node's parameters as a ROS node's services, read only unless `--ros-params-writable`, so that `ros2 param` works; `xblick param --via-ros` and `ParameterClient(ros=True)` for a ROS node's parameters.
 - `CountedPublisher.ros_matched`: a ROS subscriber of the key's mirror (`matched` stays our key's).
 - Readers of ROS topics: transport `ros` for images and clouds (`xblick hz`, `xblick snapshot`), `DetectionSubscriber(ros_type=...)`, `TransformBuffer(ros=True)`.
-- ROS 2 Lyrical (`rmw_zenoh_cpp` 0.10.6 to 0.10.8): readers of images, compressed images and clouds also take them from Lyrical publishers, which send these types on keys of their own (Python and C++).
+- ROS 2 Lyrical (`rmw_zenoh_cpp` 0.10.6 or newer): readers of images, compressed images and clouds also take them from Lyrical publishers, which send these types on keys of their own (Python and C++).
 - The C++ API and programs (`xblick-cpp-camera`, `xblick-cpp-probe`, `xblick-points`) take part the same way: the options in `Options::add_session_options`, `SessionOptions::ros`, `Transport::Ros`.
 - `_core.ros_gid`: the gid of a ROS entity as `rmw_zenoh` makes it (XXH3-128 of its token), used by both sides.
 - The guide [Durchblick and ROS 2](docs/integrations/ros2.md) and the protocol's section on `rmw_zenoh`.

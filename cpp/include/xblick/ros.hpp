@@ -1,5 +1,5 @@
 // ROS 2 on Zenoh in C++: the keys, type names, type hashes, attachments, QoS strings and liveliness tokens of
-// rmw_zenoh_cpp 0.2.13 (ROS 2 Jazzy) and 0.10.6 to 0.10.8 (ROS 2 Lyrical), so that a C++ program started with --ros
+// rmw_zenoh_cpp 0.2.13 (ROS 2 Jazzy) and 0.10.6 or newer (ROS 2 Lyrical), so that a C++ program started with --ros
 // takes part in ROS 2 as well. The same rules, names and bytes as Python's xblick.ros (its module docstring and
 // docs/integrations/ros2.md are the reference; tests/test_cpp_ros.py compares the two byte for byte):
 //
@@ -53,7 +53,6 @@
 namespace xblick::ros
 {
     inline constexpr std::string_view kRmwZenoh = "0.2.13";  // the rmw_zenoh_cpp version followed (ROS 2 Jazzy)
-    inline constexpr std::string_view kRmwZenohLyrical = "0.10.8";  // and for ROS 2 Lyrical (buffer keys from 0.10.5)
     inline constexpr std::string_view kAdminSpace = "@ros2_lv";
     inline constexpr const char* kDomainEnv = "ROS_DOMAIN_ID";
     inline constexpr int kDefaultDomain = 0;

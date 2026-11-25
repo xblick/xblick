@@ -135,8 +135,8 @@ the same id count as one node. A program older than 0.5.13 sends none of these a
 
 ## ROS 2 on rmw_zenoh
 
-A program with `--ros` also sends on the keys of `rmw_zenoh_cpp`: 0.2.13 is the RMW of ROS 2 Jazzy, and 0.10.6 to
-0.10.8 are those of ROS 2 Lyrical. The payload stays
+A program with `--ros` also sends on the keys of `rmw_zenoh_cpp`: 0.2.13 is the RMW of ROS 2 Jazzy, and 0.10.6 or
+newer are those of ROS 2 Lyrical. The payload stays
 the same CDR bytes. Only the key, the attachment and the announcements differ. `src/xblick/ros.py` implements them,
 and [Durchblick and ROS 2](../integrations/ros2.md) explains what takes part.
 

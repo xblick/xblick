@@ -21,7 +21,7 @@ is started without `--ros`.
 ## Take part in ROS 2
 
 Start a command or a node with `--ros`. The program then sends on our keys as before and also on the keys of
-`rmw_zenoh_cpp`. It needs `rmw_zenoh_cpp` 0.2.13 (ROS 2 Jazzy) or 0.10.6 to 0.10.8 (ROS 2 Lyrical) on the ROS side.
+`rmw_zenoh_cpp`. It needs `rmw_zenoh_cpp` 0.2.13 (ROS 2 Jazzy) or 0.10.6 or newer (ROS 2 Lyrical) on the ROS side.
 In ROS 2 it is a node of its own.
 
 | Option | Meaning |

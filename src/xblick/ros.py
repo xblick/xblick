@@ -1,5 +1,5 @@
 """ROS 2 on Zenoh: the keys, type names, type hashes, attachments, QoS strings and liveliness tokens of rmw_zenoh_cpp
-0.2.13 (ROS 2 Jazzy) and 0.10.6 to 0.10.8 (ROS 2 Lyrical), so that a program started with ``--ros`` takes part in
+0.2.13 (ROS 2 Jazzy) and 0.10.6 or newer (ROS 2 Lyrical), so that a program started with ``--ros`` takes part in
 ROS 2 as well (docs/integrations/ros2.md). Durchblick's payloads are the CDR bytes ROS 2 writes already
 (protocol.md); ROS needs them on its own keys, with its own attachment, and announces every entity by a liveliness
 token.
@@ -55,7 +55,6 @@ import zenoh
 log = logging.getLogger("xblick")
 
 RMW_ZENOH = "0.2.13"           # the rmw_zenoh_cpp version this module follows (ROS 2 Jazzy)
-RMW_ZENOH_LYRICAL = "0.10.8"   # and for ROS 2 Lyrical (its buffer keys from 0.10.5)
 ADMIN_SPACE = "@ros2_lv"       # the liveliness tokens' prefix
 DOMAIN_ENV = "ROS_DOMAIN_ID"   # ROS's variable for the domain id
 DEFAULT_DOMAIN = 0             # ROS's default domain id
