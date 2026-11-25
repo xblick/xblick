@@ -346,7 +346,9 @@ namespace xblick
     };
 
     // A camera's fixed transforms between its streams' frames, on <camera>/tf_static (protocol.hpp): published once
-    // and answered on request for as long as this object lives, as ROS's latched /tf_static.
+    // and answered on request for as long as this object lives, as ROS's latched /tf_static. Also answered to
+    // zenoh-ext's AdvancedSubscriber (tf_static/@adv/pub/<zid>/**), so that a late transient-local ROS subscriber
+    // behind zenoh-bridge-ros2dds gets them.
     class StaticTransformPublisher
     {
     public:
@@ -360,6 +362,7 @@ namespace xblick
         std::string key_;
         std::vector<std::uint8_t> payload_;
         std::optional<zenoh::Queryable<void>> queryable_;
+        std::optional<zenoh::Queryable<void>> history_queryable_;
     };
 
     // A camera's fixed transforms from <camera>/tf_static, as Python's StaticTransformSubscriber: those its publisher

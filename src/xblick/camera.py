@@ -651,21 +651,37 @@ def find_streams(session: zenoh.Session, prefix: str = "", timeout: float = 2.0)
     return sorted((base, dict(record, relayed_by=sorted(relays.get(base, ())))) for base, record in found.items())
 
 
+def declare_advanced_history(session: zenoh.Session, key: str, answer) -> zenoh.Queryable:
+    """The queryable ``topics.advanced_history`` of the once-published ``key``: ``answer(query)`` replies on ``key``
+    itself, as zenoh-ext's AdvancedPublisher answers from its cache. zenoh-bridge-ros2dds asks it for a transient-local
+    ROS subscriber (``/tf_static``) that starts after the put."""
+    def history(query: zenoh.Query):
+        # a reply on the key itself lies outside the query's key: only a query with _anyke accepts it, as
+        # zenoh-ext's AdvancedSubscriber sends; another query gets no reply
+        if query.accepts_replies() == zenoh.ReplyKeyExpr.ANY:
+            answer(query)
+    return session.declare_queryable(topics.advanced_history(key, str(session.info.zid())), history)
+
+
 class StaticTransformPublisher:
     """A camera's fixed transforms between its streams' frames on ``<camera>/tf_static``: published once and answered
-    on request until :meth:`close`, as ROS's latched ``/tf_static``."""
+    on request until :meth:`close`, as ROS's latched ``/tf_static``. Also answered to zenoh-ext's AdvancedSubscriber
+    (``declare_advanced_history``), so that a late transient-local ROS subscriber behind zenoh-bridge-ros2dds gets
+    them."""
 
     def __init__(self, session: zenoh.Session, camera: str, transforms: list[TransformStamped]):
         self.key = topics.tf_static(camera)
         self._payload = bytes(TFMessage(transforms=list(transforms)).serialize())
-        # the queryable first: a subscriber that starts after the put asks for it
+        # the queryables first: a subscriber that starts after the put asks for it
         self._queryable = session.declare_queryable(self.key, self._answer)
+        self._history = declare_advanced_history(session, self.key, self._answer)
         session.put(self.key, self._payload, encoding=cdr_encoding(TFMessage))
 
     def _answer(self, query: zenoh.Query):
         query.reply(self.key, self._payload, encoding=cdr_encoding(TFMessage))
 
     def close(self):
+        self._history.undeclare()
         self._queryable.undeclare()
 
 
