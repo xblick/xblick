@@ -8,7 +8,7 @@ exactly what is compatible with ROS 2 and what is not.
 | Aspect | State |
 | --- | --- |
 | Message definitions and bytes on the wire | identical. Tests compare every message type with an independent CDR implementation ([protocol](../concepts/protocol.md)). |
-| Topic layout of a camera stream | identical to `image_transport`: `image_raw`, `image_raw/compressed`, `camera_info` |
+| Topic layout of a camera stream | identical to `image_transport`: `image_raw`, `image_raw/compressed`, `camera_info`. Depth is the exception. Durchblick sends RVL depth on `image_raw/compressed`, and the `compressedDepth` plugin of ROS 2 uses `image_raw/compressedDepth`. |
 | Transforms, diagnostics, clock | the types and roles of `/tf`, `/tf_static`, `/diagnostics` and `/clock` |
 | Parameters | the messages and services of `rcl_interfaces`, with the same bytes. Only the keys follow Durchblick's naming ([parameters](../reference/parameters.md)). |
 | Calibration files | the YAML format of `camera_calibration`. `CameraInfo.read_file` reads it and `write_file` writes it. |
