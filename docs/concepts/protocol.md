@@ -5,9 +5,15 @@ which messages Durchblick sends, how it adds its own fields, and how versions pr
 
 ## ROS 2 messages without ROS
 
-Every payload is a ROS 2 message, for example `sensor_msgs/msg/Image` or `vision_msgs/msg/Detection3DArray`.
-Durchblick serialises it as CDR, the binary format of ROS 2, in little-endian byte order with the 4-byte
-encapsulation header. The bytes are identical to the bytes that ROS 2 writes.
+Images, point clouds, detections, transforms, diagnostics and parameters travel as ROS 2 messages, for example
+`sensor_msgs/msg/Image` or `vision_msgs/msg/Detection3DArray`. Durchblick serialises them as CDR, the binary format
+of ROS 2, in little-endian byte order with the 4-byte encapsulation header. The bytes are identical to the bytes that
+ROS 2 writes.
+
+Two other kinds of payload exist. The message types that Durchblick defines, such as the descriptors of the rings,
+are CDR as well ([below](#one-definition-with-versions)). Records and events are JSON. These are the info record of
+a stream, the program record, the events of a simulation, the send counts of a blocking publisher and the status of
+the recorder.
 
 We chose ROS 2 messages because engineers know them and tools read them. Durchblick does not need a ROS
 installation. It has its own implementation of the messages in Python and in C++.
@@ -33,14 +39,16 @@ A reader takes the fields that it knows and ignores the others. [Timestamps](tim
 `cpp/include/xblick/protocol.hpp` defines the whole protocol: the topic names, the message types and their
 versions. The Python package reads these values from the C++ core, so both languages always agree.
 
-Every sample names its schema in its Zenoh [encoding](https://docs.rs/zenoh/1.10.1/zenoh/bytes/struct.Encoding.html):
+Every CDR sample names its schema in its Zenoh
+[encoding](https://docs.rs/zenoh/1.10.1/zenoh/bytes/struct.Encoding.html):
 
 ```
 application/cdr;sensor_msgs/msg/Image                 a ROS 2 type
 application/cdr;xblick_msgs/msg/ShmImage@1            a Durchblick type, version 1
 ```
 
-Durchblick's own types are the descriptors for the rings. Their version changes whenever their layout changes. A
+The types that Durchblick defines are mainly the descriptors for the rings. The others carry compressed point
+clouds, their rays and the services of the controller link. Their version changes whenever their layout changes. A
 subscriber that receives another version raises `ProtocolError` and names both versions. It does not try to read
 the sample. The rings and their handshake carry versions in the same way.
 
