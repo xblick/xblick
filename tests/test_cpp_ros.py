@@ -69,6 +69,8 @@ def python_wire(case: list[str]) -> str:
             return ros.data_key(int(f[0]), f[1], f[2], ros.hash_of(f[2]))
         if op == "hashes":
             return ";".join(f"{t}={h}" for t, h in sorted(ros.TYPE_HASHES.items()))
+        if op == "buffer_fields":
+            return ";".join(f"{t}={int(b)}" for t, b in sorted(ros.BUFFER_FIELDS.items()))
         if op == "attachment":
             return ros.encode_attachment(int(f[0]), int(f[1]), bytes.fromhex(f[2])).hex()
         if op == "decode_attachment":
@@ -82,7 +84,7 @@ def python_wire(case: list[str]) -> str:
             domain, zid, node_id, entity_id, kind, ns, node, name, type_name, r, d, h, depth = f
             qos = ros.Qos(reliability=int(r), durability=int(d), history=int(h), depth=int(depth))
             token = ros.Token(int(domain), zid, node_id, entity_id, kind, "/", ns, node, ros.check_ros_name(name),
-                              type_name, ros.hash_of(type_name), qos)
+                              type_name, ros.hash_of(type_name), qos, ros.backends_of(kind, type_name, qos))
             if qos.reliability == ros.BEST_EFFORT:
                 return "ERROR"  # the C++ API offers no best-effort entity (zenoh-c sets reliability unstably only)
             return f"{token.key()}\t{ros.data_key(int(domain), name, type_name, token.type_hash)}"
@@ -107,12 +109,13 @@ CASES = (
     + [["dds_type", t] for t in TYPES + ["sensor_msgs/Image", "pkg/act/X", "a/msg/b/c"]]
     + [["data_key", 87, name, t] for name in ("/chatter", "/a/b/c", "chatter", "/a-b") for t in
        ("std_msgs/msg/String", "rcl_interfaces/srv/GetParameters", "xblick_msgs/msg/ShmImage")]
-    + [["hashes"]]
+    + [["hashes"], ["buffer_fields"]]
     + [["attachment", seq, ns, gid] for seq, ns, gid in ((1, 0, "00" * 16), (3, 1_763_000_000_123_456_789, "ab" * 16),
                                                           (-1, -5, "0f" * 16), (2**63 - 1, 2**62, "11" * 16))]
     + [["decode_attachment", a] for a in (CHATTER_ATTACHMENT, CHATTER_ATTACHMENT[:-2], "",
                                           CHATTER_ATTACHMENT[:32] + "0f" + CHATTER_ATTACHMENT[34:])]
     + [["token", t] for t in (TALKER_CHATTER, TALKER_CHATTER.replace("/MP/", "/XX/"), TALKER_CHATTER + "/x",
+                              TALKER_CHATTER + "/backends:cpu:", TALKER_CHATTER + "/backends:cpu:/x",
                               f"@ros2_lv/87/{ZID}/0/0/NN/%/%/talker", f"@ros2_lv/x/{ZID}/0/0/NN/%/%/talker")]
     + [["node_token", 87, ZID, 0, ns, n] for ns, n in (("/", "xblick_cpp_camera"), ("/test/camera", "boxer"),
                                                        ("/", "bad-name"))]
@@ -126,7 +129,11 @@ CASES = (
            (5, "MS", "/", "probe", "/roscam/image_raw", "sensor_msgs/msg/Image", 1, 2, 1, 1),
            (6, "MP", "/", "probe", "/x", "sensor_msgs/msg/Image", 2, 2, 1, 5),
            (7, "MP", "/", "probe", "/x", "xblick_msgs/msg/ShmImage", 1, 2, 1, 1),
-           (8, "MP", "/", "probe", "x-y", "sensor_msgs/msg/Image", 1, 2, 1, 1))]
+           (8, "MP", "/", "probe", "x-y", "sensor_msgs/msg/Image", 1, 2, 1, 1),
+           (9, "MS", "/", "probe", "/roscam/points", "sensor_msgs/msg/PointCloud2", 1, 2, 1, 1),
+           (10, "MS", "/", "probe", "/roscam/image_raw", "sensor_msgs/msg/Image", 1, 1, 1, 1),
+           (11, "MS", "/", "probe", "/roscam/camera_info", "sensor_msgs/msg/CameraInfo", 1, 2, 1, 1),
+           (12, "MS", "/", "probe", "/roscam/compressed", "sensor_msgs/msg/CompressedImage", 1, 2, 1, 1))]
     + [["qos", q] for q in ("::,7:,:,:,,", ":1:,1000:,:10,0:,,", ":1:,1:,:,:,,", "::,:,:,:,,", ":7:,:,:,,", "x::,1:,:,:,,",
                             "::,1:,:,:,,,", "")]
     + [["domain", d] for d in ("", "0", "7", "-1")]

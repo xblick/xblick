@@ -171,6 +171,13 @@ namespace
                         out += (out.empty() ? "" : ";") + type + "=" + hash;
                     }
                 }
+                else if (op == "buffer_fields")
+                {
+                    for (const auto& [type, buffer] : ros::buffer_fields())
+                    {
+                        out += (out.empty() ? "" : ";") + type + "=" + (buffer ? "1" : "0");
+                    }
+                }
                 else if (op == "attachment")
                 {
                     ros::Gid gid{};

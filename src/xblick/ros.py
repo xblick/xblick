@@ -1,7 +1,8 @@
 """ROS 2 on Zenoh: the keys, type names, type hashes, attachments, QoS strings and liveliness tokens of rmw_zenoh_cpp
-0.2.13 (ROS 2 Jazzy, Zenoh 1.10.1), so that a program started with ``--ros`` takes part in ROS 2 as well
-(docs/integrations/ros2.md). Durchblick's payloads are the CDR bytes ROS 2 writes already (protocol.md); ROS needs
-them on its own keys, with its own attachment, and announces every entity by a liveliness token.
+0.2.13 (ROS 2 Jazzy) and 0.10.6 to 0.10.8 (ROS 2 Lyrical), so that a program started with ``--ros`` takes part in
+ROS 2 as well (docs/integrations/ros2.md). Durchblick's payloads are the CDR bytes ROS 2 writes already
+(protocol.md); ROS needs them on its own keys, with its own attachment, and announces every entity by a liveliness
+token.
 
 * data key: ``<domain>/<topic without the leading />/<pkg>::msg::dds_::<Name>_/RIHS01_<type hash>``;
   a service's key the same with the service's name and ``<pkg>::srv::dds_::<Name>_`` and the service type's hash;
@@ -11,7 +12,14 @@ them on its own keys, with its own attachment, and announces every entity by a l
 * liveliness token of a node: ``@ros2_lv/<domain>/<zid>/<node id>/<node id>/NN/<enclave>/<namespace>/<node>``; of a
   publisher (MP), subscription (MS), service (SS), client (SC): ``@ros2_lv/<domain>/<zid>/<node id>/<entity
   id>/<kind>/<enclave>/<namespace>/<node>/<topic>/<type>/RIHS01_<hash>/<qos>``, every ``/`` inside a name written
-  as ``%`` (``/`` alone: ``%``);
+  as ``%`` (``/`` alone: ``%``); Lyrical adds an optional 14th part ``backends:<name>:<meta>;...`` (below);
+* buffer types (Lyrical): a message type with a ``uint8[]`` field, its own or a nested type's (``BUFFER_FIELDS``),
+  goes from a Lyrical publisher to a volatile subscription only on ``<key>/_buf_cpu`` (a subscription whose token
+  says ``backends:cpu:``) and ``<key>/_buf/<subscription gid>`` (any other), never on the key itself while it knows
+  every subscription. Our volatile subscriptions of such a type say ``backends:cpu:`` and take ``<key>/_buf_cpu``
+  as well as the key; the bytes there are the same CDR with the same attachment. A publisher sends each message on
+  the key or on these keys, never on both. Jazzy reads the 14th part and ignores it; a Lyrical subscription reads the
+  key whatever the publisher's token says, so our publishers stay as they are;
 * a transient-local publisher (``/tf_static``) is a zenoh-ext AdvancedPublisher with a cache of ``depth`` samples
   and publisher detection (and sample-miss detection with a sporadic heartbeat of 0.5 s when reliable); a
   transient-local subscription an AdvancedSubscriber that asks late-detected publishers for their history;
@@ -47,6 +55,7 @@ import zenoh
 log = logging.getLogger("xblick")
 
 RMW_ZENOH = "0.2.13"           # the rmw_zenoh_cpp version this module follows (ROS 2 Jazzy)
+RMW_ZENOH_LYRICAL = "0.10.8"   # and for ROS 2 Lyrical (its buffer keys from 0.10.5)
 ADMIN_SPACE = "@ros2_lv"       # the liveliness tokens' prefix
 DOMAIN_ENV = "ROS_DOMAIN_ID"   # ROS's variable for the domain id
 DEFAULT_DOMAIN = 0             # ROS's default domain id
@@ -59,6 +68,9 @@ HEARTBEAT_S = 0.5  # sample-miss detection of a reliable transient-local publish
 SYSTEM_DEFAULT, RELIABLE, BEST_EFFORT = 0, 1, 2
 TRANSIENT_LOCAL, VOLATILE = 1, 2
 KEEP_LAST, KEEP_ALL = 1, 2
+
+CPU_BACKENDS = "backends:cpu:"  # the 14th token part of a subscription that takes buffer types as plain CDR
+CPU_GROUP = "_buf_cpu"          # below a buffer type's key: what Lyrical's publishers send to such subscriptions
 
 NODE, PUBLISHER, SUBSCRIPTION, SERVICE, CLIENT = "NN", "MP", "MS", "SS", "SC"
 KINDS = (NODE, PUBLISHER, SUBSCRIPTION, SERVICE, CLIENT)
@@ -259,12 +271,15 @@ class Token:
     type_name: str | None = None  # pkg/msg/Name
     type_hash: str | None = None
     qos: Qos | None = None
+    backends: str | None = None   # the optional 14th part (rmw_zenoh 0.10.5 and later), ``backends:...``
 
     def key(self) -> str:
         parts = [ADMIN_SPACE, str(self.domain), self.zid, self.node_id, self.entity_id, self.kind, mangle(self.enclave),
                  mangle(self.namespace), mangle(self.node)]
         if self.kind != NODE:
             parts += [mangle(self.topic), dds_type(self.type_name), self.type_hash, self.qos.key()]
+            if self.backends is not None:
+                parts.append(self.backends)
         return "/".join(parts)
 
     @property
@@ -286,9 +301,12 @@ def parse_token(key: str) -> Token:
         if len(parts) != 9:
             raise RosError(f"{key!r}: a node's token has 9 parts")
         return Token(*base)
-    if len(parts) != 13:
-        raise RosError(f"{key!r}: an entity's token has 13 parts")
-    return Token(*base, demangle(parts[9]), type_of_dds(parts[10]), parts[11], Qos.parse(parts[12]))
+    if len(parts) not in (13, 14):
+        raise RosError(f"{key!r}: an entity's token has 13 parts, or 14 with backends")
+    if len(parts) == 14 and not parts[13].startswith("backends:"):
+        raise RosError(f"{key!r}: an entity's 14th token part starts with 'backends:'")
+    return Token(*base, demangle(parts[9]), type_of_dds(parts[10]), parts[11], Qos.parse(parts[12]),
+                 parts[13] if len(parts) == 14 else None)
 
 
 # ------------------------------------------------------------------------------------------- type hashes (RIHS01)
@@ -322,6 +340,47 @@ TYPE_HASHES = {
     "vision_msgs/msg/Detection2DArray": "RIHS01_214274120007f4a683866481336b70310268cfa107aebe9d594a6acf75bda968",
     "vision_msgs/msg/Detection3DArray": "RIHS01_793f5eab9595ac1c0da07873cc859db42eae51f0ee76056db8562515d830e018",
 }
+
+
+# Every message type of TYPE_HASHES: True when ROS 2 Lyrical's typesupport says it has Buffer fields (rosidl
+# has_buffer_fields_<pkg>__msg__<Name>(): an unbounded uint8[] field of its own or of a type it uses), asked of a
+# Lyrical install (rmw_zenoh_cpp 0.10.6, vision_msgs 4.2.0); tests/test_ros.py checks that every message type is here
+BUFFER_FIELDS = {
+    "builtin_interfaces/msg/Time": False,
+    "diagnostic_msgs/msg/DiagnosticArray": False,
+    "geometry_msgs/msg/WrenchStamped": False,
+    "nav_msgs/msg/Odometry": False,
+    "rcl_interfaces/msg/ParameterEvent": False,
+    "rosgraph_msgs/msg/Clock": False,
+    "sensor_msgs/msg/CameraInfo": False,
+    "sensor_msgs/msg/CompressedImage": True,
+    "sensor_msgs/msg/Image": True,
+    "sensor_msgs/msg/Imu": False,
+    "sensor_msgs/msg/JointState": False,
+    "sensor_msgs/msg/PointCloud2": True,
+    "std_msgs/msg/Float64MultiArray": False,
+    "std_msgs/msg/String": False,
+    "tf2_msgs/msg/TFMessage": False,
+    "vision_msgs/msg/Classification": False,
+    "vision_msgs/msg/Detection2DArray": False,
+    "vision_msgs/msg/Detection3DArray": False,
+}
+
+
+def backends_of(kind: str, type_name: str, qos: Qos) -> str | None:
+    """The 14th token part of an entity of ours: ``CPU_BACKENDS`` for a subscription of a buffer type that is not
+    transient local (rmw_zenoh uses no buffer keys for transient local), else None. RosError for a subscription's
+    message type of unknown buffer status (not in ``BUFFER_FIELDS``)."""
+    if kind != SUBSCRIPTION:
+        return None
+    if type_name not in BUFFER_FIELDS:
+        raise RosError(f"{type_name}: not known whether ROS 2 Lyrical sends it on buffer keys (ros.BUFFER_FIELDS)")
+    return CPU_BACKENDS if BUFFER_FIELDS[type_name] and qos.durability != TRANSIENT_LOCAL else None
+
+
+def cpu_group_key(key: str) -> str:
+    """The key on which Lyrical's publishers send a buffer type to ``backends:cpu:`` subscriptions."""
+    return f"{key}/{CPU_GROUP}"
 
 
 def hash_of(type_name: str) -> str:
@@ -592,7 +651,7 @@ class RosNode:
 
     def entity_token(self, kind: str, name: str, type_name: str, qos: Qos) -> Token:
         return Token(self.ros.domain, self.ros.zid, self.id, self.ros.next_id(), kind, "/", self.namespace, self.name,
-                     check_ros_name(name), type_name, hash_of(type_name), qos)
+                     check_ros_name(name), type_name, hash_of(type_name), qos, backends_of(kind, type_name, qos))
 
     def _add(self, entity):
         with self._lock:
@@ -703,11 +762,13 @@ class RosPublisher(_Entity):
 class RosSubscriber(_Entity):
     """A ROS subscription: ``callback(payload: bytes, seq, source_ns, gid)`` for each sample (in Zenoh's thread). A
     sample without ROS's attachment is dropped with a warning, as ROS drops it. Transient local: zenoh-ext's
-    AdvancedSubscriber, which asks publishers it detects for their cache."""
+    AdvancedSubscriber, which asks publishers it detects for their cache. A buffer type (``backends_of``): also the
+    key's ``_buf_cpu``, where Lyrical's publishers send it."""
 
     def __init__(self, node: RosNode, topic: str, type_name: str, callback: Callable, qos: Qos = STREAM_QOS):
         super().__init__(node, SUBSCRIPTION, topic, type_name, qos)
         self._callback = callback
+        self._warned = False
         if qos.durability == TRANSIENT_LOCAL:
             import zenoh.ext as ext
             recovery = ext.RecoveryConfig(periodic_queries=None, heartbeat=True) \
@@ -718,8 +779,15 @@ class RosSubscriber(_Entity):
                 subscriber_detection=True)
         else:
             self._declared = self._raw.declare_subscriber(self.key, self._on_sample)
+        self._cpu_group = self._raw.declare_subscriber(cpu_group_key(self.key), self._on_sample) \
+            if self.token.backends == CPU_BACKENDS else None
         self._announce()
-        self._warned = False
+
+    def close(self):
+        super().close()
+        if self._cpu_group is not None:
+            self._cpu_group.undeclare()
+            self._cpu_group = None
 
     def _on_sample(self, sample: zenoh.Sample):
         try:

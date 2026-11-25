@@ -1,5 +1,6 @@
 // ros.hpp against bytes captured from rmw_zenoh_cpp 0.2.13 (ROS 2 Jazzy's talker, listener and tf2_ros'
-// static_transform_publisher on domain 87; the same captures as tests/test_ros.py). The comparison with Python's
+// static_transform_publisher on domain 87) and 0.10.6 (ROS 2 Lyrical's cam2image and showimage on domain 77); the
+// same captures as tests/test_ros.py. The comparison with Python's
 // xblick.ros case by case is tests/test_cpp_ros.py.
 #include <cstdio>
 #include <cstdlib>
@@ -61,6 +62,13 @@ namespace
     const std::string kTalkerGet =
         "@ros2_lv/87/78cf7f7f723020cd89f943acf3eb2710/0/2/SS/%/%/talker/%talker%get_parameters/rcl_interfaces::srv::"
         "dds_::GetParameters_/RIHS01_bf9803d5c74cf989a5de3e0c2e99444599a627c7ff75f97b8c05b01003675cbc/::,1000:,:,:,,";
+    const std::string kLyricalCam2image =
+        "@ros2_lv/77/1b98790c445491809533e78cc3304fd5/0/10/MP/%/%/cam2image/%lyrg%image_raw/sensor_msgs::msg::dds_::"
+        "Image_/RIHS01_d31d41a9a4c4bc8eae9be757b0beed306564f7526c88ea6a4588fb9582527d47/::2,10:,:,:,,/backends:cpu:";
+    const std::string kLyricalCam2imageGid = "3d71c655915d7801d6885bcb18590281";
+    const std::string kLyricalShowimage =
+        "@ros2_lv/77/16a25e588aeb51c11d8c2340714f13f/0/10/MS/%/%/showimage/%lyrg%image_raw/sensor_msgs::msg::dds_::"
+        "Image_/RIHS01_d31d41a9a4c4bc8eae9be757b0beed306564f7526c88ea6a4588fb9582527d47/::2,10:,:,:,,/backends:cpu:";
     const std::string kChatterKey =
         "87/chatter/std_msgs::msg::dds_::String_/RIHS01_df668c740482bbd48fb39d76a70dfd4bd59db1288021743503259e948f6b1a18";
     const std::string kChatterAttachment = "0300000000000000dca5f02d39ace8181031b1bb10e2fda68e3b7018e216540748";
@@ -103,7 +111,8 @@ int main()
     refused([&] { ros::decode_attachment(length); }, "an attachment with length byte 15");
 
     // tokens read and written back
-    for (const std::string& key : {kTalkerChatter, kListenerChatter, kTalkerNode, kTalkerRosout, kStaticTf, kTalkerGet})
+    for (const std::string& key : {kTalkerChatter, kListenerChatter, kTalkerNode, kTalkerRosout, kStaticTf, kTalkerGet,
+                                   kLyricalCam2image, kLyricalShowimage})
     {
         check(ros::Token::parse(key).key() == key, "token read and written back: " + key);
     }
@@ -120,6 +129,47 @@ int main()
     std::string kind = kTalkerChatter;
     kind.replace(kind.find("/MP/"), 4, "/XX/");
     refused([kind] { ros::Token::parse(kind); }, "a token of kind XX");
+
+    // Lyrical's optional 14th part: read and kept, the gid over the whole token; another 14th part or a 15th refused
+    const ros::Token lyrical = ros::Token::parse(kLyricalCam2image);
+    check(lyrical.kind == "MP" and lyrical.type_name == "sensor_msgs/msg/Image" and lyrical.backends == "backends:cpu:",
+          "the parts of cam2image's token");
+    check(ros::Token::parse(kLyricalShowimage).backends == ros::kCpuBackends, "showimage's backends");
+    check(not ros::Token::parse(kTalkerChatter).backends, "no backends in a Jazzy token");
+    const ros::Gid lyrical_gid = ros::gid(kLyricalCam2image);
+    check(std::vector<std::uint8_t>(lyrical_gid.begin(), lyrical_gid.end()) == unhex(kLyricalCam2imageGid),
+          "cam2image's gid is the one in its samples");
+    std::string not_backends = kLyricalCam2image;
+    not_backends.replace(not_backends.find("/backends:"), 10, "/b:");
+    for (std::string bad : {not_backends, kLyricalCam2image + "/backends:cpu:", kTalkerNode + "/backends:cpu:"})
+    {
+        refused([bad] { ros::Token::parse(bad); }, "token " + bad);
+    }
+
+    // buffer types: a volatile subscription says backends:cpu:, nothing else does; an unknown message type refused
+    check(ros::backends_of(ros::kSubscription, "sensor_msgs/msg/Image", ros::kStreamQos) == "backends:cpu:",
+          "backends of an Image subscription");
+    check(ros::backends_of(ros::kSubscription, "sensor_msgs/msg/PointCloud2", ros::kStreamQos) == "backends:cpu:",
+          "backends of a PointCloud2 subscription");
+    check(not ros::backends_of(ros::kSubscription, "sensor_msgs/msg/Image",
+                               ros::Qos{.durability = ros::kTransientLocal, .depth = 1}),
+          "no backends when transient local");
+    check(not ros::backends_of(ros::kPublisher, "sensor_msgs/msg/Image", ros::kStreamQos),
+          "no backends of a publisher");
+    check(not ros::backends_of(ros::kSubscription, "sensor_msgs/msg/CameraInfo", ros::kStreamQos),
+          "no backends of CameraInfo");
+    check(not ros::backends_of(ros::kService, "rcl_interfaces/srv/GetParameters", ros::kParametersQos),
+          "no backends of a service");
+    refused([] { ros::backends_of(ros::kSubscription, "sensor_msgs/msg/Range", ros::kStreamQos); },
+            "a subscription of unknown buffer status");
+    for (const auto& [type, hash] : ros::type_hashes())
+    {
+        check(type.find("/msg/") == std::string::npos or ros::buffer_fields().contains(type),
+              "buffer status of " + type);
+    }
+    check(ros::cpu_group_key("77/x/sensor_msgs::msg::dds_::Image_/RIHS01_0") ==
+              "77/x/sensor_msgs::msg::dds_::Image_/RIHS01_0/_buf_cpu",
+          "cpu_group_key");
 
     // QoS
     check(ros::Qos{.depth = 7}.key() == "::,7:,:,:,,", "QoS depth 7");

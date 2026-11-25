@@ -13,7 +13,7 @@ GitHub release. The rule is in [Development](docs/project/development.md#release
 
 ## Branch ros2 (not released)
 
-With `--ros`, a program also takes part in ROS 2 Jazzy on `rmw_zenoh`: ROS nodes see its streams, transforms and
+With `--ros`, a program also takes part in ROS 2 Jazzy or Lyrical on `rmw_zenoh`: ROS nodes see its streams, transforms and
 parameters, and it reads theirs.
 
 ### Added
@@ -24,6 +24,7 @@ parameters, and it reads theirs.
 - With `--ros`: each node's parameters as a ROS node's services, read only unless `--ros-params-writable`, so that `ros2 param` works; `xblick param --via-ros` and `ParameterClient(ros=True)` for a ROS node's parameters.
 - `CountedPublisher.ros_matched`: a ROS subscriber of the key's mirror (`matched` stays our key's).
 - Readers of ROS topics: transport `ros` for images and clouds (`xblick hz`, `xblick snapshot`), `DetectionSubscriber(ros_type=...)`, `TransformBuffer(ros=True)`.
+- ROS 2 Lyrical (`rmw_zenoh_cpp` 0.10.6 to 0.10.8): readers of images, compressed images and clouds also take them from Lyrical publishers, which send these types on keys of their own (Python and C++).
 - The C++ API and programs (`xblick-cpp-camera`, `xblick-cpp-probe`, `xblick-points`) take part the same way: the options in `Options::add_session_options`, `SessionOptions::ros`, `Transport::Ros`.
 - `_core.ros_gid`: the gid of a ROS entity as `rmw_zenoh` makes it (XXH3-128 of its token), used by both sides.
 - The guide [Durchblick and ROS 2](docs/integrations/ros2.md) and the protocol's section on `rmw_zenoh`.
@@ -41,6 +42,7 @@ parameters, and it reads theirs.
 
 - With `--ros-params-writable` a ROS client's set is unchecked and uncounted: no node check, no deadline, and every node of the name executes it.
 - Keys with a part `command` never go to ROS.
+- A Jazzy subscriber gets no images, compressed images or clouds from a Lyrical publisher, between ROS nodes as well.
 - C++: a ROS subscriber that starts late may get a `/tf_static` message twice (zenoh-c's standalone build has no advanced publisher).
 
 Compatible with 0.5.14: without `--ros` no byte on the wire changes.

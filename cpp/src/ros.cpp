@@ -318,6 +318,10 @@ namespace xblick::ros
                 throw std::logic_error("an entity's token needs its topic, type, hash and QoS");
             }
             out += "/" + mangle(*topic) + "/" + dds_type(*type_name) + "/" + *type_hash + "/" + qos->key();
+            if (backends)
+            {
+                out += "/" + *backends;
+            }
         }
         return out;
     }
@@ -365,14 +369,22 @@ namespace xblick::ros
             }
             return t;
         }
-        if (parts.size() != 13)
+        if (parts.size() != 13 and parts.size() != 14)
         {
-            throw RosError(repr(key) + ": an entity's token has 13 parts");
+            throw RosError(repr(key) + ": an entity's token has 13 parts, or 14 with backends");
+        }
+        if (parts.size() == 14 and not parts[13].starts_with("backends:"))
+        {
+            throw RosError(repr(key) + ": an entity's 14th token part starts with 'backends:'");
         }
         t.topic = demangle(parts[9]);
         t.type_name = type_of_dds(parts[10]);
         t.type_hash = parts[11];
         t.qos = Qos::parse(parts[12]);
+        if (parts.size() == 14)
+        {
+            t.backends = parts[13];
+        }
         return t;
     }
 
@@ -432,6 +444,55 @@ namespace xblick::ros
             throw RosError(type_name + ": no ROS 2 type hash known for it, so it is not offered to ROS");
         }
         return it->second;
+    }
+
+    const std::map<std::string, bool>& buffer_fields()
+    {
+        // Python's ros.BUFFER_FIELDS (ROS 2 Lyrical's has_buffer_fields_<pkg>__msg__<Name>())
+        static const std::map<std::string, bool> table = {
+            {"builtin_interfaces/msg/Time", false},
+            {"diagnostic_msgs/msg/DiagnosticArray", false},
+            {"geometry_msgs/msg/WrenchStamped", false},
+            {"nav_msgs/msg/Odometry", false},
+            {"rcl_interfaces/msg/ParameterEvent", false},
+            {"rosgraph_msgs/msg/Clock", false},
+            {"sensor_msgs/msg/CameraInfo", false},
+            {"sensor_msgs/msg/CompressedImage", true},
+            {"sensor_msgs/msg/Image", true},
+            {"sensor_msgs/msg/Imu", false},
+            {"sensor_msgs/msg/JointState", false},
+            {"sensor_msgs/msg/PointCloud2", true},
+            {"std_msgs/msg/Float64MultiArray", false},
+            {"std_msgs/msg/String", false},
+            {"tf2_msgs/msg/TFMessage", false},
+            {"vision_msgs/msg/Classification", false},
+            {"vision_msgs/msg/Detection2DArray", false},
+            {"vision_msgs/msg/Detection3DArray", false},
+        };
+        return table;
+    }
+
+    std::optional<std::string> backends_of(std::string_view kind, const std::string& type_name, const Qos& qos)
+    {
+        if (kind != kSubscription)
+        {
+            return std::nullopt;
+        }
+        const auto it = buffer_fields().find(type_name);
+        if (it == buffer_fields().end())
+        {
+            throw RosError(type_name + ": not known whether ROS 2 Lyrical sends it on buffer keys (ros.BUFFER_FIELDS)");
+        }
+        if (it->second and qos.durability != kTransientLocal)  // rmw_zenoh: no buffer keys when transient local
+        {
+            return std::string(kCpuBackends);
+        }
+        return std::nullopt;
+    }
+
+    std::string cpu_group_key(const std::string& key)
+    {
+        return key + "/" + std::string(kCpuGroup);
     }
 
     // ------------------------------------------------------------------------------------------ taking part
@@ -603,6 +664,7 @@ namespace xblick::ros
         token.type_name = type_name;
         token.type_hash = hash_of(type_name);
         token.qos = qos;
+        token.backends = backends_of(kind, type_name, qos);
         token_key = token.key();
         key = data_key(ros.domain(), name, type_name, *token.type_hash);
         if (key.empty() or not std::isdigit(static_cast<unsigned char>(key[0])))  // no key of ours starts so
@@ -814,6 +876,12 @@ namespace xblick::ros
                 },
                 zenoh::closures::none, std::move(options)));
         }
+        if (entity_.token.backends == kCpuBackends)
+        {
+            cpu_group_.emplace(session.declare_subscriber(
+                zenoh::KeyExpr(cpu_group_key(entity_.key)),
+                [state](const zenoh::Sample& sample) { state->take(sample); }, zenoh::closures::none));
+        }
         token_.emplace(session.liveliness_declare_token(zenoh::KeyExpr(entity_.token_key)));
     }
 
@@ -822,6 +890,7 @@ namespace xblick::ros
         state_->closed.store(true);
         token_.reset();
         history_.reset();
+        cpu_group_.reset();
         subscriber_.reset();
     }
 

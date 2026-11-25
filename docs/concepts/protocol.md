@@ -135,7 +135,8 @@ the same id count as one node. A program older than 0.5.13 sends none of these a
 
 ## ROS 2 on rmw_zenoh
 
-A program with `--ros` also sends on the keys of `rmw_zenoh_cpp` 0.2.13, the RMW of ROS 2 Jazzy. The payload stays
+A program with `--ros` also sends on the keys of `rmw_zenoh_cpp`: 0.2.13 is the RMW of ROS 2 Jazzy, and 0.10.6 to
+0.10.8 are those of ROS 2 Lyrical. The payload stays
 the same CDR bytes. Only the key, the attachment and the announcements differ. `src/xblick/ros.py` implements them,
 and [Durchblick and ROS 2](../integrations/ros2.md) explains what takes part.
 
@@ -145,13 +146,13 @@ and [Durchblick and ROS 2](../integrations/ros2.md) explains what takes part.
 | data key of a service | the same with the service's name, `<pkg>::srv::dds_::<Name>_` and the service type's hash |
 | attachment | 33 bytes: the sequence number (int64), the source time in ns (int64), the length byte 16, the gid (16 bytes) |
 | node token | `@ros2_lv/<domain>/<zid>/<node id>/<node id>/NN/<enclave>/<namespace>/<node>` |
-| entity token | `@ros2_lv/<domain>/<zid>/<node id>/<entity id>/<MP\|MS\|SS\|SC>/<enclave>/<namespace>/<node>/<topic>/<type>/RIHS01_<hash>/<qos>` |
+| entity token | `@ros2_lv/<domain>/<zid>/<node id>/<entity id>/<MP\|MS\|SS\|SC>/<enclave>/<namespace>/<node>/<topic>/<type>/RIHS01_<hash>/<qos>`, in Lyrical optionally followed by `/backends:<name>:<meta>;...` |
 | QoS in a token | `<reliability>:<durability>:<history>,<depth>:<deadline>:<lifespan>:<liveliness>`, each part empty where it is `rmw_zenoh`'s default |
 
 Inside a token every `/` of a name is written as `%`. A ROS subscriber drops a sample without the attachment. A
 service reply carries the request's sequence number and client gid with the reply's own time.
 
-Three rules of `rmw_zenoh` decide how a program takes part:
+Four rules of `rmw_zenoh` decide how a program takes part:
 
 - A transient-local publisher, such as one on `/tf_static`, is zenoh-ext's advanced publisher with a cache of `depth`
   samples. A subscriber that starts later asks it for them.
@@ -159,6 +160,13 @@ Three rules of `rmw_zenoh` decide how a program takes part:
   only complete queryables. Our own queryables are never complete, and our keys never match ROS's keys.
 - A type hash (RIHS01) is the SHA-256 of the type's description in a fixed JSON form. Durchblick computes it as
   ROS does. `tests/test_ros.py` compares the result with every type of a ROS 2 Jazzy installation.
+- In Lyrical, a message type with a `uint8[]` field, its own or one of a type it uses, is a buffer type. Image,
+  CompressedImage and PointCloud2 are the buffer types among ours. A Lyrical publisher of a buffer type sends to a
+  volatile subscription on `<key>/_buf_cpu` when its token ends in `backends:cpu:`. It sends to any other
+  subscription on `<key>/_buf/<the subscription's gid>`. It uses the key itself only while it has not yet seen
+  every subscription, and it sends each message on one of these ways only. Our volatile subscriptions of buffer
+  types therefore end their token in `backends:cpu:` and also read `<key>/_buf_cpu`. The bytes and the attachment
+  there are the same as on the key. Jazzy reads such a token and ignores the last part.
 
 ## Related pages
 

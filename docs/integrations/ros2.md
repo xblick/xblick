@@ -21,7 +21,8 @@ is started without `--ros`.
 ## Take part in ROS 2
 
 Start a command or a node with `--ros`. The program then sends on our keys as before and also on the keys of
-`rmw_zenoh_cpp` 0.2.13, the RMW of ROS 2 Jazzy on Zenoh 1.10. In ROS 2 it is a node of its own.
+`rmw_zenoh_cpp`. It needs `rmw_zenoh_cpp` 0.2.13 (ROS 2 Jazzy) or 0.10.6 to 0.10.8 (ROS 2 Lyrical) on the ROS side.
+In ROS 2 it is a node of its own.
 
 | Option | Meaning |
 | --- | --- |
@@ -83,6 +84,12 @@ A reader reads a ROS topic only when you ask for it. It then needs a session wit
 
 A ROS sample carries no attachment of ours. Its frames therefore have no `seq`, `source` or publish time.
 
+A Lyrical publisher sends images, compressed images and clouds on keys of its own for each kind of subscriber. Our
+readers of these types announce themselves as subscribers that take plain CDR. A Lyrical publisher then sends them the
+usual bytes on the topic's key with the suffix `/_buf_cpu`, and our readers read that key as well. A Jazzy publisher
+and our own publishers send on the topic's key, which our readers read as before
+([protocol](../concepts/protocol.md#ros-2-on-rmw_zenoh)).
+
 ## Several cameras and tf
 
 With `--ros` all transforms go to ROS's global `/tf` and `/tf_static`, as tf2 and rviz expect. tf2 keeps one parent
@@ -137,7 +144,7 @@ A Zenoh router serves our programs and ROS nodes alike. Both default to port 744
 
 ## Try it with ROS 2's tools
 
-These commands need a shell with ROS 2 Jazzy (`source /opt/ros/jazzy/setup.bash`) and
+These commands need a shell with ROS 2 Jazzy or Lyrical (such as `source /opt/ros/jazzy/setup.bash`) and
 `RMW_IMPLEMENTATION=rmw_zenoh_cpp`. Keep `ROS_DOMAIN_ID` the same in both shells, or pass `--ros-domain`. Steps 2 and
 5 and `tf2_echo` were run, the ROS programs started directly. The other `ros2` commands, `rviz2` and step 4 are
 untested.
@@ -214,8 +221,11 @@ type hashes that `--ros` uses.
   `tf2_echo` its `/tf_static`, `rclcpp`'s parameter client its parameters, and `xblick-cpp-probe` reads an `rclcpp`
   node's image.
 - The type hashes of `vision_msgs` come from our own implementation of ROS's hash over the message definitions. It
-  gives ROS's hashes for all 252 message and service types of a Jazzy installation. A Jazzy installation with
-  `vision_msgs` was not at hand to confirm these three.
+  gives ROS's hashes for all 252 message and service types of a Jazzy installation. They equal the hashes of
+  `vision_msgs` 4.2.0 in a Lyrical installation. A Jazzy installation with `vision_msgs` was not at hand.
+- A Jazzy subscriber gets no images, compressed images or clouds from a Lyrical publisher. Lyrical sends these
+  types on keys that Jazzy does not read. This holds between ROS nodes as well, so a program with `--ros` cannot
+  change it. Lyrical subscribers get these types from Jazzy publishers and from ours.
 - A program is one ROS node, and each node's parameters are one more. A vision node therefore shows as two ROS
   nodes, such as `/xblick_yolox` and `/test/camera/yolox`.
 - `/clock` is not mapped: a world's clock is `/<world>/clock`. A ROS node that uses simulated time needs a remap.

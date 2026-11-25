@@ -1,7 +1,7 @@
 // ROS 2 on Zenoh in C++: the keys, type names, type hashes, attachments, QoS strings and liveliness tokens of
-// rmw_zenoh_cpp 0.2.13 (ROS 2 Jazzy, Zenoh 1.10.1), so that a C++ program started with --ros takes part in ROS 2 as
-// well. The same rules, names and bytes as Python's xblick.ros (its module docstring and docs/integrations/ros2.md
-// are the reference; tests/test_cpp_ros.py compares the two byte for byte):
+// rmw_zenoh_cpp 0.2.13 (ROS 2 Jazzy) and 0.10.6 to 0.10.8 (ROS 2 Lyrical), so that a C++ program started with --ros
+// takes part in ROS 2 as well. The same rules, names and bytes as Python's xblick.ros (its module docstring and
+// docs/integrations/ros2.md are the reference; tests/test_cpp_ros.py compares the two byte for byte):
 //
 //   data key   <domain>/<topic without the leading />/<pkg>::msg::dds_::<Name>_/RIHS01_<type hash>
 //              (a service: its name, <pkg>::srv::dds_::<Name>_ and the service type's hash)
@@ -9,8 +9,14 @@
 //              (zenoh-ext's serialization, 33 bytes); a ROS subscriber drops a sample without it
 //   tokens     @ros2_lv/<domain>/<zid>/<node id>/<node id>/NN/<enclave>/<namespace>/<node> (a node);
 //              @ros2_lv/<domain>/<zid>/<node id>/<entity id>/<MP|MS|SS|SC>/<enclave>/<namespace>/<node>/<topic>/
-//              <type>/RIHS01_<hash>/<qos> (an entity), every '/' inside a name written as '%'
+//              <type>/RIHS01_<hash>/<qos> (an entity), every '/' inside a name written as '%'; Lyrical adds an
+//              optional 14th part backends:<name>:<meta>;...
 //   gid        XXH3-128 of the entity's token key (ros_gid.hpp)
+//   buffers    a type with a uint8[] field, its own or a used type's (buffer_fields()), goes from a Lyrical publisher
+//              to a volatile subscription only on <key>/_buf_cpu and <key>/_buf/<subscription gid>, never on the key
+//              while it knows every subscription; each message on the key or on these, never on both. A volatile
+//              Subscriber of such a type says backends:cpu: and reads <key>/_buf_cpu as well (plain CDR, ROS's
+//              attachment). Publishers stay as they are: a Lyrical subscription reads the key.
 //
 // A session takes part when open_session got SessionOptions::ros (--ros, Options::add_session_options): ros::of(session)
 // is then its Ros, else null. CameraPublisher, PointCloudPublisher, the transform, robot state, diagnostics, IMU and
@@ -47,6 +53,7 @@
 namespace xblick::ros
 {
     inline constexpr std::string_view kRmwZenoh = "0.2.13";  // the rmw_zenoh_cpp version followed (ROS 2 Jazzy)
+    inline constexpr std::string_view kRmwZenohLyrical = "0.10.8";  // and for ROS 2 Lyrical (buffer keys from 0.10.5)
     inline constexpr std::string_view kAdminSpace = "@ros2_lv";
     inline constexpr const char* kDomainEnv = "ROS_DOMAIN_ID";
     inline constexpr int kDefaultDomain = 0;
@@ -56,6 +63,11 @@ namespace xblick::ros
     inline constexpr int kSystemDefault = 0, kReliable = 1, kBestEffort = 2;
     inline constexpr int kTransientLocal = 1, kVolatile = 2;
     inline constexpr int kKeepLast = 1, kKeepAll = 2;
+
+    // the 14th token part of a subscription that takes buffer types as plain CDR, and the key below a buffer type's
+    // key where Lyrical's publishers send to such subscriptions
+    inline constexpr std::string_view kCpuBackends = "backends:cpu:";
+    inline constexpr std::string_view kCpuGroup = "_buf_cpu";
 
     inline constexpr std::string_view kNode = "NN", kPublisher = "MP", kSubscription = "MS", kService = "SS",
                                       kClient = "SC";
@@ -136,6 +148,7 @@ namespace xblick::ros
         std::string zid, node_id, entity_id, kind, enclave, ns, node;
         std::optional<std::string> topic, type_name, type_hash;  // an entity's (pkg/msg/Name), not a node's
         std::optional<Qos> qos;
+        std::optional<std::string> backends;  // the optional 14th part (rmw_zenoh 0.10.5 and later), "backends:..."
 
         std::string key() const;
         std::string fully_qualified_node() const;
@@ -148,6 +161,15 @@ namespace xblick::ros
     // computed by Python's message_hash), compared by tests/test_cpp_ros.py.
     const std::map<std::string, std::string>& type_hashes();
     std::string hash_of(const std::string& type_name);  // RosError for a type not offered to ROS
+
+    // Every message type of type_hashes(): true when ROS 2 Lyrical's typesupport says it has Buffer fields: Python's
+    // ros.BUFFER_FIELDS, compared by tests/test_cpp_ros.py.
+    const std::map<std::string, bool>& buffer_fields();
+    // The 14th token part of an entity of ours: kCpuBackends for a subscription of a buffer type that is not transient
+    // local, else none. RosError for a subscription's message type not in buffer_fields().
+    std::optional<std::string> backends_of(std::string_view kind, const std::string& type_name, const Qos& qos);
+    // <key>/_buf_cpu
+    std::string cpu_group_key(const std::string& key);
 
     // ---------------------------------------------------------------------------------- taking part on the wire
 
@@ -267,7 +289,8 @@ namespace xblick::ros
     // A ROS subscription: callback(payload, attachment) for each sample, in Zenoh's thread. A sample without ROS's
     // attachment is dropped with one warning line, as ROS drops it. Transient local (/tf_static): also the last
     // `depth` samples of every publisher with a publication cache, those there at the start and those that come
-    // later (zenoh-ext's AdvancedSubscriber's history; a sample can come twice).
+    // later (zenoh-ext's AdvancedSubscriber's history; a sample can come twice). A buffer type (backends_of): also
+    // <key>/_buf_cpu, where Lyrical's publishers send it.
     class Subscriber
     {
     public:
@@ -285,6 +308,7 @@ namespace xblick::ros
         std::shared_ptr<State> state_;
         std::optional<zenoh::Subscriber<void>> subscriber_;
         std::optional<zenoh::Subscriber<void>> history_;  // transient local: the publishers' cache tokens
+        std::optional<zenoh::Subscriber<void>> cpu_group_;  // a buffer type: <key>/_buf_cpu
         std::optional<zenoh::LivelinessToken> token_;
     };
 
