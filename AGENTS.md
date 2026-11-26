@@ -102,7 +102,7 @@ Reference check: `tools/check_references.sh` (no internal or robot-framework nam
 | Nodes misbehave on a looped playback | `xblick play --loop` moves all stamps forward on each pass. Nodes rely on stamps that only grow. |
 | A test or harness never ends | Zenoh threads keep a process alive. Close sessions. Run long checks in the background with `timeout`. A shell script starts background jobs with SIGINT ignored: `xblick` commands, `node.start` (`node.end_on_signals`) and the C++ tools end on it anyway, other programs and nodes on an older xblick may not. Stop by PID with SIGTERM. Never kill by name pattern. |
 | Large writes fail | NFS. Build and write large outputs on a local disk. |
-| A test sees extra keys, tokens, queryables or a first output line it did not expect | Every session takes part in ROS 2 by default (ros.py): rmw_zenoh keys (they start with the domain id), `@ros2_lv` tokens, six parameter services per program, a start line on stderr. A test of native behaviour turns it off explicitly: `ros_options=False`, `--no-ros`, `XBLICK_ROS=0` (C++ `.ros = std::nullopt`). A session left open stays alive (its ROS threads hold it): close every session. |
+| A test sees extra keys, tokens, queryables or a first output line it did not expect | Every session takes part in ROS 2 by default (ros.py): rmw_zenoh keys (they start with the domain id), `@ros2_lv` tokens, six parameter services per program, a start line on stderr. A test of native behaviour turns it off explicitly: `ros_options=False`, `--no-ros`, `XBLICK_ROS=0` (C++ `.ros = std::nullopt`). A dropped Session in ROS 2 is closed by a finalizer when it is collected (session.py `_release`; not at exit); still close every session. |
 
 ## Layout
 

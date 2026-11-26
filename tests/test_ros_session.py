@@ -434,3 +434,34 @@ def test_a_program_without_parameters_answers_ros2_param_list():
     finally:
         client.close()
         net.close()
+
+
+@pytest.mark.parametrize("with_ros", [False, True])
+def test_a_session_dropped_without_close_is_released(with_ros):
+    """A Session a program drops without close() is released as without ROS: its tokens (declaration, ROS node) go,
+    and its threads (declaration, the ROS node's empty parameter services, duplicate watch, graph) end."""
+    import gc
+    import threading
+
+    endpoint = f"tcp/127.0.0.1:{free_port()}"
+    observer = session.open_session(listen=[endpoint], declare=False, ros_options=False)
+    before = set(threading.enumerate())
+    options = session.RosOptions(DOMAIN, "xblick_dropped") if with_ros else False
+    dropped = session.open_session(connect=[endpoint], ros_options=options)
+    zid = str(dropped.info.zid())
+    if with_ros:
+        ImageSubscriber(dropped, "/dropped/image_raw", transport="ros").close()  # makes the graph too
+
+    def tokens():  # its declaration's and its ROS node's (** matches no @ chunk: asked apart)
+        return [str(r.ok.key_expr) for selector in ("**", "@ros2_lv/**")
+                for r in session.replies(observer, selector, 1.0, liveliness=True)
+                if r.ok is not None and zid in str(r.ok.key_expr)]
+
+    try:
+        wait_until(lambda: len(tokens()) >= (2 if with_ros else 1))
+        del dropped
+        gc.collect()
+        wait_until(lambda: not tokens(), timeout=8.0)
+        wait_until(lambda: not [t for t in threading.enumerate() if t not in before and t.is_alive()], timeout=8.0)
+    finally:
+        observer.close()
