@@ -13,8 +13,8 @@ GitHub release. The rule is in [Development](docs/project/development.md#release
 
 ## Branch ros2 (not released)
 
-With `--ros`, a program also takes part in ROS 2 Jazzy or Lyrical on `rmw_zenoh`: ROS nodes see its streams, transforms and
-parameters, and it reads theirs.
+Every program also takes part in ROS 2 Jazzy or Lyrical on `rmw_zenoh` (`--no-ros` turns it off): ROS nodes see its
+streams, transforms and parameters, and it reads theirs.
 
 ### Added
 
@@ -26,11 +26,17 @@ parameters, and it reads theirs.
 - Readers of ROS topics: transport `ros` for images and clouds (`xblick hz`, `xblick snapshot`), `DetectionSubscriber(ros_type=...)`, `TransformBuffer(ros=True)`.
 - ROS 2 Lyrical (`rmw_zenoh_cpp` 0.10.6 or newer): readers of images, compressed images and clouds also take them from Lyrical publishers, which send these types on keys of their own (Python and C++).
 - The C++ API and programs (`xblick-cpp-camera`, `xblick-cpp-probe`, `xblick-points`) take part the same way: the options in `Options::add_session_options`, `SessionOptions::ros`, `Transport::Ros`.
+- `--no-ros` and `XBLICK_ROS=0` (only 0 and 1 are taken) turn the part in ROS 2 off; `--ros-clock KEY` sends a clock key to ROS's `/clock` for `use_sim_time`.
+- A fixed frame that another program sends on `/tf_static` with another parent or transform is one error line; a second ROS node of the program's name is one warning line.
 - `_core.ros_gid`: the gid of a ROS entity as `rmw_zenoh` makes it (XXH3-128 of its token), used by both sides.
 - The guide [Durchblick and ROS 2](docs/integrations/ros2.md) and the protocol's section on `rmw_zenoh`.
 
 ### Changed
 
+- **ROS 2 is on by default** in every program, Python and C++; `--ros` is still accepted and does nothing.
+- A program is one ROS node that carries its publishers, subscribers and parameter services; it takes the name of its parameters (`/test/camera/yolox`), else the program's name in the namespace of its `--camera`; `--ros-node` also takes `/namespace/NAME`.
+- `xblick test-camera` names its frame after the stream (`test_camera_color`, was `TestCamera`); `xblick-cpp-probe --tf-static` reads ROS's `/tf_static` with `--via-ros` (was `--ros`).
+- A key that is no ROS name is left out of ROS with one warning line instead of stopping the program.
 - C++: a ROS-only subscriber now counts in `CameraPublisher::subscribed()`, `needs_pixels()` and `ImuPublisher::subscribed()`, so frames render for it; a ROS reader of camera_info alone counts in `subscribed()`, not in `needs_pixels()`.
 
 ### Fixed
@@ -45,7 +51,7 @@ parameters, and it reads theirs.
 - A Jazzy subscriber gets no images, compressed images or clouds from a Lyrical publisher, between ROS nodes as well.
 - C++: a ROS subscriber that starts late may get a `/tf_static` message twice (zenoh-c's standalone build has no advanced publisher).
 
-Compatible with 0.5.14: without `--ros` no byte on the wire changes.
+Compatible with 0.5.14: our own keys are unchanged, and with `--no-ros` no byte on the wire changes.
 
 ## 0.5.14
 

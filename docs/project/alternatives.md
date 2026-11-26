@@ -73,7 +73,7 @@ Choose Durchblick for perception nodes in Python or C++ that share cameras betwe
 a ROS installation. It fits when each node needs its own Python environment, when subscribers mix GPU, host and
 network transports, or when the memory of a stream must stay fixed.
 
-Durchblick uses the message types of ROS 2. A program started with `--ros` also takes part in ROS 2 on
+Durchblick uses the message types of ROS 2. Every program also takes part in ROS 2 on
 `rmw_zenoh_cpp`, and ROS 2 nodes on DDS read its topics through a bridge. ROS 2 nodes receive serialised messages
 on both ways, not the rings. [Durchblick and ROS 2](../integrations/ros2.md) explains both.
 

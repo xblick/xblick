@@ -1,8 +1,9 @@
 # ROS 2 by default: facts for a decision
 
-Today a program takes part in ROS 2 only with `--ros` ([Durchblick and ROS 2](../integrations/ros2.md)). This page
-collects what we know about a later step, in which Durchblick speaks ROS 2 without the option. It takes no decision.
-Each area lists the facts with their source and then the options with their consequences.
+Every program now takes part in ROS 2 by default, beside our own keys, and `--no-ros` turns it off
+([Durchblick and ROS 2](../integrations/ros2.md)). This is option A below. This page collects the facts behind that
+step and behind the options B and C, which would change our own keys. Where a passage says "with `--ros`", it means
+a program in ROS 2. Each area lists the facts with their source and then the options with their consequences.
 
 The facts refer to ROS 2 Jazzy with `rmw_zenoh_cpp` 0.2.13. "rmw_zenoh" below means that version. Its source is the
 tag [0.2.13](https://github.com/ros2/rmw_zenoh/tree/0.2.13/rmw_zenoh_cpp/src/detail) on GitHub.
