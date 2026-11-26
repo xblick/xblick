@@ -199,6 +199,25 @@ def test_cpp_reads_cam2image(lyrical):
     assert probe.returncode == 0 and len(lines) == 2, probe.stdout + probe.stderr
 
 
+def test_cpp_auto_reads_cam2image_by_its_topic_and_by_our_stream_name(lyrical):
+    """As the Python case: xblick-cpp-probe with auto reads cam2image on its own topic name (/lyr/cppany/image, a ROS
+    name) and on our stream's ROS form (/lyr/cpponly/image_raw, auto's ROS form)."""
+    from test_cpp_interop import BUILD, tool
+    if not BUILD:
+        pytest.skip("XBLICK_CPP_BUILD (the C++ build directory) is not set")
+    box, port = lyrical
+    for topic in ("/lyr/cppany/image", "/lyr/cpponly/image_raw"):
+        box.start("ros2 run image_tools cam2image --ros-args -p burger_mode:=true -p show_camera:=false "
+                  f"-p frequency:=10.0 -r image:={topic}")
+    for base in ("/lyr/cppany/image", "lyr/cpponly"):
+        probe = subprocess.run([tool("xblick-cpp-probe"), "--connect", f"127.0.0.1:{port}", "--ros-domain",
+                                str(DOMAIN), "--base", base, "--transport", "auto", "--frames", "2", "--timeout", "20"],
+                               capture_output=True, text=True, timeout=60)
+        lines = [json.loads(line) for line in probe.stdout.splitlines()]
+        assert probe.returncode == 0 and len(lines) == 2, probe.stdout + probe.stderr
+        assert {(line["transport"], line["height"], line["width"]) for line in lines} == {("ros", 240, 320)}, lines
+
+
 def test_lyrical_publishers_say_backends_for_our_buffer_types(lyrical, ours):
     """A Lyrical publisher's token ends in backends exactly for the types that ros.BUFFER_FIELDS marks."""
     box, _ = lyrical

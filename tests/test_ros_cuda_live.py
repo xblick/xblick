@@ -2,7 +2,8 @@
 subscriber that accepts the CUDA buffer backend (tests/ros/cuda_check, built here) gets our GPU frames as CUDA buffers
 with the right pixels, with the backend's release and, given an overlay, another build of it; a reader that holds its
 messages makes the pool drop rather than wait; a peer of another Linux user gets no block; and Isaac ROS's
-ResizeNode reads our GPU frames as descriptors and resizes them right.
+ResizeNode reads our GPU frames as descriptors and resizes them right. The C++ CameraPublisher (xblick-cpp-camera,
+with XBLICK_CPP_BUILD) gives the stock reader its frames as the Python one does.
 
 Skipped without docker or a CUDA device, and unless an environment variable names the image:
 
@@ -17,6 +18,7 @@ user, have a /dev/shm of their own (a tmpfs: CUDA's interprocess events need one
 /proc/<pid>/root/dev/shm (the readers' records and the backend's registry; never the host's), and the test's folder
 at its own path (the socket files). The Isaac container runs alone: a wrong descriptor aborts it."""
 
+import json
 import os
 import shutil
 import socket
@@ -198,6 +200,49 @@ def test_stock_reader_gets_cuda_buffers(tmp, monkeypatch, variant):
     finally:
         if camera is not None:
             camera.close()
+        box.close()
+    assert [p for p in os.listdir(tmp) if p.startswith("xblick_cuda_")] == []
+
+
+@needs_image
+def test_stock_reader_gets_cuda_buffers_from_the_cpp_camera(tmp, monkeypatch):
+    """The C++ CameraPublisher (xblick-cpp-camera --check-pattern, device frames) to the stock reader: the same as
+    from the Python one. Needs XBLICK_CPP_BUILD (as tests/test_cpp_interop.py)."""
+    from test_cpp_interop import BUILD, tool
+    if not BUILD:
+        pytest.skip("XBLICK_CPP_BUILD (the C++ build directory) is not set")
+    box = box_with_router(IMAGE, tmp, monkeypatch)
+    camera = None
+    w, h = 1280, 720
+    try:
+        install = build_check(box, "")
+        camera = subprocess.Popen([tool("xblick-cpp-camera"), "--connect", f"127.0.0.1:{box.port}", "--base",
+                                   "xbcpp/cam/color", "--encoding", "rgb8", "--size", str(w), str(h), "--fps", "20",
+                                   "--seconds", "60", "--cuda-device", "0", "--device-frames", "--check-pattern",
+                                   "--ros-domain", str(DOMAIN)],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=dict(os.environ))
+        assert camera.stdout.readline().strip() == "ready"
+        box.start(f"bash -c 'source {install}/setup.bash && exec ros2 run xblick_cuda_check cuda_check "
+                  "--ros-args -p topic:=/xbcpp/cam/color/image_raw'", "check.log")
+        end = time.monotonic() + 40
+        while time.monotonic() < end and sum(c.get("backend") == "cuda" for c in checks(box.log("check.log"))) < 40:
+            time.sleep(0.2)
+        camera.terminate()
+        _, err = camera.communicate(timeout=20)
+        lines = checks(box.log("check.log"))
+        gpu = [c for c in lines if c.get("backend") == "cuda"]
+        assert camera.returncode == 0, err
+        stats = json.loads(err.split("xblick-cpp-camera: gpu link ")[1].splitlines()[0])
+        assert len(gpu) >= 40, (stats, box.log("check.log")[-3000:])
+        assert all(c["ok"] for c in lines), [c for c in lines if not c["ok"]][:5]
+        assert all(c["size"] == str(w * h * 3) for c in gpu)
+        assert stats["accepts"] >= 1 and stats["refused"] == 0 and stats["dropped"] == 0, stats
+        assert "Dropping stale descriptor" not in box.log("check.log")
+        assert [p for p in os.listdir(box.shm) if p.startswith(f"cuda_vmm_{camera.pid}_")] == []  # its records gone
+    finally:
+        if camera is not None and camera.poll() is None:
+            camera.kill()
+            camera.communicate(timeout=10)
         box.close()
     assert [p for p in os.listdir(tmp) if p.startswith("xblick_cuda_")] == []
 
