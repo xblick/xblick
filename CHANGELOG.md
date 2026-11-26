@@ -11,6 +11,16 @@ Each version below is a heading with its release notes: one summary sentence, th
 (and Known limit), one line on compatibility. `tools/release_notes.sh <version>` prints a version's notes for its
 GitHub release. The rule is in [Development](docs/project/development.md#release-notes).
 
+## 0.5.16
+
+A script that ends without closing what it opened now exits.
+
+### Fixed
+
+- A script that ends without closing its session or subscriber no longer hangs at interpreter exit.
+
+Compatible with 0.5.15: nothing on the wire changes.
+
 ## 0.5.15
 
 `xblick play` shows photos and phone videos upright, and a command without its extra prints the install command that
