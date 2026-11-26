@@ -313,3 +313,35 @@ def test_list_shows_ros_camera_topics_without_our_copies(network):
         ours.close()
         xblick.close()
         camera.close()
+
+
+def test_rgbd_inputs_pair_a_ros_only_colour_and_depth_camera(network):
+    """RGBDInputs reads with auto: the colour stream of ours that only a ROS node publishes, and a depth named as a ROS
+    topic (CameraSpec's depth=/TOPIC), each with its camera_info, paired by stamp."""
+    from xblick.rgbd import CameraSpec, RGBDInputs
+
+    endpoint, reader = network
+    camera = RosCamera(endpoint, color=("/rgbd/color/image_raw", Image.TYPE),
+                       color_info=("/rgbd/color/camera_info", CameraInfo.TYPE),
+                       depth=("/rgbd/aligned/image_rect", Image.TYPE),
+                       depth_info=("/rgbd/aligned/camera_info", CameraInfo.TYPE))
+    spec = CameraSpec.parse("rgbd:depth=/rgbd/aligned/image_rect")
+    assert spec.keys == {"color": "rgbd/color", "depth": "/rgbd/aligned/image_rect"}
+    with pytest.raises(ValueError, match="without a leading /"):
+        CameraSpec.parse("/rgbd")
+    inputs = RGBDInputs(reader, spec, 8, "auto", threading.Event())
+    try:
+        end = time.monotonic() + 8.0
+        frames = None
+        while frames is None and time.monotonic() < end:
+            stamp = inputs.newest_complete()
+            frames = inputs.take(stamp) if stamp is not None else None
+            time.sleep(0.05)
+        assert frames is not None, inputs.waiting()
+        assert frames["color"].stamp_ns == frames["depth"].stamp_ns == stamp
+        assert {r.subscriber.transport for r in inputs.readers.values()} == {ROS}
+        assert inputs.readers["depth"].subscriber.camera_info.distortion_model == "depth_info"
+        assert inputs.readers["color"].subscriber.camera_info.distortion_model == "color_info"
+    finally:
+        inputs.close()
+        camera.close()

@@ -53,7 +53,12 @@ frame = prepare(inputs, stamp) if stamp else None    # an RGBDFrame
 ```
 
 **`CameraSpec`** describes the inputs in one string: `CAMERA[:color=NAME][:depth=NAME][:segmenter=NAME]`. The
-parts are separated by colons, because some process managers split arguments at commas.
+parts are separated by colons, because some process managers split arguments at commas. A `color` or `depth` name
+with a leading `/` is a ROS 2 image topic, for example `camera:depth=/camera/aligned_depth_to_color/image_raw`.
+
+**ROS cameras.** `RGBDInputs` reads with the transport `auto`. In a session in ROS 2 it therefore pairs a camera that
+only a ROS node publishes: `/<camera>/color/image_raw` and `/<camera>/depth/image_raw`, each with `camera_info`
+beside it. A ROS driver that names its topics otherwise needs the ROS topics in `color=` and `depth=`.
 
 **`RGBDInputs`** reads all streams in threads of their own. `newest_complete()` returns the newest stamp for which
 every stream has a frame.

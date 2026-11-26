@@ -29,7 +29,9 @@ KEYS = ("color", "depth", "segmenter")
 class CameraSpec:
     """A camera and the streams below it: ``<camera>/<color>``, ``<camera>/<depth>`` (16UC1 mm in the colour camera's
     geometry) and, if ``segmenter`` is set, ``<camera>/<segmenter>/{instances,detections_2d}`` (e.g. an xblick-sam3
-    instance on the colour stream)."""
+    instance on the colour stream). A ``color`` or ``depth`` with a leading ``/`` is a ROS 2 image topic, taken as it
+    is (``depth=/camera/aligned_depth_to_color/image_raw``; ImageSubscriber reads its camera_info beside it). Streams
+    of ours that only a ROS node publishes need no such name: ``auto`` reads ``/<camera>/<color>/image_raw``."""
 
     camera: str
     color: str = "color"
@@ -44,6 +46,9 @@ class CameraSpec:
         camera, *options = text.strip().split(":")
         if not camera:
             raise ValueError(f"{text!r}: CAMERA[:color=NAME][:depth=NAME][:segmenter=NAME] expected")
+        if camera.startswith("/"):
+            raise ValueError(f"{text!r}: the camera is a name of ours, without a leading /; a ROS 2 image topic goes "
+                             "into color=/TOPIC or depth=/TOPIC")
         values = {}
         for option in options:
             key, sep, value = option.partition("=")
@@ -57,7 +62,8 @@ class CameraSpec:
 
     @property
     def keys(self) -> dict:
-        keys = {"color": f"{self.camera}/{self.color}", "depth": f"{self.camera}/{self.depth}"}
+        keys = {k: name if name.startswith("/") else f"{self.camera}/{name}"
+                for k, name in (("color", self.color), ("depth", self.depth))}
         if self.segmenter is not None:
             keys |= {"instances": f"{self.camera}/{self.segmenter}/instances",
                      "detections": f"{self.camera}/{self.segmenter}/detections_2d"}
