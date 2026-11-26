@@ -43,7 +43,7 @@
 //                         which asks tf_static/@adv/** with _anyke (zenoh-bridge-ros2dds for a transient-local
 //                         ROS subscriber); <zid> the publisher's session. A chunk that starts with @ matches no
 //                         wildcard, so Durchblick's own queries never reach it
-//   tf                 tf2_msgs/msg/TFMessage: the camera's moving transforms, as ROS's /tf: its pose in the
+//   tf                    tf2_msgs/msg/TFMessage: the camera's moving transforms, as ROS's /tf: its pose in the
 //                         world (header.frame_id "world", child a frame of its streams), stamped as the image taken
 //                         from it, one message per image (the simulation; on a robot: from the robot's state)
 //   imu                   sensor_msgs/msg/Imu: one message per sample, while somebody subscribes

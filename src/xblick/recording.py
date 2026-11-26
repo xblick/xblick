@@ -85,7 +85,7 @@ import zenoh
 
 from . import _core, declaration, topics
 from .camera import (FIND_PERIOD, SENT_VERSION, CameraPublisher, ProtocolError, _attachment, _check_encoding,
-                     congestion, _declare_advanced_history, find_streams, parse_attachment)
+                     _declare_advanced_history, congestion, find_streams, parse_attachment)
 from .codecs import parse_format
 from .msg import CameraInfo, Clock, CompressedImage, Message, Time
 from .msgdefs import MSGDEFS
