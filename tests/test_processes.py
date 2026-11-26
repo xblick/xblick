@@ -1,7 +1,7 @@
 """The commands as separate processes behind ``xblick router``, in the default (peer) mode, as a user starts them:
 a publisher, then ``list``, ``hz`` (network and the move to the shm ring), ``param`` (liveliness and a query), a
-client-mode session and ``xblick view``; the default port without any option (skipped when 7447 is taken); and the
-long-running commands, a node (``xblick.node.start``) and the C++ tools ending on SIGTERM and on SIGINT as background
+client-mode session and ``xblick view``; a script that ends without closing what it opened; the default port without
+any option (skipped when 7447 is taken); and the long-running commands, a node (``xblick.node.start``) and the C++ tools ending on SIGTERM and on SIGINT as background
 jobs of a script (a non-interactive shell starts those with SIGINT ignored).
 
 0.5.3 found nothing here: a peer that only connected did not listen, and a Zenoh 1.10 router does not route between
@@ -179,6 +179,43 @@ def test_a_node_given_a_stream_as_its_camera_ends_with_one_line(camera):
     assert waiting.returncode == 0, out
     hints = [line for line in out.splitlines() if "no publisher answers within 5 s" in line]
     assert len(hints) == 1 and "a camera that has not started yet, or a wrong name" in hints[0], out
+
+
+UNCLOSED = """
+import sys
+
+import numpy as np
+
+from xblick import session
+from xblick.camera import CameraPublisher, ImageSubscriber
+
+s = session.open_session(connect=[sys.argv[1]])
+color = ImageSubscriber(s, "test/camera/color", transport="auto")
+while color.latest(timeout=1.0) is None:
+    pass
+own = CameraPublisher(s, "unclosed/camera/color", encoding="mono8", frame_id="unclosed")
+own.publish(np.zeros((4, 4), np.uint8))
+print("xblick-test-unclosed: a frame", flush=True)
+"""
+
+
+def test_a_script_that_does_not_close_ends(camera):
+    """A script that leaves its session, an auto subscriber and a publisher open ends at once, without a word on
+    stderr: zenoh's callback threads are not daemons and ended only with their session, so it waited for good; the
+    subscriber's chooser kept its ring reader, which nanobind then reported as leaked."""
+    script = subprocess.Popen([sys.executable, "-c", UNCLOSED, camera], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=ENV)
+    try:
+        assert script.stdout.readline() == "xblick-test-unclosed: a frame\n"
+        printed = time.monotonic()
+        out, err = script.communicate(timeout=20)
+        took = time.monotonic() - printed
+    finally:
+        if script.poll() is None:
+            script.kill()
+            script.communicate()
+    assert script.returncode == 0 and not err, out + err
+    assert took < 3.0, took  # well within a second on a PC that is not busy
 
 
 def port_free(port: int) -> bool:
