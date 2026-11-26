@@ -17,6 +17,13 @@ shared memory, so it runs on any PC that reaches the robot's routers. Each camer
 ROS's global ``/tf_static`` (all cameras' static transforms so far in each message, transient local), so that ``ros2
 bag play`` feeds tf2 from a recording; ``play`` leaves that copy out (``ROS_COPY``).
 
+In a session in ROS 2 it also records the cameras that exist only as ROS topics (ros.camera_streams, below
+``prefix``; never the ROS copies of our programs' streams), under their ROS topic names as they are, each channel as
+``ros2 bag record`` writes it (CDR with its ros2msg schema, no ``zenoh_key``): of an image topic ``T`` the first form
+its publishers offer of image_transport's ``T/compressed``, ``T/compressedDepth`` and ``T`` itself (compressed
+first, as for a stream of ours), and its ``camera_info`` beside it (ROS's convention); with ``points`` its
+PointCloud2 topics. ``play`` plays them as a rosbag2's channels (below).
+
 **One node records and plays** (``Recorder``; ``xblick record`` starts it recording, ``xblick play`` playing,
 both take every command later). On ``xblick/<name>/control`` (plain text or JSON ``{"command": ...}``) it takes
 
@@ -88,7 +95,8 @@ import zenoh
 
 from . import _core, declaration, ros, topics
 from .camera import (FIND_PERIOD, INFO_VERSION, SENT_VERSION, CameraPublisher, ProtocolError, _attachment,
-                     _check_encoding, _declare_advanced_history, congestion, find_streams, parse_attachment)
+                     _check_encoding, _declare_advanced_history, _undeclare, congestion, find_streams,
+                     parse_attachment)
 from .codecs import CODEC_ENCODINGS, JPEG, RVL, decompress, parse_format
 from .encodings import image_to_numpy
 from .msg import CameraInfo, Clock, CompressedImage, Image, Message, PointCloud2, TFMessage, Time
@@ -245,10 +253,13 @@ class _File:
                 schema, message_encoding = self._schema(name), "cdr"
         elif encoding == JSON:
             message_encoding = "json"
-        metadata = {"zenoh_key": key, "zenoh_encoding": encoding}
+        if ros.is_topic(key):  # a ROS camera's topic (Recorder._subscribe_ros): as ros2 bag record writes it
+            metadata, topic = {}, key
+        else:
+            metadata, topic = {"zenoh_key": key, "zenoh_encoding": encoding}, f"/{key}"
         if info is not None:
             metadata["xblick_info"] = json.dumps(info, separators=(",", ":"))
-        channel = self._writer.register_channel(f"/{key}", message_encoding, schema, metadata)
+        channel = self._writer.register_channel(topic, message_encoding, schema, metadata)
         self._channels[(key, encoding)] = channel
         return channel
 
@@ -367,6 +378,24 @@ def rosbag_streams(channels, wanted) -> tuple[set[str], set[str]]:
         elif schema.name == CompressedImage.TYPE and key.endswith("/" + topics.COMPRESSED):
             compressed.add(key[: -len(topics.COMPRESSED) - 1])
     return raw, compressed
+
+
+COMPRESSED_DEPTH = f"{topics.IMAGE_RAW}/{ros.COMPRESSED_DEPTH}"  # image_transport's compressedDepth of image_raw
+
+
+def rosbag_depth_streams(channels, wanted) -> set[str]:
+    """The image streams of a rosbag2's channels (no zenoh_key) that have only ROS's compressedDepth: a
+    sensor_msgs/CompressedImage on ``<base>/image_raw/compressedDepth`` and neither ``<base>/image_raw`` nor
+    ``<base>/image_raw/compressed`` (``rosbag_streams``)."""
+    raw, compressed = rosbag_streams(channels, wanted)
+    depth = set()
+    for channel, schema in channels:
+        if "zenoh_key" in channel.metadata or schema is None or not wanted(key_of(channel)):
+            continue
+        key = key_of(channel)
+        if schema.name == CompressedImage.TYPE and key.endswith("/" + COMPRESSED_DEPTH):
+            depth.add(key[: -len(COMPRESSED_DEPTH) - 1])
+    return depth - raw - compressed
 
 
 def raw_codec(encoding: str) -> str | None:
@@ -690,7 +719,7 @@ class Recorder:
             subscribers, self._subscribers = list(self._subscribers.values()), {}
         self._drained.set()  # blocked deliveries give up
         for subscriber in subscribers:
-            subscriber.undeclare()
+            _undeclare(subscriber)
         while True:
             try:
                 self._queue.get_nowait()
@@ -708,7 +737,7 @@ class Recorder:
         with self._lock:
             subscribers, self._subscribers = list(self._subscribers.values()), {}
         for subscriber in subscribers:
-            subscriber.undeclare()
+            _undeclare(subscriber)
         if self.keys is not None:
             with self._counts_lock:
                 self._summary = (self._check_counts(reports) if self.blocking else
@@ -1024,9 +1053,21 @@ class Recorder:
                 self._info[key] = info
             self._subscribers[key] = self.session.declare_subscriber(key, self._on_sample)
 
+    def _subscribe_ros(self, topic: str, type_name: str):
+        """A ROS camera's topic (``_look``), recorded under its ROS name (``_File``: a channel as rosbag2's)."""
+        with self._lock:
+            if topic in self._subscribers or not self._recording.is_set() or self._stopping.is_set():
+                return
+            encoding = CDR + type_name
+            self._subscribers[topic] = self.session.ros.node.subscriber(
+                topic, type_name, lambda payload, *_: self._take(topic, encoding, payload, None), daemon=True)
+
     def _on_sample(self, sample: zenoh.Sample):
-        key = str(sample.key_expr)
-        item = (key, str(sample.encoding), sample.payload.to_bytes(), time.time_ns())
+        self._take(str(sample.key_expr), str(sample.encoding), sample.payload.to_bytes(), sample.attachment)
+
+    def _take(self, key: str, encoding: str, payload: bytes, attachment):
+        """A sample into the writer's queue (or dropped, counted)."""
+        item = (key, encoding, payload, time.time_ns())
         with self._counts_lock:
             blocking = key in self._blocking_keys
         if blocking:
@@ -1049,7 +1090,7 @@ class Recorder:
         with self._counts_lock:
             self._received[key] = self._received.get(key, 0) + 1
             if blocking:
-                self._sequence(key, sample.attachment)
+                self._sequence(key, attachment)
 
     def _drop(self, key: str):
         with self._counts_lock:
@@ -1074,8 +1115,10 @@ class Recorder:
         self._seqs.setdefault(key, array.array("q")).append(seq)
 
     def _look(self):
-        """Thread: the streams and detections, looked for every look_every seconds."""
+        """Thread: the streams and detections, looked for every look_every seconds; in ROS 2 the ROS cameras too
+        (``_look_ros``)."""
         try:
+            graph = self.session.ros.graph if getattr(self.session, "ros", None) is not None else None
             while not self._stopping.is_set():
                 for base, record in find_streams(self.session, self.prefix, min(2.0, self.look_every)):
                     kind = record.get("kind")
@@ -1091,9 +1134,31 @@ class Recorder:
                         self._subscribe(base, record)
                     elif kind == "points" and self.points:
                         self._subscribe(topics.cloud(base), record)
+                if graph is not None:  # after find_streams: the graph, made before it, knows ROS's publishers by then
+                    self._look_ros(graph)
                 self._stopping.wait(self.look_every)
         except BaseException as error:  # noqa: BLE001 - raised in the caller's thread by check()
             self._error = error
+
+    def _look_ros(self, graph: ros.Graph):
+        """The cameras that exist only as ROS topics (ros.camera_streams): of each image topic the first form its
+        publishers offer of ``T/compressed``, ``T/compressedDepth`` and ``T``, and its camera_info beside it; with
+        ``points`` the PointCloud2 topics. Said once each."""
+        found = ros.camera_streams(graph, self.prefix)
+        offered = {(t.topic, t.type_name) for t in graph.publishers() if not graph.by_xblick(t.zid)}
+        for image in found["images"]:
+            form = next((topic for topic, kind in ((ros.compressed_topic(image), ros.COMPRESSED_TYPE),
+                                                   (ros.compressed_depth_topic(image), ros.COMPRESSED_TYPE),
+                                                   (image, ros.IMAGE_TYPE)) if (topic, kind) in offered), None)
+            if form is None:  # gone meanwhile
+                continue
+            if form not in self._subscribers:
+                print(f"{self.prog}: recording the ROS camera {image} as {form} and {ros.camera_info_topic(image)}",
+                      flush=True)
+            self._subscribe_ros(form, ros.COMPRESSED_TYPE if form != image else ros.IMAGE_TYPE)
+            self._subscribe_ros(ros.camera_info_topic(image), ros.CAMERA_INFO_TYPE)
+        for cloud in found["clouds"] if self.points else ():
+            self._subscribe_ros(cloud, ros.CLOUD_TYPE)
 
     def _log_ns(self, key: str, encoding: str, payload: bytes, received_ns: int) -> int:
         return received_ns if self.log_time == "receive" else header_stamp(key, encoding, payload)
@@ -1472,8 +1537,8 @@ class Seeked(Exception):
 
 class Player(Paced):
     """Plays MCAP recordings (``record``'s, and rosbag2's MCAP files, whose ROS topics map to keys as live reading
-    maps them: ``/a/b`` is ``a/b``; image_transport's ``<base>/image_raw`` or ``<base>/image_raw/compressed`` with
-    ``<base>/camera_info`` a stream of ours through a CameraPublisher, ``<base>/cloud`` a cloud stream with its info
+    maps them: ``/a/b`` is ``a/b``; image_transport's ``<base>/image_raw``, ``<base>/image_raw/compressed`` or, alone
+    and decoded, ``<base>/image_raw/compressedDepth`` with ``<base>/camera_info`` a stream of ours through a CameraPublisher, ``<base>/cloud`` a cloud stream with its info
     record; ``channel_key``, ``rosbag_streams``) back onto Zenoh, below
     ``prefix``, at ``rate`` times the recorded pace, ``loop``-ing if asked; ``keys``: only channels whose Zenoh key
     matches one of these patterns (fnmatch); ``cuda_device``: image streams also in a CUDA ring on that device.
@@ -1510,6 +1575,7 @@ class Player(Paced):
         self._ros: dict[str, ros.RosPublisher] = {}  # in ROS 2: the ROS publisher of a key (ros.mirror, /tf)
         self._cameras: dict[str, CameraPublisher] = {}  # recorded stream base -> its publisher
         self._raw_streams: set[str] = set()  # bases whose frames are a rosbag2's sensor_msgs/Image on image_raw
+        self._depth_streams: set[str] = set()  # bases whose frames are a rosbag2's image_raw/compressedDepth only
         self._queryables: list = []
         self._encodings: dict[str, str] = {}  # key -> its Zenoh encoding
         self._static: dict[str, bytes] = {}  # tf_static key -> its last payload
@@ -1632,7 +1698,7 @@ class Player(Paced):
         return not self.keys or any(fnmatch.fnmatchcase(key, k) for k in self.keys)
 
     def _first_frames(self, bases: set[str], raw: set[str] = frozenset(),
-                      clouds: set[str] = frozenset()) -> dict[str, tuple]:
+                      clouds: set[str] = frozenset(), depth: set[str] = frozenset()) -> dict[str, tuple]:
         """The first compressed frame (its codec; for a base in ``raw`` the first sensor_msgs/Image on
         ``image_raw``, a rosbag2's) and camera_info of each image stream, from the files; a stream without camera_info
         (label images) none, looked for until FIRST_INFO_S recorded seconds after the last first frame. And the first
@@ -1644,6 +1710,8 @@ class Player(Paced):
                 break
             if key in clouds:
                 base, i, kind = key, 0, PointCloud2
+            elif key.endswith("/" + COMPRESSED_DEPTH) and key[: -len(COMPRESSED_DEPTH) - 1] in depth:
+                base, i, kind = key[: -len(COMPRESSED_DEPTH) - 1], 0, CompressedImage
             elif key.endswith("/" + topics.COMPRESSED) and key[: -len(topics.COMPRESSED) - 1] not in raw:
                 base, i, kind = key[: -len(topics.COMPRESSED) - 1], 0, CompressedImage
             elif key.endswith("/" + topics.IMAGE_RAW) and key[: -len(topics.IMAGE_RAW) - 1] in raw:
@@ -1669,6 +1737,7 @@ class Player(Paced):
         # a rosbag2's image streams (ros2 bag record's): <base>/image_raw, else <base>/image_raw/compressed, as a
         # camera of ours, so that every reader takes them as it takes a camera's (rosbag_streams)
         raw, compressed = rosbag_streams(channels, self._wanted)
+        depth = rosbag_depth_streams(channels, self._wanted)
         rosbag_clouds = set()
         for base in sorted(raw & compressed):
             log.info(f"{base}: the rosbag2 has its image_raw and its image_raw/compressed; playing image_raw, "
@@ -1693,7 +1762,8 @@ class Player(Paced):
                 streams[key[: -len(topics.COMPRESSED) - 1]] = json.loads(info)
                 continue
             if rosbag and (key[: -len(topics.COMPRESSED) - 1] in compressed and key.endswith("/" + topics.COMPRESSED)
-                           or key[: -len(topics.IMAGE_RAW) - 1] in raw and key.endswith("/" + topics.IMAGE_RAW)):
+                           or key[: -len(topics.IMAGE_RAW) - 1] in raw and key.endswith("/" + topics.IMAGE_RAW)
+                           or key[: -len(COMPRESSED_DEPTH) - 1] in depth and key.endswith("/" + COMPRESSED_DEPTH)):
                 self._encodings[key] = encoding
                 continue  # played by its stream's CameraPublisher
             if rosbag and encoding == CDR + PointCloud2.TYPE and key.endswith("/" + topics.CLOUD):
@@ -1724,8 +1794,8 @@ class Player(Paced):
         if self.loop:
             self._movable("looped")
             self._pass_ns = self._loop_length()
-        for base, (frame, camera_info) in self._first_frames(set(streams) | raw | compressed, raw,
-                                                             rosbag_clouds).items():
+        for base, (frame, camera_info) in self._first_frames(set(streams) | raw | compressed | depth, raw,
+                                                             rosbag_clouds, depth).items():
             if frame is None:
                 continue  # no frame recorded
             if base in rosbag_clouds:
@@ -1734,6 +1804,10 @@ class Player(Paced):
             if base in raw:  # a rosbag2's sensor_msgs/Image: the camera compresses as a live one
                 self._raw_streams.add(base)
                 encoding, codec, record = frame.encoding, raw_codec(frame.encoding), {"source": "play"}
+            elif base in depth:  # ROS's compressedDepth only: decoded, the camera compresses as a live one
+                self._depth_streams.add(base)
+                encoding = decompress(frame)[1]
+                codec, record = raw_codec(encoding), {"source": "play"}
             elif base in compressed and base not in streams:  # a rosbag2's compressed frames only
                 original, codec = parse_format(frame.format)
                 encoding, record = original or decompress(frame)[1], {"source": "play"}
@@ -1797,6 +1871,12 @@ class Player(Paced):
         if key.endswith("/" + topics.COMPRESSED) and key[: -len(topics.COMPRESSED) - 1] in self._cameras:
             message = moved if moved is not None else CompressedImage.deserialize(payload)
             self._cameras[key[: -len(topics.COMPRESSED) - 1]].publish_compressed(message)
+            return
+        if key.endswith("/" + COMPRESSED_DEPTH) and key[: -len(COMPRESSED_DEPTH) - 1] in self._depth_streams:
+            message = moved if moved is not None else CompressedImage.deserialize(payload)
+            camera = self._cameras[key[: -len(COMPRESSED_DEPTH) - 1]]
+            camera.frame_id = message.header.frame_id
+            camera.publish(decompress(message)[0], message.header.stamp.to_ns())
             return
         if key.endswith("/" + topics.IMAGE_RAW) and key[: -len(topics.IMAGE_RAW) - 1] in self._raw_streams:
             message = moved if moved is not None else Image.deserialize(payload)

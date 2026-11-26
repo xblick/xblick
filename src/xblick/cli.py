@@ -68,8 +68,9 @@ def _list(args) -> int:
 
 def _list_streams(args) -> int:
     with zsession.open_from_args(args, prog=f"xblick {args.command}") as z:
+        graph = z.ros.graph if z.ros is not None else None  # made first: it fills while the streams are looked for
         found = find_streams(z, args.prefix, args.seconds)
-        ros_found = ros_camera_topics(z, args.prefix) if z.ros is not None else []
+        ros_found = ros.camera_topics(graph, args.prefix) if graph is not None else []
         why = zsession.why_nothing(z)
     if not found and not ros_found:
         print(f"no stream answered within {args.seconds:g} s" + (f"; {why}" if why else ""), file=sys.stderr)
@@ -89,24 +90,11 @@ def _list_streams(args) -> int:
     return 0
 
 
-def ros_camera_topics(z, prefix: str = "", timeout: float = 1.0) -> list[tuple[str, str, list[str]]]:
-    """(topic, its types' names, its publishers' nodes) of the ROS topics of image, compressed image, point cloud and
-    camera info types (ros.CAMERA_TYPES) below ``prefix``, sorted. Only ROS's own publishers: the ROS copies of the
-    streams our programs publish (their sessions declare a program, declaration.py) are the streams listed already."""
-    from . import declaration
-
-    ours = declaration.alive(z) | {str(z.info.zid())}
-    below = "/" + prefix.strip("/") if prefix.strip("/") else ""
-    topics_: dict[str, tuple[set, set]] = {}
-    for token in ros.publishers(z, timeout):
-        if token.type_name not in ros.CAMERA_TYPES or token.zid in ours:
-            continue
-        if below and token.topic != below and not token.topic.startswith(below + "/"):
-            continue
-        kinds, nodes = topics_.setdefault(token.topic, (set(), set()))
-        kinds.add(token.type_name.rpartition("/")[2])
-        nodes.add(token.fully_qualified_node)
-    return [(t, ",".join(sorted(k)), sorted(n)) for t, (k, n) in sorted(topics_.items())]
+def ros_camera_topics(z, prefix: str = "") -> list[tuple[str, str, list[str]]]:
+    """``ros.camera_topics`` of the session's ROS graph (Ros.graph; it knows ROS's publishers some time after it was
+    made, a session's first call finds none): the ROS copies of the streams our programs publish are left out, they
+    are the streams listed already."""
+    return ros.camera_topics(z.ros.graph, prefix)
 
 
 def _is_cloud(z, base: str) -> bool:
@@ -404,6 +392,21 @@ def _bridged(found: list[tuple[str, dict]]) -> dict[str, list[str]]:
             "segmentations": of("image", labels=True)}
 
 
+def _with_ros(found: dict[str, list[str]], graph, prefix: str) -> dict[str, list[str]]:
+    """``found`` (``_bridged``) and the cameras that exist only as ROS topics (ros.camera_streams of ``graph``, the
+    session's ROS graph; None: a session not in ROS 2), their image topics as streams and their PointCloud2 topics as
+    point cloud streams."""
+    if graph is None:
+        return found
+    ros_found = ros.camera_streams(graph, prefix)
+    return dict(found, bases=found["bases"] + ros_found["images"], clouds=found["clouds"] + ros_found["clouds"])
+
+
+def _marked(keys) -> str:
+    """Keys for a line, a ROS topic's marked as ROS."""
+    return ", ".join(f"{k} (ROS)" if ros.is_topic(k) else k for k in keys)
+
+
 def _rerun_selection(args) -> dict[str, list[str]]:
     """What ``xblick rerun``'s command line names, as RerunBridge's selection (empty lists: nothing named)."""
     return {"bases": list(args.streams or []), "clouds": list(args.points or []),
@@ -427,8 +430,9 @@ def _rerun(args, parser) -> int:
     except ValueError as error:
         raise SystemExit(f"xblick rerun: {error}") from None
     with zsession.open_from_args(args, prog=f"xblick {args.command}") as z:
+        graph = z.ros.graph if discover and z.ros is not None else None  # made first: it fills meanwhile
         if discover:
-            found = _bridged(find_streams(z, args.prefix, args.seconds))
+            found = _with_ros(_bridged(find_streams(z, args.prefix, args.seconds)), graph, args.prefix)
             if not found["bases"] + found["clouds"]:
                 why = zsession.why_nothing(z)
                 print(f"no stream answered within {args.seconds:g} s" + (f"; {why}" if why else ""), file=sys.stderr)
@@ -466,7 +470,7 @@ def _rerun(args, parser) -> int:
             params.close()
             raise SystemExit(f"xblick rerun: {error}") from None
         selection = bridge.selection()
-        print(f"bridging {', '.join(k for kind in rerun_bridge.KINDS for k in selection[kind])} to Rerun "
+        print(f"bridging {_marked(k for kind in rerun_bridge.KINDS for k in selection[kind])} to Rerun "
               "(Ctrl-C to stop)", flush=True)
         if bridge.cameras:
             print(f"with the transforms (tf_static, tf) of {', '.join(bridge.cameras)}"
@@ -479,11 +483,12 @@ def _rerun(args, parser) -> int:
             while True:
                 if discover:  # a node started later; the lookup takes the frame-rate line's time
                     started = time.monotonic()
-                    looked = _bridged(find_streams(z, args.prefix, min(args.seconds, args.report)))
+                    looked = _with_ros(_bridged(find_streams(z, args.prefix, min(args.seconds, args.report))),
+                                       graph, args.prefix)
                     added = bridge.add(**looked)
                     bridge.mark_ended(looked)  # the ages table's rows of publishers that are gone (#17)
                     if added:
-                        print(f"bridging {', '.join(added)} as well", flush=True)
+                        print(f"bridging {_marked(added)} as well", flush=True)
                     time.sleep(max(0.0, args.report - (time.monotonic() - started)))
                 else:
                     time.sleep(args.report)
@@ -854,11 +859,13 @@ def build_parser(prog: str = "xblick") -> argparse.ArgumentParser:
                             description=rerun_bridge.__doc__,
                             formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("streams", nargs="*",
-                   help="stream bases to show (nothing named, neither streams nor any option below that names a "
-                        "topic: every stream, label image, detections, bodies, IMU and diagnostics that answer, below "
-                        "--prefix, looked for again every --report seconds)")
+                   help="stream bases to show, or ROS 2 image topics (a leading /, e.g. /resize/image) (nothing "
+                        "named, neither streams nor any option below that names a topic: every stream, label image, "
+                        "detections, bodies, IMU and diagnostics that answer, and the cameras that exist only as ROS "
+                        "topics, below --prefix, looked for again every --report seconds)")
     p.add_argument("--points", action="append", metavar="BASE",
-                   help="a point cloud stream to show as well, e.g. test/camera/points (repeat for more)")
+                   help="a point cloud stream to show as well, e.g. test/camera/points, or a ROS 2 PointCloud2 topic "
+                        "(/velodyne_points) (repeat for more)")
     p.add_argument("--cloud-rate", type=float, default=5.0, help="point clouds per second sent to the viewer")
     p.add_argument("--stale-after", type=float, default=2.0,
                    help="clear bodies, boxes and masks whose topic sent nothing for this many seconds (a node that "

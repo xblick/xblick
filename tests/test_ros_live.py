@@ -356,3 +356,62 @@ def test_our_parameter_client_on_a_ros_node(ros_env, ours):
         client.close()
         process.terminate()
         process.wait(10)
+
+
+def test_compressed_depth_of_image_transports_plugin(ros_env, ours, rosprobe, tmp_path):
+    """ROS's own compressedDepth plugin (image_transport's republish, png and rvl, 16UC1 and 32FC1): auto reads
+    <topic>/compressedDepth by the image topic's name; the depth cameras are ROS cameras for the tools (their streams
+    by ros.camera_streams, recorded under their topics)."""
+    from xblick import recording
+
+    republish = JAZZY / "lib/image_transport/republish"
+    if not (republish.exists() and (JAZZY / "lib/libcompressed_depth_image_transport.so").exists()):
+        pytest.skip("needs image_transport's republish and ros-jazzy-compressed-depth-image-transport")
+    env, _ = ros_env
+    depth = (np.arange(4 * 6, dtype=np.uint16).reshape(4, 6) * 100 + 300).astype(np.uint16)
+    metres = np.array([[0.5, 1.0, 1.5, 2.0, 2.5, 3.0]] * 4, np.float32)
+    inputs = {"/live/depth": numpy_to_image(depth, "16UC1", Header(Time(5, 0), "ros_depth")),
+              "/live/fdepth": numpy_to_image(metres, "32FC1", Header(Time(5, 0), "ros_depth"))}
+    outs = (("/live/depth", "/live/dpng", "png"), ("/live/depth", "/live/drvl", "rvl"),
+            ("/live/fdepth", "/live/fpng", "png"))
+    processes = []
+    readers = {}
+    try:
+        for i, (source, out, codec) in enumerate(outs):
+            processes.append(subprocess.Popen(
+                [str(republish), "--ros-args", "-r", f"__node:=republish_{i}", "-p", "in_transport:=raw", "-p",
+                 "out_transport:=compressedDepth", "-p", f"out.compressedDepth.format:={codec}", "-r", f"in:={source}",
+                 "-r", f"out/compressedDepth:={out}/compressedDepth"], env=env, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL))
+        time.sleep(2.0)  # the republishers subscribed
+        for topic, message in inputs.items():
+            processes.append(subprocess.Popen([str(rosprobe), "pub", topic, "sensor_msgs/msg/Image",
+                                               bytes(message.serialize()).hex(), "150"], env=env,
+                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        readers = {out: ImageSubscriber(ours, out, transport="auto") for _, out, _ in outs}
+        for out, reader in readers.items():
+            frame = reader.latest(timeout=15.0)
+            assert frame is not None, (out, reader.describe())
+            assert reader.transport == "ros_compressed_depth", out
+            if out == "/live/fpng":
+                assert frame.encoding == "32FC1" and np.allclose(frame.image, metres, atol=0.01), frame.image
+            else:
+                assert frame.encoding == "16UC1" and np.array_equal(frame.image, depth), (out, frame.image)
+        found = ros.camera_streams(ours.ros.graph, "live")
+        assert {"/live/depth", "/live/fdepth", "/live/dpng", "/live/drvl", "/live/fpng"} <= set(found["images"]), found
+        recorder = recording.Recorder(ours, tmp_path, prefix="live", look_every=0.5)
+        try:
+            recorder.record()
+            end = time.monotonic() + 10.0
+            while recorder.status()["messages"] < 20 and time.monotonic() < end:
+                time.sleep(0.1)
+            result = recorder.stop()
+        finally:
+            recorder.close()
+        assert {"/live/dpng/compressedDepth", "/live/depth"} <= set(result["recording"]["received"]), result
+    finally:
+        for reader in readers.values():
+            reader.close()
+        for process in processes:
+            process.terminate()
+            process.wait(10)

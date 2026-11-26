@@ -38,6 +38,9 @@ streams, transforms and parameters, and it reads theirs.
 - Recordings also hold ROS's global `/tf_static`, so `ros2 bag play` feeds tf2; `xblick play` leaves that copy out.
 - `--ros-clock` with a key the program never publishes is one warning line after 1 s.
 - An Isaac ROS node's output is read under its own names, with no remap ([guide](docs/integrations/ros2.md#read-an-isaac-ros-nodes-output)).
+- Cameras that exist only as ROS topics in the tools ([guide](docs/integrations/ros2.md#show-and-record-a-ros-camera)): `xblick rerun` shows them by topic name and in discovery, marked `(ROS)`; `xblick record` records them under their ROS topic names, as `ros2 bag record` does, and `xblick play` plays them as streams of ours where they follow image_transport's names; the terminal interface lists them in its Rerun tab and marks their nodes in its Graph.
+- image_transport's `compressedDepth` (`<topic>/compressedDepth`, PNG or RVL, 16UC1 and 32FC1): `auto` reads it where it is the only form (`ros_compressed_depth`, C++ `Transport::RosCompressedDepth`), and `decompress` reads every message of that plugin (Python and C++); an unknown codec or encoding is an error naming the format.
+- `ros.camera_topics` and `ros.camera_streams`: ROS's camera topics and cameras from a session's ROS graph, without our programs' ROS copies.
 
 ### Changed
 
@@ -47,6 +50,7 @@ streams, transforms and parameters, and it reads theirs.
 - A key that is no ROS name is left out of ROS with one warning line instead of stopping the program.
 - A subscriber name with a leading `/` is a ROS topic (it was our stream without the `/`); `CameraSpec` refuses a camera with a leading `/`.
 - After its parameters close, a program's ROS node serves the six parameter services without parameters again, so `ros2 param list` keeps answering.
+- `xblick list` takes ROS's topics from the session's ROS graph (`cli.ros_camera_topics` lost its `timeout`).
 - C++: a ROS-only subscriber now counts in `CameraPublisher::subscribed()`, `needs_pixels()` and `ImuPublisher::subscribed()`, so frames render for it; a ROS reader of camera_info alone counts in `subscribed()`, not in `needs_pixels()`.
 
 ### Fixed
@@ -56,6 +60,7 @@ streams, transforms and parameters, and it reads theirs.
 - A Session in ROS 2 that a program drops without `close()` is released again when it is collected, as without ROS.
 - `xblick play --loop`: a `/tf_static` held twice in a file no longer adds a gap as long as the recording between passes.
 - `xblick test-camera` ends with exit code 0 also when SIGTERM or Ctrl-C comes while it starts (it ended by SIGINT).
+- The ROS graph (`ros.Graph`, C++ `ros::Graph`) knows which sessions are programs of ours from their declaration tokens, which it follows with history, instead of a liveliness query per session: a query that ended by its timeout under load made a program's ROS copy count as a ROS camera for good (`auto`'s fallback, `xblick list`).
 
 ### Known limit
 

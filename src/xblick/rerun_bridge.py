@@ -71,8 +71,17 @@ second the publisher sent that never arrived (gaps in the attachment's seq), as 
 
 ``xblick rerun`` without a selection bridges everything that answers ``**/info``: image and point cloud streams,
 label images (their info record says ``labels``) and detections (kind ``detections``), and of each of their cameras
-the bodies (``<camera>/bodies``, ``<camera>/*/bodies``), IMU and diagnostics; and looks again every ``--report``
-seconds, so that a node started later appears too (in the viewer's data).
+the bodies (``<camera>/bodies``, ``<camera>/*/bodies``), IMU and diagnostics; in a session in ROS 2 also the cameras
+that exist only as ROS topics (ros.camera_streams: image topics, PointCloud2 topics; never the ROS copies of our
+programs' streams); and looks again every ``--report`` seconds, so that a node started later appears too (in the
+viewer's data).
+
+A ROS topic (a leading ``/``, e.g. ``/resize/image``, ``/velodyne_points``) is a stream or a point cloud stream of
+the selection as well, at the entity of its name. An image topic is read as ImageSubscriber reads it with ``auto``
+(the topic, else image_transport's ``<topic>/compressed``, else its ``<topic>/compressedDepth``), decoded, with the
+camera_info beside it (ROS's convention) as its pinhole; 16UC1 as depth in millimetres, 32FC1 as depth in metres.
+A ROS camera has no transforms here (ROS's are on its global ``/tf`` and ``/tf_static``, which the bridge does not
+read), no bodies, IMU or diagnostics: its streams are drawn at their own entity's origin.
 
 A camera's transforms come with its streams and results (``--no-transforms <camera>`` leaves them out). Its fixed
 transforms on ``<camera>/tf_static`` (tf2_msgs/TFMessage, e.g. the Azure Kinect's depth camera ->
@@ -113,9 +122,10 @@ from pathlib import Path
 import numpy as np
 import zenoh
 
-from . import topics
+from . import ros, topics
 from . import stamps
-from .camera import ProtocolError, StaticTransformSubscriber, TransformSubscriber, _check_encoding, parse_attachment
+from .camera import (ImageSubscriber, ProtocolError, StaticTransformSubscriber, TransformSubscriber, _check_encoding,
+                     parse_attachment)
 from .codecs import JPEG, decompress, parse_format
 from .detections import DetectionSubscriber
 from .msg import (CameraInfo, Classification, CompressedImage, Detection2DArray, DiagnosticArray, DiagnosticStatus, Imu,
@@ -130,6 +140,10 @@ def rotation_of(q) -> np.ndarray:
 
 _MEDIA_TYPES = {JPEG: "image/jpeg", "png": "image/png"}
 _SIXTEEN_BIT = ("mono16", "16UC1")
+# a decoded frame's encoding (a ROS camera's, _log_frame) -> Rerun's colour model; depth -> its meter
+_FRAME_COLOR_MODELS = {"rgb8": "RGB", "bgr8": "BGR", "rgba8": "RGBA", "bgra8": "BGRA", "mono8": "L", "8UC1": "L",
+                       "mono16": "L"}
+_DEPTH_METERS = {"16UC1": 1000.0, "32FC1": 1.0}
 TIMELINE = "capture"
 BODIES = "bodies"
 BODIES_VERSION = 1  # xblick-azure-kinect's kBodiesVersion
@@ -246,7 +260,10 @@ PLACED_KINDS = ("bases", "clouds", "detections", "segmentations", "bodies")  # w
 
 
 def camera_of_entry(kind: str, key: str) -> str | None:
-    """The camera an entry of the selection belongs to (None: a trajectory, which is in the world)."""
+    """The camera an entry of the selection belongs to (None: a trajectory, which is in the world, and a ROS topic,
+    whose camera has no transforms or extras of ours)."""
+    if ros.is_topic(key):
+        return None
     if kind == "bases":
         return camera_of(key)
     if kind in ("clouds", "bodies"):  # the camera's own (<camera>/bodies) or a node's (<camera>/<node>/bodies)
@@ -262,6 +279,10 @@ def check_entry(kind: str, key: str) -> str:
     """A key of the selection checked for its kind (ValueError saying what is expected); the key."""
     if kind not in KINDS:
         raise ValueError(f"{kind!r}: one of {', '.join(KINDS)}")
+    if ros.is_topic(key):
+        if kind not in ("bases", "clouds"):
+            raise ValueError(f"{kind} {key!r}: a ROS topic (a leading /) is a stream or a point cloud stream only")
+        return ros.check_ros_name(key)
     key = topics.check_name(key)
     last = {"bodies": BODIES, "imu": topics.IMU, "diagnostics": topics.DIAGNOSTICS}.get(kind)
     if last is not None and (not key.endswith("/" + last) or key.count("/") < 2):
@@ -456,7 +477,7 @@ class RerunBridge:
                 # <camera>/gem_x/bodies), each drawn as its own entity; the camera's IMU and diagnostics
                 known = {camera_of_entry(kind, k) for kind in PLACED_KINDS for k in getattr(self, kind)}
                 for camera in dict.fromkeys(camera_of_entry(kind, k) for kind in PLACED_KINDS for k in new[kind]):
-                    if camera in known:
+                    if camera is None or camera in known:
                         continue
                     extras = {"bodies": [f"{camera}/{BODIES}", f"{camera}/*/{BODIES}"],
                               "imu": [topics.imu(camera)], "diagnostics": [topics.diagnostics(camera)]}
@@ -528,7 +549,7 @@ class RerunBridge:
     def _sync_cameras(self):
         """The cameras whose transforms it takes: those of what they place, but those in no_transforms."""
         wanted = list(dict.fromkeys(camera_of_entry(kind, k) for kind in PLACED_KINDS for k in getattr(self, kind)))
-        wanted = [c for c in wanted if c not in self.no_transforms]
+        wanted = [c for c in wanted if c is not None and c not in self.no_transforms]
         session = self._session
         for camera in [c for c in self.cameras if c not in wanted]:
             for reader in self._camera_subs.pop(camera):
@@ -551,7 +572,14 @@ class RerunBridge:
         """The subscriptions of one entry (``_entry_subs``)."""
         session = self._session
         subs = []
-        if kind == "bases":
+        if kind == "bases" and ros.is_topic(key):  # a ROS camera's image topic: read in a thread, as a cloud
+            stop = threading.Event()
+            thread = threading.Thread(target=self._bridge_ros_image, args=(session, key, stop),
+                                      name=f"xblick-rerun {key}", daemon=True)
+            self._cloud_threads.append((thread, stop))
+            thread.start()
+            subs.append((thread, stop))
+        elif kind == "bases":
             subs += [session.declare_subscriber(topics.camera_info(key), partial(self._on_info, key)),
                      session.declare_subscriber(topics.compressed(key), partial(self._on_image, key))]
         elif kind == "segmentations":
@@ -645,7 +673,7 @@ class RerunBridge:
         if not self._ages:
             return
         keys = {k for ks in found.values() for k in ks}
-        cameras = {camera_of_entry(kind, k) for kind, ks in found.items() if kind in PLACED_KINDS for k in ks}
+        cameras = {camera_of_entry(kind, k) for kind, ks in found.items() if kind in PLACED_KINDS for k in ks} - {None}
         with self._lock:
             looked_for = set(self.bases + self.clouds + self.detections + self.segmentations)
             changed = False
@@ -676,6 +704,45 @@ class RerunBridge:
         except BaseException as error:  # noqa: BLE001 - raised in the caller's thread by check()
             self._error = error
 
+    def _bridge_ros_image(self, session: zenoh.Session, topic: str, stop: threading.Event):
+        """Thread of a ROS camera's image topic (the module's docstring): each frame as it comes, with the camera_info
+        beside it, until ``stop`` (set by remove and close)."""
+        try:
+            subscriber = ImageSubscriber(session, topic, transport="auto", camera_info=True)
+            try:
+                while not stop.is_set():
+                    frame = subscriber.latest(timeout=0.5)
+                    if frame is not None and not stop.is_set():
+                        self._log_frame(topic, frame, subscriber.camera_info)
+            finally:
+                subscriber.close()
+        except BaseException as error:  # noqa: BLE001 - raised in the caller's thread by check()
+            self._error = error
+
+    def _log_frame(self, base: str, frame, info):
+        """A decoded frame (a ROS camera's) at the entity ``base``, its camera_info (None: none yet) as its
+        pinhole."""
+        rr = self.rr
+        image, encoding = frame.image, frame.encoding
+        if encoding not in _FRAME_COLOR_MODELS and encoding not in _DEPTH_METERS:
+            raise ProtocolError(f"{base}: {encoding} images are not shown ({', '.join(_FRAME_COLOR_MODELS)}, "
+                                f"{', '.join(_DEPTH_METERS)})")
+        if encoding in _DEPTH_METERS:
+            archetype = rr.DepthImage(image, meter=_DEPTH_METERS[encoding])
+        else:
+            archetype = rr.Image(image, color_model=_FRAME_COLOR_MODELS[encoding])
+        stamp = frame.header.stamp.to_ns()
+        with self._lock:
+            if info is not None:
+                self._log_pinhole(base, info)
+            if (encoding in _DEPTH_METERS or encoding == "mono16") and base not in self._sixteen_bit:
+                self._sixteen_bit.add(base)
+                self._update_blueprint()  # depth and IR views go last
+            rr.set_time(TIMELINE, timestamp=np.datetime64(stamp, "ns"))
+            rr.log(base, archetype)
+            self._log_age(base, None, stamp, None)
+            self.frames[base] += 1
+
     def _log_cloud(self, base: str, cloud):
         points = cloud.points
         names = {f.name for f in cloud.fields}
@@ -700,12 +767,12 @@ class RerunBridge:
                 if not self._in_world:
                     rr.log("/", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
                     self._in_world = True
-            elif self._frame_id.get(base) != cloud.header.frame_id:
+            elif not ros.is_topic(base) and self._frame_id.get(base) != cloud.header.frame_id:
                 self._frame_id[base] = cloud.header.frame_id
                 self._place(cloud_camera(base))
             rr.set_time(TIMELINE, timestamp=np.datetime64(cloud.stamp_ns, "ns"))
             rr.log(entity, rr.Points3D(xyz[valid], colors=None if colors is None else colors[valid]))
-            if {"u", "v"} <= names and base.count("/") > 2:
+            if {"u", "v"} <= names and base.count("/") > 2 and not ros.is_topic(base):
                 self._log_cloud_2d(base, cloud, colors)
             rr.set_time(TIMELINE, timestamp=np.datetime64(cloud.stamp_ns, "ns"))
             self._log_age(base, cloud.age_at_send_ns, cloud.stamp_ns, cloud.seq)
@@ -873,7 +940,8 @@ class RerunBridge:
         camera_info told it yet; a colour one before a 16-bit one (depth, IR) of the same frame. Called with the lock
         held."""
         camera = camera_of(camera_of(key))
-        streams = [b for b in self.bases if camera_of(b) == camera and self._frame_id.get(b) == frame_id]
+        streams = [b for b in self.bases if not ros.is_topic(b) and camera_of(b) == camera
+                   and self._frame_id.get(b) == frame_id]
         return min(streams, key=lambda b: b in self._sixteen_bit, default=None)
 
     def _on_segmentation(self, key: str, sample: zenoh.Sample):
@@ -973,22 +1041,26 @@ class RerunBridge:
     def _log_info(self, base: str, sample: zenoh.Sample):
         _check_encoding(str(sample.key_expr), str(sample.encoding), CameraInfo)
         info = CameraInfo.deserialize(sample.payload.to_bytes())
-        calibration = (info.width, info.height, tuple(np.asarray(info.k, float)))
         with self._lock:
             if self._frame_id.get(base) != info.header.frame_id:
                 self._frame_id[base] = info.header.frame_id
                 self._place(camera_of(base))
                 self._update_blueprint()
-            if self._calibration.get(base) == calibration:
-                return
-            self._calibration[base] = calibration
-            rr = self.rr
-            # static, as the streams' poses: logged once per calibration, it must reach a viewer that connects later
-            # (--serve keeps a bounded buffer, from which images push older messages; without the pinhole a viewer
-            # shows no 2D stream in the 3D view) and hold for every frame, whatever its stamp
-            rr.log(base, rr.Pinhole(image_from_camera=np.asarray(info.k, float).reshape(3, 3),
-                                    resolution=[info.width, info.height], camera_xyz=rr.ViewCoordinates.RDF,
-                                    image_plane_distance=FRUSTUM_M), static=True)
+            self._log_pinhole(base, info)
+
+    def _log_pinhole(self, base: str, info: CameraInfo):
+        """A stream's calibration as its pinhole, when it changed. Called with the lock held."""
+        calibration = (info.width, info.height, tuple(np.asarray(info.k, float)))
+        if self._calibration.get(base) == calibration:
+            return
+        self._calibration[base] = calibration
+        rr = self.rr
+        # static, as the streams' poses: logged once per calibration, it must reach a viewer that connects later
+        # (--serve keeps a bounded buffer, from which images push older messages; without the pinhole a viewer
+        # shows no 2D stream in the 3D view) and hold for every frame, whatever its stamp
+        rr.log(base, rr.Pinhole(image_from_camera=np.asarray(info.k, float).reshape(3, 3),
+                                resolution=[info.width, info.height], camera_xyz=rr.ViewCoordinates.RDF,
+                                image_plane_distance=FRUSTUM_M), static=True)
 
     def _log_image(self, base: str, sample: zenoh.Sample):
         _check_encoding(str(sample.key_expr), str(sample.encoding), CompressedImage)
@@ -1078,8 +1150,9 @@ class RerunBridge:
         """Log the pose of every stream and of the bodies of a camera whose frame is known, where it changed (Rerun:
         parent from child, as tf2). Called with the lock held."""
         rr = self.rr
-        entities = {b: self._frame_id.get(b) for b in self.bases if camera_of(b) == camera}
-        entities.update({c: self._frame_id.get(c) for c in self.clouds if cloud_camera(c) == camera})
+        entities = {b: self._frame_id.get(b) for b in self.bases if not ros.is_topic(b) and camera_of(b) == camera}
+        entities.update({c: self._frame_id.get(c) for c in self.clouds
+                         if not ros.is_topic(c) and cloud_camera(c) == camera})
         entities.update({e: f for e, (c, f) in self._bodies_frame.items() if c == camera})
         for key, frame in self._detections_frame.items():
             if camera_of(camera_of(key)) == camera:

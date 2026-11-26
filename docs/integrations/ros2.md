@@ -141,22 +141,32 @@ xblick snapshot /resize/image frame.png
 The camera_info follows ROS's convention: the topic `camera_info` in the namespace of the image topic. `/image_raw`
 has `/camera_info`, and `/resize/image` has `/resize/camera_info`. Name another topic with
 `camera_info="/cam/calibration"`. Compressed frames follow image_transport's convention, the topic
-`<image topic>/compressed`.
+`<image topic>/compressed`, and so do the frames of its `compressedDepth` plugin, `<image topic>/compressedDepth`.
 
 In C++, `ImageSubscriber(session, "/resize/image", {.camera_info = true})` reads the same topics.
 `SubscriberOptions::camera_info_topic` names another camera_info topic. The compressed topic's transport is
-`Transport::RosCompressed`.
+`Transport::RosCompressed`, the compressedDepth topic's `Transport::RosCompressedDepth`.
 
 | `transport` | Image topic `/T` |
 | --- | --- |
-| `auto` | `/T`. When the publishers offer only `/T/compressed`, that one. |
+| `auto` | `/T`. Else `/T/compressed`, else `/T/compressedDepth`: the first that the publishers offer. |
 | `ros` or `raw` | `/T` |
 | `compressed` | `/T/compressed` |
+
+The `transport` of a subscriber that reads `/T/compressedDepth` says `ros_compressed_depth`. No transport asks for it
+by name: `auto` takes it when it is the only form.
+
+A compressedDepth frame has the format `<encoding>; compressedDepth png` or `<encoding>; compressedDepth rvl`.
+`<encoding>; compressedDepth` alone, as older versions of the plugin write it, is PNG. Its data is ROS's 12-byte
+header, then the PNG or the RVL bytes. A `16UC1` or `mono16` image is decoded as it is. A `32FC1` image comes as
+quantised inverse depth, and the reader gives back the depth in metres, NaN where the plugin had no depth. Another
+codec or encoding is an error that names the format.
 
 A reader never picks a topic in place of the one you named. After 5 s without a frame it looks at ROS's graph, and
 `latest()` raises an error in two cases:
 
-- The topic's publishers send another type. For `/T/compressed` the error names `/T` and the transport `compressed`.
+- The topic's publishers send another type. For `/T/compressed` the error names `/T` and the transport `compressed`,
+  for `/T/compressedDepth` it names `/T` and `auto`.
 - No topic has the name, but topics of the kind lie below it. `xblick hz /rgbd` then says `no ROS topic of this
   name, and these are below it: /rgbd/color/image_raw, /rgbd/depth/image_raw; name one of them`.
 
@@ -166,19 +176,47 @@ In C++, `latest()` throws these errors, `ProtocolError` and `std::invalid_argume
 ### Streams that only ROS publishes
 
 A subscriber with the transport `auto` waits for a publisher of its stream. When no program of ours answers, a ROS
-node that publishes the stream's ROS topic counts as well. The subscriber then reads `/<stream>/image_raw`, or
-`/<stream>/image_raw/compressed` when the node publishes only that, with `camera_info` beside it. A cloud's topic is
-`/<stream>/cloud`. Its `transport` then says `ros` or `ros_compressed`. A publisher of ours has priority: once one
-answers, the subscriber moves to it.
+node that publishes the stream's ROS topic counts as well. The subscriber then reads `/<stream>/image_raw`, else
+`/<stream>/image_raw/compressed`, else `/<stream>/image_raw/compressedDepth`, with `camera_info` beside it. A cloud's
+topic is `/<stream>/cloud`. Its `transport` then says `ros`, `ros_compressed` or `ros_compressed_depth`. A publisher of
+ours has priority: once one answers, the subscriber moves to it.
 
 The ROS copies that our programs publish never count. A ROS publisher belongs to a program of ours when its session
 declares a program ([protocol](../concepts/protocol.md)). So a camera of ours is read in its own forms, as before.
+Each session's ROS graph learns which sessions declare a program from their declaration tokens, which it follows as
+it follows ROS's publisher tokens. A program declares itself before it takes part in ROS, so its declaration arrives
+first, also under heavy load.
 
 `xblick hz usb_cam` therefore reads a ROS camera on `/usb_cam/image_raw`. A node with `--camera lab/cam` reads
 `/lab/cam/color/image_raw` when only a ROS node publishes it. `RGBDInputs` pairs a ROS camera's `/<camera>/color/image_raw` and
 `/<camera>/depth/image_raw` ([pairing](../guides/pairing-streams.md)). `xblick list` shows the ROS topics of the types
 Image, CompressedImage, PointCloud2 and CameraInfo after our streams, with `ros` in the transports column and the
 publishing nodes. It leaves out the ROS copies of our streams.
+
+### Show and record a ROS camera
+
+The tools take a camera that exists only as ROS topics by the name of its image topic, as a subscriber does:
+
+- an Image topic `/T`, such as `/usb_cam/image_raw` or `/resize/image`;
+- `/T` when only `/T/compressed` or only `/T/compressedDepth` is published;
+- a PointCloud2 topic, such as `/velodyne_points`, as a point cloud stream.
+
+`xblick rerun /resize/image` shows the topic, and `--points /velodyne_points` a cloud. Without a selection,
+`xblick rerun` shows such cameras beside our streams and marks them `(ROS)` in its lines. Each frame is decoded and
+drawn at the entity of its topic, with the camera_info beside it as its pinhole. `16UC1` shows as depth in
+millimetres, `32FC1` as depth in metres. A ROS camera has no transforms in the viewer, and no bodies, IMU or
+diagnostics: ROS keeps its transforms on its global `/tf` and `/tf_static`.
+
+`xblick record` records such cameras under their ROS topic names, each channel as `ros2 bag record` writes it. Of an
+image topic `/T` it records the first form its publishers offer of `/T/compressed`, `/T/compressedDepth` and `/T`,
+and the camera_info beside it. With `--points` it records the PointCloud2 topics too. `xblick play` plays these
+channels as it plays a rosbag2: a camera on image_transport's names, `/<base>/image_raw`, its compressed or its
+compressedDepth form with `/<base>/camera_info`, becomes the stream `<base>` of ours. A compressedDepth form is
+decoded and compressed again as a live camera's frames are. Other topics play on their keys and their ROS topics.
+
+The terminal interface lists such cameras in its Rerun tab below their topics' namespace, marked `(ROS)`, without
+transforms. Its Graph titles the session of a ROS node that publishes them by the node's name, marked `(ROS)`, and
+lists its camera topics in the box.
 
 ### Read an Isaac ROS node's output
 
@@ -513,9 +551,10 @@ type hashes of the part in ROS 2.
 - A subscriber of every key (`**`), such as the traffic meter of the terminal interface, also subscribes to the ROS
   copies. The publishers then send them as well. The terminal interface shows and counts our keys only.
 - The C++ tool `xblick-cpp-camera` keeps its fixed frame `TestCamera`. It serves the tests, which compare its bytes.
-- `xblick rerun`, `xblick record` and the terminal interface find streams by their info records. They do not show a
-  camera that only a ROS node publishes. Record such a camera with `ros2 bag record`, and play the bag with
-  `xblick play`.
+- A ROS camera that `xblick record` recorded plays as a stream of ours only when its topics follow image_transport's
+  names (`/<base>/image_raw` and `/<base>/camera_info`). An image topic of another name, such as `/resize/image`,
+  plays on its key and its ROS topic, which the tools then take for the ROS copy of `xblick play`.
+- The terminal interface's Graph marks a ROS node's session only when the routers' admin space knows the session.
 - A ROS 2 reader gets GPU frames as CUDA buffers only from a `CameraPublisher` with `cuda_device`, only on
   `rmw_zenoh`, and only on the publisher's PC and GPU ([GPU frames for ROS readers](#gpu-frames-for-ros-readers)).
   Point clouds and frames from ROS publishers into our readers go as bytes. [Alternatives](../project/alternatives.md)
