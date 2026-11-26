@@ -46,7 +46,7 @@ accepts these options. [Durchblick and ROS 2](../integrations/ros2.md) explains 
 | `--ros-domain ID` | The ROS domain id. The default is `ROS_DOMAIN_ID`, else 0. |
 | `--ros-node NAME` | The program's ROS node, as `NAME` or `/namespace/NAME`. The default is the name of the program's parameters, such as `/test/camera/yolox`. A program without parameters takes its own name in the namespace of its `--camera`, such as `/test/camera/xblick_test_camera`. Every character other than a letter, digit or `_` is written as `_`. |
 | `--ros-params-writable` | ROS clients may set the program's parameters. Without it the ROS parameter services answer reads only and refuse sets. A ROS set is unchecked and uncounted: two nodes of one name both execute it, and the ROS client shows one success. |
-| `--ros-clock KEY` | The program's clock key `KEY` (`rosgraph_msgs/Clock`, such as `sim/clock`) goes to ROS's global `/clock` instead of `/KEY`. ROS nodes with `use_sim_time` read it. The default is no key. |
+| `--ros-clock KEY` | The program's clock key `KEY` (`rosgraph_msgs/Clock`, such as `sim/clock`) goes to ROS's global `/clock` instead of `/KEY`. ROS nodes with `use_sim_time` read it. The default is no key. A program that has made no publisher of `KEY` after 1 s prints one warning line and goes on. |
 
 | Variable | Meaning |
 | --- | --- |

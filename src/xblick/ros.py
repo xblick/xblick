@@ -724,6 +724,7 @@ class Graph:
 
 CLOCK_TOPIC = "/clock"  # ROS's global clock, which a node with use_sim_time reads
 TF_STATIC_TOPIC = "/tf_static"  # ROS's global static transforms (tf2's static broadcaster and listener)
+CLOCK_WAIT_S = 1.0  # --ros-clock: a program that has made no publisher of its clock key by then is told (C++ too)
 TF_TOLERANCE = 1e-6     # m and quaternion units: two static transforms of one frame that differ less are the same
 
 
@@ -781,11 +782,18 @@ class Ros:
         self._duplicates = None
         self._duplicates_said: set[str] = set()
         self._no_parameters = None
+        self._closed = False
         self._graph: Graph | None = None
+        self._clock_published = False
+        self._clock_check = None
         self.node = self.add_node(node, namespace)
         self._watch_duplicates()
         from .parameters import Parameters
         self._no_parameters = Parameters.none_on(self.node)  # until the program's first Parameters
+        if self.clock is not None:
+            self._clock_check = threading.Timer(CLOCK_WAIT_S, self._check_clock)
+            self._clock_check.name, self._clock_check.daemon = f"ros clock {self.clock}", True
+            self._clock_check.start()
 
     def next_id(self) -> str:
         with self._lock:
@@ -842,13 +850,38 @@ class Ros:
         return self.node, False
 
     def release_parameters(self):
-        """The node's parameters closed: the next Parameters serve on it again."""
+        """The node's parameters closed: the next Parameters serve on it again, and until then its six services
+        without parameters (Parameters.none_on), so that ROS's parameter tools still get an answer. Not after
+        ``close``."""
+        from .parameters import Parameters
         with self._lock:
             self._parameters_taken = False
+            if self._closed or self._no_parameters is not None:
+                return
+        try:
+            none = Parameters.none_on(self.node)
+        except zenoh.ZError:  # its session closed already
+            return
+        with self._lock:
+            if self._closed or self._parameters_taken or self._no_parameters is not None:
+                taken = True
+            else:
+                self._no_parameters, taken = none, False
+        if taken:  # closed, or the next Parameters came meanwhile
+            none.close()
 
     def own(self, gid_: bytes):
         with self._lock:
             self._own_gids.add(gid_)
+
+    def _check_clock(self):
+        """``--ros-clock``: one warning line when the program has made no publisher of the clock key within
+        CLOCK_WAIT_S (``mirror`` notes it). A warning, not an error: a program may make it later (a simulation that
+        loads its scene first), and ROS nodes with use_sim_time wait for /clock meanwhile."""
+        if not self._clock_published and not self._closed:
+            log.warning(f"--ros-clock {self.clock}: this program has published no {self.clock} within "
+                        f"{CLOCK_WAIT_S:g} s, so ROS's /clock stays empty until it does (ROS nodes with use_sim_time "
+                        "wait for it); check the key")
 
     @property
     def graph(self) -> Graph:
@@ -860,13 +893,16 @@ class Ros:
             return self._graph
 
     def close(self):
+        if self._clock_check is not None:
+            self._clock_check.cancel()
         with self._lock:
+            self._closed = True
             graph, self._graph = self._graph, None
+            no_parameters, self._no_parameters = self._no_parameters, None
         if graph is not None:
             graph.close()
-        if self._no_parameters is not None:
-            self._no_parameters.close()
-            self._no_parameters = None
+        if no_parameters is not None:
+            no_parameters.close()
         if self._duplicates is not None:
             self._duplicates.undeclare()
             self._duplicates = None
@@ -965,6 +1001,7 @@ def mirror(session, key: str, encoding, topic: str | None = None, qos: Qos = STR
         if type_name != "rosgraph_msgs/msg/Clock":
             raise RosError(f"--ros-clock {key}: its type is {type_name or str(encoding)}, not rosgraph_msgs/msg/Clock")
         topic = CLOCK_TOPIC
+        taking_part._clock_published = True
     if not type_name or "@" in type_name or type_name not in TYPE_HASHES:
         log.warning(f"{key}: not offered to ROS ({type_name or str(encoding)} has no ROS type hash here)")
         return None

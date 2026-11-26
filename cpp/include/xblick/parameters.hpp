@@ -205,6 +205,7 @@ namespace xblick
         // /parameter_events (none without a part in ROS)
         bool ros_params_writable_ = false;
         std::shared_ptr<ros::Ros> ros_part_;  // the program's node serves them: released at the end
+        zenoh::Session* ros_session_ = nullptr;  // theirs, for the empty services the node serves again at the end
         std::string ros_name_;                // the ROS node's fully qualified name
         std::unique_ptr<ros::RosNode> ros_node_;
         std::vector<std::unique_ptr<ros::Service>> ros_services_;

@@ -316,8 +316,9 @@ of the reply is its response. The key names are constants in `protocol.hpp` (`kL
 `kParameterEvents`, `kParametersToken`) and in Python (`_core.protocol.LIST_PARAMETERS` and so on).
 
 A program in ROS 2 (the default) also serves the six services on the keys of `rmw_zenoh`, as the services of its
-ROS node, and sends the events on `/parameter_events` as well. The payloads stay as they are. See
-[Durchblick and ROS 2](../integrations/ros2.md#one-node-per-program).
+ROS node, and sends the events on `/parameter_events` as well. The payloads stay as they are. Before its first
+parameters and after they are closed, the node serves the six services without parameters, so that `ros2 param list`
+answers at once. See [Durchblick and ROS 2](../integrations/ros2.md#one-node-per-program).
 
 ## Messages
 

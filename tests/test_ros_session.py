@@ -436,6 +436,53 @@ def test_a_program_without_parameters_answers_ros2_param_list():
         net.close()
 
 
+def test_after_its_parameters_close_the_node_answers_ros2_param_list_again():
+    """The program's node, renamed after its parameters, serves the six services without parameters again once they
+    are closed (and the program's next Parameters take them over)."""
+    from xblick.parameters import ParameterClient
+
+    net = Network(with_ros=True)
+    a = session.open_session(connect=[net.endpoint], ros_options=session.RosOptions(
+        DOMAIN, "xblick_probe", follow_parameters=True))
+    params = Parameters(a, "probe", "rostest/cam")
+    params.declare("threshold", 0.5)
+    client = ParameterClient(net.b, "rostest/cam/probe", timeout=3.0, ros=True)
+    try:
+        assert client.list() == ["threshold"]
+        params.close()
+        end = time.monotonic() + 5.0
+        while time.monotonic() < end and not (a.ros._no_parameters is not None and client.list() == []):
+            time.sleep(0.1)
+        assert client.list() == []
+        again = Parameters(a, "probe", "rostest/cam")
+        again.declare("threshold", 0.7)
+        assert a.ros._no_parameters is None
+        wait_until(lambda: client.list() == ["threshold"])
+        again.close()
+    finally:
+        client.close()
+        a.close()
+        net.close()
+
+
+def test_a_clock_key_the_program_never_publishes_is_one_warning(monkeypatch, caplog):
+    monkeypatch.setattr(ros, "CLOCK_WAIT_S", 0.2)
+    from xblick.camera import CountedPublisher, cdr_encoding
+    from xblick.msg import Clock
+
+    options = session.RosOptions(DOMAIN, "xblick_sim", clock="rostest/world/clock")
+    with session.open_session(local_router=False, ros_options=options):
+        time.sleep(0.4)
+    assert [r for r in caplog.records if "--ros-clock rostest/world/clock: this program has published no" in
+            r.getMessage()]
+    caplog.clear()
+    with session.open_session(local_router=False, ros_options=options) as a:
+        clock = CountedPublisher(a, "rostest/world/clock", cdr_encoding(Clock))
+        time.sleep(0.4)
+        clock.close()
+    assert not [r for r in caplog.records if "--ros-clock" in r.getMessage()]
+
+
 @pytest.mark.parametrize("with_ros", [False, True])
 def test_a_session_dropped_without_close_is_released(with_ros):
     """A Session a program drops without close() is released as without ROS: its tokens (declaration, ROS node) go,
