@@ -182,8 +182,22 @@ of live reading: the topic `/a/b` becomes the key `a/b`.
 
 A bag with both `image_raw` and `image_raw/compressed` of one stream plays `image_raw`. `play` says so in one line.
 In ROS 2 the playback offers its streams to ROS as every publisher does, so `/tf` and `/tf_static` reach ROS's
-global topics again. rosbag2's sqlite3 storage (`.db3` files) is refused with a message. Convert such a bag with
-`ros2 bag convert` to the storage `mcap`.
+global topics again. rosbag2's sqlite3 storage (`.db3` files) is refused with a message. Convert such a bag to MCAP:
+
+```yaml
+# out.yaml
+output_bags:
+- uri: bag_mcap
+  storage_id: mcap
+  all_topics: true
+```
+
+```bash
+ros2 bag convert -i bag_sqlite -o out.yaml
+xblick play bag_mcap
+```
+
+Without `all_topics: true` the converted bag holds no messages.
 
 ### Step by step
 

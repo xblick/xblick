@@ -320,7 +320,8 @@ def rosbag_files(path: str | Path) -> list[Path]:
 
 def sqlite_text(path: Path) -> str:
     return (f"{path}: a rosbag2 in the sqlite3 storage; xblick play reads rosbag2's MCAP storage only. Convert it "
-            "with ros2 bag convert (output storage_id: mcap), or record with ros2 bag record -s mcap")
+            "with ros2 bag convert -i BAG -o OUT.yaml, OUT.yaml naming an output bag with storage_id: mcap and "
+            "all_topics: true; or record with ros2 bag record -s mcap")
 
 
 def key_of(channel) -> str | None:
@@ -1606,7 +1607,9 @@ class Player(Paced):
 
     def _loop_length(self) -> int:
         """ns a pass moves the stamps on by: from the first message to the last, and the mean period of the slowest
-        channel (one message: none), so that each channel keeps its pace from one pass to the next."""
+        channel (one message: none), so that each channel keeps its pace from one pass to the next. A tf_static has no
+        pace: published once, also when a file holds it twice (ros2 bag record of a transient-local /tf_static), it
+        would make the gap between two passes as long as the recording."""
         start = end = None
         counts: dict[str, int] = {}
         for path, summary in self._summaries():
@@ -1617,7 +1620,7 @@ class Player(Paced):
             end = stats.message_end_time if end is None else max(end, stats.message_end_time)
             for channel_id, n in stats.channel_message_counts.items():
                 key = key_of(summary.channels[channel_id])
-                if key is not None and self._wanted(key):
+                if key is not None and self._wanted(key) and not key.endswith(topics.TF_STATIC):
                     counts[key] = counts.get(key, 0) + n
         span = end - start
         periods = [span // (n - 1) for n in counts.values() if n > 1]

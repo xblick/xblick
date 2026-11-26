@@ -417,7 +417,7 @@ def test_playback_controls_as_parameters(sessions, tmp_path):  # noqa: F811
             c.close()
 
 
-def write_rosbag(path, frames=5, compressed_too=False):
+def write_rosbag(path, frames=5, compressed_too=False, static_twice=False):
     """An MCAP file as ros2 bag record writes it (profile ros2, ros2msg schemas, channels on ROS topics without our
     metadata): a colour camera's image_raw and camera_info, a depth camera's compressed frames only, /tf_static, a
     point cloud, and an image topic outside image_transport's names. Frames 100 ms apart, stamped 1 s, 2 s, ..."""
@@ -457,7 +457,7 @@ def write_rosbag(path, frames=5, compressed_too=False):
                         "/other/image": numpy_to_image(image, "rgb8", header)}
             if compressed_too:
                 payloads["/rb/cam/color/image_raw/compressed"] = compress(image, "rgb8", header=header)
-            if k == 0:
+            if k == 0 or (static_twice and k == frames - 1):  # ros2 bag record can hold a /tf_static twice
                 payloads["/tf_static"] = TFMessage([transform("rb_base", "rb_cam", 0.1)])
             for topic, message in payloads.items():
                 log_ns = 100_000_000 * k + 1
@@ -567,3 +567,16 @@ def test_the_ros_copy_of_tf_static_holds_every_camera_and_is_not_played(sessions
     finally:
         player.close()
         recorder.close()
+
+
+def test_a_rosbag2_loops_without_a_gap_for_its_tf_static(sessions, tmp_path):  # noqa: F811
+    """A /tf_static recorded twice has no pace: a pass is the recording's length and one period of the frames (100 ms),
+    not twice its length."""
+    a, _ = sessions
+    path = tmp_path / "loop.mcap"
+    write_rosbag(path, frames=5, static_twice=True)
+    player = recording.Player(a, [path], loop=True)
+    try:
+        assert player._pass_ns == 400_000_000 + 100_000_000
+    finally:
+        player.close()
