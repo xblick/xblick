@@ -954,6 +954,11 @@ class Subscription:
     samples. ``max_hz``: at most so many frames a second (MaxRate), the others skipped before they are decoded or read
     from their ring and counted in ``skipped_max_hz``; None: every frame.
 
+    In a session in ROS 2, ``auto`` reads a stream of ours that no publisher of ours answers from its ROS form
+    (``ros_forms``: ``/<base>/image_raw``, else ``/<base>/image_raw/compressed``; a cloud's ``/<base>/cloud``) when a
+    ROS publisher of another program offers it. The ROS copies that our programs publish are never read in place of a
+    stream's own forms, and once a publisher of ours answers, the subscription moves to it.
+
     ``base`` with a leading ``/`` is a ROS 2 topic as ROS's tools write it (``/image_raw``, ``/resize/image``, a
     cloud's ``/points``), read from ROS publishers (``ros_topic``; a session in ROS 2): ``auto`` takes the form its
     publishers offer (``ros_forms``: the topic itself, else image_transport's compressed topic of an image topic),
@@ -1232,7 +1237,9 @@ class Subscription:
                 records = query_info(self._session, self.base)
                 if not records and not self._closed.is_set():
                     self._check_not_below_a_stream()
-                    if not hinted and time.monotonic() - waiting_since >= WAIT_HINT_S:
+                    if self._choose_ros_only():
+                        waiting_since, hinted = time.monotonic(), False
+                    elif not hinted and time.monotonic() - waiting_since >= WAIT_HINT_S:
                         hinted = True
                         log.info(f"{self.base}: no publisher answers within {WAIT_HINT_S:g} s, waiting for it: a "
                                  "camera that has not started yet, or a wrong name (a node's --camera is the camera, "
@@ -1272,6 +1279,16 @@ class Subscription:
                      + (f" (was {before})" if before else ""))
             self._use(chosen)
         return True
+
+    def _choose_ros_only(self) -> bool:
+        """auto on a stream of ours that no publisher of ours answers: its ROS form (``ros_forms``) when a ROS
+        publisher of another program than ours offers it (a ROS camera, ``ros2 bag play``), never our programs' ROS
+        copies. Our forms keep priority: the next round with an answer takes them. True when a ROS form is offered."""
+        if not self.ros_forms:
+            return False
+        if self._graph is None:  # made at the first need: a stream of ours that answers never needs it
+            self._graph = self._session.ros.graph
+        return self._choose_ros(foreign_only=True, why="only a ROS publisher offers it")
 
     def _check_not_below_a_stream(self):
         """While no publisher answers the stream: StreamGivenAsCamera when the name before its last part answers as a

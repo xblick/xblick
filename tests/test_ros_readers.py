@@ -229,3 +229,87 @@ def test_a_ros_name_needs_a_session_in_ros():
             ImageSubscriber(s, "/image_raw", transport="shm")
         with pytest.raises(ValueError, match="no ROS name"):
             ImageSubscriber(s, "/cam-1/image_raw", transport="auto")
+
+
+def test_auto_reads_a_stream_only_a_ros_publisher_offers_and_moves_to_ours(network):
+    """auto on a stream of ours with only a ROS publisher (a ROS camera on /<base>/image_raw): its ROS form, with its
+    camera_info; a publisher of ours that starts later takes over."""
+    from xblick.camera import CameraPublisher
+
+    endpoint, reader = network
+    camera = RosCamera(endpoint, image=("/roscam/color/image_raw", Image.TYPE),
+                       info=("/roscam/color/camera_info", CameraInfo.TYPE))
+    subscriber = ImageSubscriber(reader, "roscam/color", transport="auto", camera_info=True)
+    ours = None
+    try:
+        assert first_frame(subscriber) is not None and subscriber.transport == ROS
+        assert "only a ROS publisher" in subscriber.transport_reason
+        end = time.monotonic() + 3.0
+        while subscriber.camera_info is None and time.monotonic() < end:
+            time.sleep(0.05)
+        assert subscriber.camera_info.distortion_model == "info"
+        xblick = session.open_session(connect=[endpoint], ros_options=False)
+        ours = (xblick, CameraPublisher(xblick, "roscam/color", encoding="mono8", frame_id="roscam"))
+        end = time.monotonic() + 5.0
+        while subscriber.transport == ROS and time.monotonic() < end:
+            ours[1].publish(np.zeros((4, 6), np.uint8))
+            subscriber.latest(timeout=0.05)
+        assert subscriber.transport == "shm"
+    finally:
+        subscriber.close()
+        if ours is not None:
+            ours[1].close()
+            ours[0].close()
+        camera.close()
+
+
+def test_auto_never_reads_the_ros_copy_of_a_stream_of_ours(network, monkeypatch):
+    """A program of ours (it declares itself) whose stream is on ROS's keys only: auto does not take that copy. A
+    camera of ours is read in its own form, as before."""
+    from xblick.camera import CameraPublisher
+
+    endpoint, reader = network
+    xblick = session.open_session(connect=[endpoint], ros_options=session.RosOptions(DOMAIN, "xblick_camera"))
+    copy = xblick.ros.node.publisher("/copy/color/image_raw", Image.TYPE)
+    camera = CameraPublisher(xblick, "mine/color", encoding="mono8", frame_id="mine")
+    copied = ImageSubscriber(reader, "copy/color", transport="auto")
+    mine = ImageSubscriber(reader, "mine/color", transport="auto")
+    try:
+        end = time.monotonic() + 2.0
+        while time.monotonic() < end:
+            payload = numpy_to_image(np.zeros((4, 6), np.uint8), "mono8", Header(Time.from_ns(time.time_ns()))).serialize()
+            copy.put(bytes(payload))
+            camera.publish(np.zeros((4, 6), np.uint8))
+            mine.latest(timeout=0.05)
+        assert copied.latest(timeout=0.1) is None and copied.transport is None
+        assert mine.transport == "shm"
+    finally:
+        copied.close()
+        mine.close()
+        camera.close()
+        xblick.close()
+
+
+def test_list_shows_ros_camera_topics_without_our_copies(network):
+    from xblick.camera import CameraPublisher
+    from xblick.cli import ros_camera_topics
+
+    endpoint, reader = network
+    camera = RosCamera(endpoint, image=("/usb_cam/image_raw", Image.TYPE), info=("/usb_cam/camera_info",
+                                                                                 CameraInfo.TYPE))
+    xblick = session.open_session(connect=[endpoint], ros_options=session.RosOptions(DOMAIN, "xblick_camera"))
+    ours = CameraPublisher(xblick, "mine/color", encoding="mono8", frame_id="mine")
+    try:
+        end = time.monotonic() + 3.0
+        found = []
+        while len(found) < 2 and time.monotonic() < end:
+            found = ros_camera_topics(reader)
+            time.sleep(0.1)
+        assert found == [("/usb_cam/camera_info", "CameraInfo", ["/ros_camera"]),
+                         ("/usb_cam/image_raw", "Image", ["/ros_camera"])]
+        assert ros_camera_topics(reader, "usb_cam/image_raw") == [("/usb_cam/image_raw", "Image", ["/ros_camera"])]
+        assert ros_camera_topics(reader, "other") == []
+    finally:
+        ours.close()
+        xblick.close()
+        camera.close()

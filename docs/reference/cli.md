@@ -80,7 +80,9 @@ address (`--listen tcp/127.0.0.1:PORT`) the start line says that other PCs canno
 ### `xblick list [prefix]`
 
 Lists every stream with its encoding or fields, its transports, its host and its Durchblick version. The command
-queries the info records and subscribes to nothing.
+queries the info records and subscribes to nothing. In ROS 2 it then lists the ROS topics of the types Image,
+CompressedImage, PointCloud2 and CameraInfo, with `ros` in the transports column and the publishing nodes. It leaves
+out the ROS copies of our own streams, which are listed already.
 
 | Option | Meaning |
 | --- | --- |
@@ -92,7 +94,8 @@ queries the info records and subscribes to nothing.
 
 Subscribes to an image or point cloud stream. Prints the rate, the age at send and at receive, and the missing
 frames. A `<stream>` with a leading `/` is a ROS 2 topic of any name, such as `/image_raw` or `/resize/image`. Its
-type in ROS's graph decides between images and point clouds.
+type in ROS's graph decides between images and point clouds. A stream of ours that only a ROS node publishes is read
+from ROS with `auto`, as the subscribers do.
 
 | Option | Meaning |
 | --- | --- |

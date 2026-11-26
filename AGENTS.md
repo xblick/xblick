@@ -135,7 +135,9 @@ Reference check: `tools/check_references.sh` (no internal or robot-framework nam
   `XBLICK_HOME` moves cache and data (docs/reference/files.md).
 - Stream name: `<namespace>/<camera>/<stream>`. Node results: `<camera>/<node>/<name>`. Diagnostics:
   `<camera>/diagnostics`.
-- Transports: `auto`, `compressed`, `raw`, `shm`, `cuda`. Nodes and the CLI use `auto`.
+- Transports: `auto`, `compressed`, `raw`, `shm`, `cuda`, `ros`. Nodes and the CLI use `auto`. In ROS 2 `auto` reads
+  a stream that only a ROS node publishes from `/<base>/image_raw` (never our programs' ROS copies, `Graph.by_xblick`).
+  A subscriber name with a leading `/` is a ROS topic of any name (camera.py `Subscription`).
 - Image ring: 32 slots. Point cloud ring: 4 slots.
 - Test without a camera: `xblick test-camera` publishes `test/camera/color` (640 x 480, 15 Hz).
   `xblick play <file.mcap> --loop` replays a recording.

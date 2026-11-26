@@ -69,8 +69,9 @@ def _list(args) -> int:
 def _list_streams(args) -> int:
     with zsession.open_from_args(args, prog=f"xblick {args.command}") as z:
         found = find_streams(z, args.prefix, args.seconds)
+        ros_found = ros_camera_topics(z, args.prefix) if z.ros is not None else []
         why = zsession.why_nothing(z)
-    if not found:
+    if not found and not ros_found:
         print(f"no stream answered within {args.seconds:g} s" + (f"; {why}" if why else ""), file=sys.stderr)
         return 1
     for base, r in found:
@@ -83,16 +84,46 @@ def _list_streams(args) -> int:
         print(f"{base:45s} {what:8s} {','.join(r.get('transports', [])):26s} "
               f"source {r.get('source', '')!r:8s} host {str(r.get('host'))[:8]}  xblick {r.get('xblick')}"
               + (f"  relayed on {', '.join(h[:8] for h in r['relayed_by'])}" if r.get("relayed_by") else ""))
+    for topic, kinds, nodes in ros_found:
+        print(f"{topic:45s} {kinds:8s} {'ros':26s} node {', '.join(nodes)}")
     return 0
+
+
+def ros_camera_topics(z, prefix: str = "", timeout: float = 1.0) -> list[tuple[str, str, list[str]]]:
+    """(topic, its types' names, its publishers' nodes) of the ROS topics of image, compressed image, point cloud and
+    camera info types (ros.CAMERA_TYPES) below ``prefix``, sorted. Only ROS's own publishers: the ROS copies of the
+    streams our programs publish (their sessions declare a program, declaration.py) are the streams listed already."""
+    from . import declaration
+
+    ours = declaration.alive(z) | {str(z.info.zid())}
+    below = "/" + prefix.strip("/") if prefix.strip("/") else ""
+    topics_: dict[str, tuple[set, set]] = {}
+    for token in ros.publishers(z, timeout):
+        if token.type_name not in ros.CAMERA_TYPES or token.zid in ours:
+            continue
+        if below and token.topic != below and not token.topic.startswith(below + "/"):
+            continue
+        kinds, nodes = topics_.setdefault(token.topic, (set(), set()))
+        kinds.add(token.type_name.rpartition("/")[2])
+        nodes.add(token.fully_qualified_node)
+    return [(t, ",".join(sorted(k)), sorted(n)) for t, (k, n) in sorted(topics_.items())]
 
 
 def _is_cloud(z, base: str) -> bool:
     """True if the stream's publisher says it is a point cloud stream, or a ROS topic's publishers send
-    sensor_msgs/PointCloud2 (a stream that does not answer is taken as images; its subscriber refuses it later if it is
-    not)."""
+    sensor_msgs/PointCloud2: a ROS name's, or for a stream of ours that no publisher of ours answers its ROS form
+    ``/<base>/cloud`` (as auto reads it). A stream that does not answer is taken as images; its subscriber refuses it
+    later if it is not."""
     if ros.is_topic(base):
         return z.ros is not None and _ros_types(z, base) == {ros.CLOUD_TYPE}
-    return any(r.get("kind") == "points" for r in wait_for_info(z, base))
+    records = wait_for_info(z, base)
+    if records or z.ros is None:
+        return any(r.get("kind") == "points" for r in records)
+    try:
+        cloud = ros.topic_of(topics.cloud(base))
+    except ros.RosError:
+        return False
+    return ros.CLOUD_TYPE in _ros_types(z, cloud, 1.0)
 
 
 def _ros_types(z, topic: str, timeout: float = 2.0) -> set[str]:
