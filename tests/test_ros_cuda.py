@@ -194,6 +194,10 @@ def test_pool_hands_the_block_to_readers_of_this_user_by_both_sockets(tmp_path):
             data, fds, _, _ = socket.recv_fds(s, 1, 1)
         assert data == b"X" and len(fds) == 1
         os.close(fds[0])
+    # the server thread counts an accept after its send returned, which can be after the fd arrived here
+    end = time.monotonic() + 5
+    while pool.accepts < 2 and time.monotonic() < end:
+        time.sleep(0.01)
     assert pool.accepts == 2 and pool.refused == 0
     del pool
     assert not os.path.exists(path)
