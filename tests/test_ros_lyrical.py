@@ -119,6 +119,30 @@ def test_we_read_cam2image(lyrical, ours):
     assert frame is not None and frame.image.shape == (240, 320, 3)
 
 
+def test_auto_reads_cam2image_by_its_topic_and_by_our_stream_name(lyrical, ours):
+    """cam2image on its own topic name (/lyr/any/image) and on our stream's ROS form (/lyr/only/image_raw): both read
+    with auto (a ROS topic of any name; auto's ROS form when only ROS publishes the stream)."""
+    box, _ = lyrical
+    by_topic = ImageSubscriber(ours, "/lyr/any/image", transport="auto")
+    by_stream = ImageSubscriber(ours, "lyr/only", transport="auto")
+    try:
+        for topic in ("/lyr/any/image", "/lyr/only/image_raw"):
+            box.start("ros2 run image_tools cam2image --ros-args -p burger_mode:=true -p show_camera:=false "
+                      f"-p frequency:=10.0 -r image:={topic}")
+        frames = []
+        for reader in (by_topic, by_stream):
+            end = time.monotonic() + 20.0
+            frame = None
+            while frame is None and time.monotonic() < end:
+                frame = reader.latest(timeout=0.2)
+            frames.append((frame, reader.transport))
+    finally:
+        by_topic.close()
+        by_stream.close()
+    for frame, transport in frames:
+        assert frame is not None and frame.image.shape == (240, 320, 3) and transport == "ros"
+
+
 def test_we_read_rclpy_image_and_cloud(lyrical, ours):
     box, _ = lyrical
     images = ImageSubscriber(ours, "lyr/py", transport="ros")
