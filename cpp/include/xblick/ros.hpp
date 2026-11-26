@@ -156,8 +156,8 @@ namespace xblick::ros
 
     // ------------------------------------------------------------------------------------ type hashes (RIHS01)
 
-    // The RIHS01 hash of every type Durchblick carries to ROS: Python's ros.TYPE_HASHES (ROS 2 Jazzy's own; vision_msgs
-    // computed by Python's message_hash), compared by tests/test_cpp_ros.py.
+    // The RIHS01 hash of every type Durchblick carries to ROS: Python's ros.TYPE_HASHES (ROS 2 Jazzy's own, vision_msgs
+    // those of ros-jazzy-vision-msgs 4.1.1), compared by tests/test_cpp_ros.py.
     const std::map<std::string, std::string>& type_hashes();
     std::string hash_of(const std::string& type_name);  // RosError for a type not offered to ROS
 

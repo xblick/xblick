@@ -62,6 +62,7 @@ Complete lists for lookup.
 
 - [Development](project/development.md)
 - [Alternatives](project/alternatives.md)
+- [ROS 2 by default](project/ros-roadmap.md)
 - [Writing documentation](project/writing-docs.md)
 - [Changelog](../CHANGELOG.md)
 

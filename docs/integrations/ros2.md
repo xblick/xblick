@@ -1,8 +1,8 @@
 # Durchblick and ROS 2
 
 Durchblick uses the message types and conventions of ROS 2, and it needs no ROS installation. With the option `--ros`
-a program also takes part in ROS 2 on `rmw_zenoh`. This page states what is compatible, what `--ros` adds and how
-you try it with ROS 2's own tools.
+a program also takes part in ROS 2 Jazzy with `rmw_zenoh_cpp` 0.2.13, the version we test. This page states what is
+compatible, what `--ros` adds and how you try it with ROS 2's own tools.
 
 ## What is identical
 
@@ -23,6 +23,11 @@ is started without `--ros`.
 Start a command or a node with `--ros`. The program then sends on our keys as before and also on the keys of
 `rmw_zenoh_cpp`. It needs `rmw_zenoh_cpp` 0.2.13 (ROS 2 Jazzy) or 0.10.6 or newer (ROS 2 Lyrical) on the ROS side.
 In ROS 2 it is a node of its own.
+
+The keys and the attachment are `rmw_zenoh_cpp`'s format, which ROS 2 itself does not define. Other versions of
+`rmw_zenoh_cpp` are untested. Nodes on another RMW, such as one on DDS, do not use Zenoh and see nothing. Humble's
+`rmw_zenoh_cpp` puts no type hash into its keys, so a Humble node never matches ours. Jazzy's releases 0.2.0 to 0.2.3
+used another attachment ([ROS 2 by default](../project/ros-roadmap.md#which-versions-use-these-33-bytes)).
 
 | Option | Meaning |
 | --- | --- |
@@ -220,9 +225,9 @@ type hashes that `--ros` uses.
 - The C++ programs were tested against ROS 2's own programs as well: `rclcpp` reads `xblick-cpp-camera`'s streams,
   `tf2_echo` its `/tf_static`, `rclcpp`'s parameter client its parameters, and `xblick-cpp-probe` reads an `rclcpp`
   node's image.
-- The type hashes of `vision_msgs` come from our own implementation of ROS's hash over the message definitions. It
-  gives ROS's hashes for all 252 message and service types of a Jazzy installation. They equal the hashes of
-  `vision_msgs` 4.2.0 in a Lyrical installation. A Jazzy installation with `vision_msgs` was not at hand.
+- The type hashes of `vision_msgs` are those of `ros-jazzy-vision-msgs` 4.1.1. They equal the hashes of
+  `vision_msgs` 4.2.0 in a Lyrical installation. A typed `rclcpp` subscription receives and deserialises our
+  `Detection2DArray` and `Detection3DArray`, and those of `xblick-yolox --ros`.
 - A Jazzy subscriber gets no images, compressed images or clouds from a Lyrical publisher. Lyrical sends these
   types on keys that Jazzy does not read. This holds between ROS nodes as well, so a program with `--ros` cannot
   change it. Lyrical subscribers get these types from Jazzy publishers and from ours.
@@ -231,3 +236,4 @@ type hashes that `--ros` uses.
 - `/clock` is not mapped: a world's clock is `/<world>/clock`. A ROS node that uses simulated time needs a remap.
 - To make the streams visible to ROS 2 nodes that read rings in place, ROS 2 Lyrical's buffer backends
   (`rosidl::Buffer`) would be needed. [Alternatives](../project/alternatives.md) describes these projects.
+- [ROS 2 by default](../project/ros-roadmap.md) collects what a later step without `--ros` would change.
