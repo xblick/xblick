@@ -685,6 +685,19 @@ namespace xblick
         CU(cuStreamSynchronize(m.stream));
     }
 
+    void CudaRingWriter::copy_slot(std::uint32_t slot, std::uint64_t dst, std::uint64_t nbytes)
+    {
+        if (slot >= control_.slot_count() or nbytes > control_.slot_size())
+        {
+            throw RingError("copy_slot: slot " + std::to_string(slot) + ", " + std::to_string(nbytes) + " bytes");
+        }
+        Impl& m = *impl_;
+        ContextGuard guard(m.primary.context);
+        CU(cuStreamWaitEvent(m.stream, m.events[slot], 0));
+        CU(cuMemcpyDtoDAsync(dst, m.base + slot * m.stride, nbytes, m.stream));
+        CU(cuStreamSynchronize(m.stream));
+    }
+
     // ---------------------------------------------------------------------------------------------- reader
 
     struct CudaRingReader::Impl

@@ -1181,12 +1181,17 @@ class RosPublisher(_Entity):
             return True
         return self._declared.matching_status.matching
 
+    def attachment(self) -> bytes:
+        """The attachment of the next message, its sequence number counted: for a message that goes on keys of its
+        own (ros_cuda: the buffer keys of Lyrical's readers), each with this one."""
+        with self._seq_lock:
+            seq = next(self._seq)
+        return encode_attachment(seq, time.time_ns(), self.gid)
+
     def put(self, payload):
         if self.check is not None:
             self.check(payload)
-        with self._seq_lock:
-            seq = next(self._seq)
-        self._declared.put(bytes(payload), attachment=encode_attachment(seq, time.time_ns(), self.gid))
+        self._declared.put(bytes(payload), attachment=self.attachment())
 
 
 class RosSubscriber(_Entity):

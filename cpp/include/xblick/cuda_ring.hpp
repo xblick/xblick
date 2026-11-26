@@ -86,6 +86,9 @@ namespace xblick
         Written commit(std::uint64_t nbytes, std::uint64_t stream);
         // Copy slot (as last written) to host memory; returns when done.
         void read_host(std::uint32_t slot, void* dst, std::uint64_t nbytes);
+        // Copy slot (as last written) to device memory of the ring's device at dst (e.g. a block of the export pool
+        // for ROS readers, ros_cuda.hpp); returns when done.
+        void copy_slot(std::uint32_t slot, std::uint64_t dst, std::uint64_t nbytes);
         // Page-lock host memory that read_host copies into (a host ring's slots), so that the GPU writes it directly
         // instead of through the driver's staging buffer; unlocked when this ring is destroyed, which must happen
         // before the memory is unmapped. Once per ring.

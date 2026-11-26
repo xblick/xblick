@@ -102,6 +102,44 @@ The reader has the same problem in the other direction, because the copy into th
 work. Each slot therefore has an event that both processes can see. The reader's GPU work waits for this event, so
 it starts after the copy into the slot has finished. You do not need to do anything for this.
 
+## ROS 2 readers
+
+A ROS 2 Lyrical node can accept image data as a CUDA buffer through ROS 2's CUDA buffer backend
+(`cuda_buffer_backend`, experimental upstream). Isaac ROS nodes do this. Such a reader gets our GPU frames on the GPU
+as well. [GPU frames for ROS readers](../integrations/ros2.md#gpu-frames-for-ros-readers) lists what the reader
+needs. In short, it runs on `rmw_zenoh` with the backend's plugin, as the same Linux user on the same PC and GPU, and
+it shares `/dev/shm`, `/tmp`, the process ids and the network with the publisher.
+
+The backend's reader maps one whole CUDA allocation from its start. A slot of our CUDA ring is a part of one
+allocation, so the reader cannot map it. The publisher therefore keeps a small pool of blocks, each one allocation of
+exactly the frame's size in whole steps of 2 MiB.
+
+1. A ROS reader that accepts the backend announces it in its liveliness token.
+2. The publisher finds the reader in the backend's registry in `/dev/shm`. The registry tells whether the reader
+   runs on this PC, as this user and on this GPU.
+3. For each frame, the publisher copies the slot into a free block on the GPU and waits for the copy. It then sends
+   a descriptor of the block to the reader in place of the pixels.
+4. The reader receives the block's file descriptor over a Unix socket once, maps the block, and keeps the mapping.
+   The socket accepts only processes of the publisher's user.
+5. The reader counts its hold in a small record in `/dev/shm` while it uses the message. The publisher rewrites a
+   block only when the count is zero.
+
+The count rises only when the reader takes a message from its queue. A message that waits in the queue holds
+nothing. The publisher therefore also waits until as many frames as the reader's queue holds have gone out since
+the block's last frame. A reader that takes a message whose block was rewritten drops it. An Isaac ROS node then
+aborts, so this rule matters.
+
+The copy into the block costs the publisher little compared with the bytes that it sends otherwise:
+
+| 1080p `rgb8` to one ROS reader that accepts CUDA buffers | Publisher's time per frame, median | 95th percentile |
+| --- | --- | --- |
+| CUDA buffer: copy into a block, descriptor | 0.5 ms | 0.7 ms |
+| Bytes: download, serialisation, put | 13.4 ms | 15.2 ms |
+
+Measured on 2026-11-26 on an RTX PRO 6000 with a stock Lyrical reader in a container, whose queue holds 10 messages,
+twice 300 frames at 30 Hz per row. Both rows include the copy into the CUDA ring. Other jobs used the PC's CPUs at the
+time. The pool had 11 blocks, which take 66 MiB of GPU memory.
+
 ## What follows for your node
 
 - Name your CUDA stream when you publish a device array.
@@ -118,6 +156,9 @@ it starts after the copy into the slot has finished. You do not need to do anyth
 - A reader sets up CUDA when its first frame arrives. When 16 readers opened one ring at the same time, each reader
   needed about 3 s for this.
 - We measured the copy between GPUs on one machine with two GPUs of the same model.
+- A ROS reader gets CUDA buffers only from the Python `CameraPublisher`, only on the publisher's GPU, and only
+  through a backend whose wire format matches ours. The backend is experimental and has no version on the wire.
+- A ROS reader on another GPU gets the bytes. The backend's reader cannot copy between GPUs.
 
 ## Related pages
 
@@ -125,3 +166,4 @@ it starts after the copy into the slot has finished. You do not need to do anyth
 - [Making a node fast](../guides/making-a-node-fast.md): what else we learned about GPU work in nodes.
 - [Alternatives](../project/alternatives.md): other projects that share GPU memory between processes.
 - `cpp/include/xblick/cuda_ring.hpp`: the handshake and the slot events.
+- `cpp/include/xblick/ros_cuda.hpp`: the CUDA buffer backend's protocol and the pool of blocks.
