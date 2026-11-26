@@ -15,6 +15,7 @@ import dataclasses
 import ipaddress
 import json
 import logging
+import os
 import re
 import socket
 import sys
@@ -809,19 +810,24 @@ def count(answers: list, selector: str) -> list:
 
 
 CLOSE_TIMEOUT_S = 5.0  # how long a close waits for Zenoh (Session, close)
+EXIT_CLOSE_S = CLOSE_TIMEOUT_S  # how long the close at the end of a program may take in all (_close_open_sessions)
+EXIT_WATCHDOG = "xblick exit watchdog"  # the thread that ends a program whose close at exit stalls
 
 
 def close(session, timeout: float = CLOSE_TIMEOUT_S) -> bool:
     """Closes ``session`` (a zenoh.Session or a Session), waiting at most ``timeout`` s: Zenoh's close blocked for
     good after a query it did not finalize (seen in the tests, also with that query cancelled), and a program must
-    still end. True when closed; False: it is left closing in a daemon thread, logged."""
+    still end. True when closed; False: it is left closing in a daemon thread, logged, and waited for once more at
+    the end of the program (``_close_open_sessions``)."""
     raw, declared = _take(session)
     closer = threading.Thread(target=_end, args=(raw, declared), name="zenoh close", daemon=True)
     closer.start()
     closer.join(timeout)
     if closer.is_alive():
-        log.warning(f"the Zenoh session {raw.info.zid()} did not close within {timeout:g} s: going on without "
-                    "waiting for it")
+        what = f"the Zenoh session {raw.info.zid()}"
+        _still_closing[closer] = what
+        _watch()
+        log.warning(f"{what} did not close within {timeout:g} s: going on without waiting for it")
         return False
     return True
 
@@ -831,10 +837,21 @@ def _take(session) -> tuple:
     if not isinstance(session, Session):
         return session, None
     _open.discard(session)
-    _declared.discard(session)
+    if session._release is not None:
+        session._release.detach()  # its declaration is closed with the session, not when the Session is dropped
     declared = session.declaration
     object.__setattr__(session, "declaration", None)
     return session._session, declared
+
+
+def _drop(declared) -> None:
+    """A declared Session dropped without close(): its declaration (token, queryable, thread) is closed while the
+    zenoh session still sends. Zenoh then closes the session itself, once the Session is gone, as in 0.5.15 (where
+    the thread ended on its own, a little later, when its queryable's channel closed)."""
+    try:
+        declared.close()
+    except zenoh.ZError:  # the session was closed already (by zenoh directly): nothing left to undeclare
+        pass
 
 
 def _end(raw: zenoh.Session, declared) -> None:
@@ -846,16 +863,18 @@ def _end(raw: zenoh.Session, declared) -> None:
     raw.close()
 
 
-def close_at_exit(thing) -> None:
+def close_at_exit(thing, what: str) -> None:
     """``thing.close()`` is called when the program ends without having called it, before the sessions are closed
     (``_close_open_sessions``); that close calls ``forget_at_exit(thing)``. For what a thread of its own keeps
-    alive, which is never freed otherwise (a Subscription's chooser)."""
-    _open_things.add(thing)
+    alive, which is never freed otherwise (a Subscription's chooser). ``what`` names it in the line of a close at
+    exit that stalls (``the subscription of test/camera/color``)."""
+    _open_things[thing] = what
+    _watch()
 
 
 def forget_at_exit(thing) -> None:
     """``thing`` is closed: the end of the program leaves it alone (``close_at_exit``)."""
-    _open_things.discard(thing)
+    _open_things.pop(thing, None)
 
 
 def _zenoh_callback_thread(thread: threading.Thread) -> bool:
@@ -869,26 +888,82 @@ def _close_open_sessions() -> None:
     daemons. Zenoh runs the callbacks of a subscriber or queryable in such a thread (zenoh.handlers.Callback,
     indirect; a daemon only when the thread that declared it is one), and that thread ends only when its subscriber
     or queryable is undeclared: a program that did not close its session never ended. The program's own threads
-    that are not daemons may still use the sessions: they are waited for first, as Python would. No thread can be
-    started any more at this point (Python 3.12), so the sessions' close does not wait in one with a timeout as
-    ``close`` does."""
+    that are not daemons may still use the sessions: they are waited for first, as Python would.
+
+    Then, within EXIT_CLOSE_S in all: what was registered with ``close_at_exit``, the open sessions, and the closes
+    that ``close`` gave up on. A daemon thread that is still inside a Zenoh call when Python finalises can abort the
+    process with "FATAL: exception not rethrown" (seen with a declaration's thread that outlived its session, and with
+    plain zenoh; Python 3.12 ends such a thread with pthread_exit when it takes the GIL back, and that unwinding fails
+    in zenoh's Rust code), so those closes are waited for rather than left behind. No thread can be started any more
+    at this point (Python 3.12): the limit is kept by a thread started before (``_watch``), which ends the process
+    when it passes."""
     this = threading.current_thread()
     while waiting := [t for t in threading.enumerate()
                       if not t.daemon and t is not this and t.is_alive() and not _zenoh_callback_thread(t)]:
         for thread in waiting:
             thread.join()
-    while _open_things:
-        _open_things.pop().close()
-    while _open:
-        _end(*_take(_open.pop()))
+    _exit_began.set()
+    try:
+        things, sessions = list(_open_things.items()), list(_open)
+        closing = [(t, what) for t, what in _still_closing.items() if t.is_alive()]
+        _exit_left[:] = [what for _, what in things] + [_named(s) for s in sessions] + [what for _, what in closing]
+        for thing, what in things:
+            thing.close()
+            _exit_left.remove(what)
+        for s in sessions:
+            what = _named(s)
+            _end(*_take(s))
+            _exit_left.remove(what)
+        for thread, what in closing:
+            thread.join()
+            _exit_left.remove(what)
+    finally:
+        _exit_ended.set()
 
 
-# The Sessions not closed yet, and what is to be closed before them (close_at_exit). Weak: a session nobody refers to
-# any more is closed by zenoh itself. Except one that declares its program: the declaration's thread holds on to the
-# zenoh session, so it stays open until closed, and the Session is kept for that close (_declared).
+def _named(session) -> str:
+    try:
+        return f"the Zenoh session {session.info.zid()}"
+    except zenoh.ZError:  # closed by zenoh directly
+        return "a Zenoh session"
+
+
+def _watch() -> None:
+    """Starts the thread that keeps the limit of the close at exit (``_end_a_stalled_exit``), once in each process (a
+    forked child starts its own): with the first Session, and with anything else the end of the program closes."""
+    global _watchdog
+    with _watchdog_lock:
+        if _watchdog is None or not _watchdog.is_alive():
+            _watchdog = threading.Thread(target=_end_a_stalled_exit, name=EXIT_WATCHDOG, daemon=True)
+            _watchdog.start()
+
+
+def _end_a_stalled_exit() -> None:
+    """Waits for the close at exit, and EXIT_CLOSE_S for its end. A close that takes longer (Zenoh stalled) ends the
+    process with exit code 1 and one line on stderr that names what did not close."""
+    _exit_began.wait()
+    if _exit_ended.wait(EXIT_CLOSE_S):
+        return
+    left = ", ".join(_exit_left) or "something"
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except (OSError, ValueError):  # a broken pipe, a closed stream: the process ends either way
+            pass
+    os.write(2, f"{program_name()}: {left} did not close within {EXIT_CLOSE_S:g} s at the end of the program: "
+                "ended without waiting for it\n".encode(errors="replace"))
+    os._exit(1)
+
+
+# The Sessions not closed yet, and what is to be closed before them (close_at_exit). Weak: a Session nobody refers to
+# any more is closed by zenoh itself, and a declared one closes its declaration first (_drop).
 _open: weakref.WeakSet = weakref.WeakSet()
-_open_things: weakref.WeakSet = weakref.WeakSet()
-_declared: set = set()
+_open_things: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()  # thing -> what it is
+_still_closing: dict[threading.Thread, str] = {}  # the closes that close() gave up on -> what they close
+_exit_began, _exit_ended = threading.Event(), threading.Event()
+_exit_left: list[str] = []  # what the close at exit has not closed yet
+_watchdog: threading.Thread | None = None
+_watchdog_lock = threading.Lock()
 # threading's own exit hook, the one concurrent.futures uses: it runs before Python waits for the threads that are not
 # daemons; the hooks of atexit run only after that wait.
 threading._register_atexit(_close_open_sessions)
@@ -901,15 +976,17 @@ class Session:
     ``across_pcs`` for its options, or none; ``declaration``: its program's (declaration.py), None when it does not
     declare."""
 
-    __slots__ = ("__weakref__", "_session", "across_pcs", "declaration")
+    __slots__ = ("__weakref__", "_release", "_session", "across_pcs", "declaration")
 
     def __init__(self, session: zenoh.Session, across_pcs: Sequence[str] = (), declaration=None):
         object.__setattr__(self, "_session", session)
         object.__setattr__(self, "across_pcs", list(across_pcs))
         object.__setattr__(self, "declaration", declaration)
+        # dropped without close(): its declaration is closed then (_drop); the declaration's thread holds only that
+        object.__setattr__(self, "_release", None if declaration is None else weakref.finalize(self, _drop,
+                                                                                               declaration))
         _open.add(self)  # closed when the program ends without closing it (_close_open_sessions)
-        if declaration is not None:
-            _declared.add(self)
+        _watch()
 
     def __getattr__(self, name):
         return getattr(self._session, name)

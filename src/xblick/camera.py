@@ -862,7 +862,7 @@ class Subscription:
             self._chooser.start()
             # the chooser keeps the subscription alive: left open, its ring readers would never be freed (nanobind
             # reports them as leaked when the program ends)
-            close_at_exit(self)
+            close_at_exit(self, f"the subscription of {self.base}")
         else:
             self._use(transport)
 

@@ -10,7 +10,9 @@ import socket
 import subprocess
 import sys
 import textwrap
+import threading
 import time
+import weakref
 from pathlib import Path
 
 import pytest
@@ -217,6 +219,23 @@ def test_zenoh_query_of_the_declaration_is_answered_at_once(network):
         answers = replies(z, key, 1.0)
         assert len([r for r in answers if r.ok is not None]) == 1 and not any(timed_out(r) for r in answers)
         assert str(answers[0].ok.encoding).startswith(str(zenoh.Encoding.APPLICATION_JSON))
+
+
+def test_a_declared_session_dropped_without_close_is_released(network):
+    """A Session dropped without close() goes with its last reference, as in 0.5.15: its declaration's thread has
+    ended and its token is gone soon after. The first fix of the exit hang (0.5.16, not released) kept every declared
+    Session until the program ended (CI: a C++ interop test that drops its Session saw the thread still there)."""
+    port, z = network
+    s = open_session(connect=[f"tcp/127.0.0.1:{port}"], listen=["127.0.0.1:0"], program="dropped")
+    zid = str(s.info.zid())
+    wait_until(lambda: zid in declaration.alive(z, 0.3), timeout=10)
+    thread = f"declaration {zid[:8]}"
+    assert [t for t in threading.enumerate() if t.name == thread]
+    dropped = weakref.ref(s)
+    del s
+    assert dropped() is None
+    assert not [t for t in threading.enumerate() if t.name == thread]  # ended while the Session went (_drop)
+    assert gone_after(z, zid, timeout=10) < 3.0
 
 
 def test_a_program_that_ends_without_closing_its_session_ends():

@@ -1,8 +1,9 @@
 """The commands as separate processes behind ``xblick router``, in the default (peer) mode, as a user starts them:
 a publisher, then ``list``, ``hz`` (network and the move to the shm ring), ``param`` (liveliness and a query), a
-client-mode session and ``xblick view``; a script that ends without closing what it opened; the default port without
-any option (skipped when 7447 is taken); and the long-running commands, a node (``xblick.node.start``) and the C++ tools ending on SIGTERM and on SIGINT as background
-jobs of a script (a non-interactive shell starts those with SIGINT ignored).
+client-mode session and ``xblick view``; a script that ends without closing what it opened, and one whose close at exit
+stalls; the default port without any option (skipped when 7447 is taken); and the long-running commands, a node
+(``xblick.node.start``) and the C++ tools ending on SIGTERM and on SIGINT as background jobs of a script (a
+non-interactive shell starts those with SIGINT ignored).
 
 0.5.3 found nothing here: a peer that only connected did not listen, and a Zenoh 1.10 router does not route between
 peers (they reach each other directly), while the earlier router tests used sessions that listened."""
@@ -216,6 +217,44 @@ def test_a_script_that_does_not_close_ends(camera):
             script.communicate()
     assert script.returncode == 0 and not err, out + err
     assert took < 3.0, took  # well within a second on a PC that is not busy
+
+
+STALLED = """
+import threading
+
+from xblick import session
+
+
+class Stalled:
+    def close(self):  # as a Zenoh close that never returns
+        threading.Event().wait()
+
+
+stalled = Stalled()
+session.EXIT_CLOSE_S = 0.5
+session.close_at_exit(stalled, "the stalled thing")
+print("xblick-test-stalled: ends", flush=True)
+"""
+
+
+def test_a_close_at_exit_that_stalls_ends_the_program():
+    """The close at the end of a program has a limit (session.EXIT_CLOSE_S): after it the program ends with exit code
+    1 and one line on stderr that names what did not close. Before 0.5.17 a stalled close kept it for good."""
+    script = subprocess.Popen([sys.executable, "-c", STALLED], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True, env=ENV)
+    try:
+        assert script.stdout.readline() == "xblick-test-stalled: ends\n"
+        printed = time.monotonic()
+        out, err = script.communicate(timeout=20)
+        took = time.monotonic() - printed
+    finally:
+        if script.poll() is None:
+            script.kill()
+            script.communicate()
+    assert script.returncode == 1, (script.returncode, out + err)
+    assert err.splitlines() == [("-c: the stalled thing did not close within 0.5 s at the end of the program: ended "
+                                 "without waiting for it")], err
+    assert 0.5 <= took < 3.0, took
 
 
 def port_free(port: int) -> bool:
