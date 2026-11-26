@@ -249,6 +249,30 @@ def test_transport_ros_reads_a_ros_image(ros_env, ours, rosprobe):
     assert frame is not None and frame.header.frame_id == "ros_cam" and (frame.image == picture).all()
 
 
+@pytest.mark.parametrize(("name", "topic"), [("/live/resize/image", "/live/resize/image"),
+                                             ("live/fallback/color", "/live/fallback/color/image_raw")])
+def test_auto_reads_an_rclcpp_image_by_its_topic_or_our_stream_name(ros_env, ours, rosprobe, name, topic):
+    """An rclcpp publisher's image: read with auto by its own topic name, and by our stream name when only ROS
+    publishes it (auto's ROS form)."""
+    env, _ = ros_env
+    picture = np.arange(4 * 6 * 3, dtype=np.uint8).reshape(4, 6, 3)
+    payload = bytes(numpy_to_image(picture, "rgb8", Header(Time(5, 0), "ros_cam")).serialize())
+    reader = ImageSubscriber(ours, name, transport="auto")
+    try:
+        process = subprocess.Popen([str(rosprobe), "pub", topic, "sensor_msgs/msg/Image", payload.hex(), "40"],
+                                   env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        end = time.monotonic() + 12.0
+        frame = None
+        while frame is None and time.monotonic() < end:
+            frame = reader.latest(timeout=0.2)
+        process.terminate()
+        process.wait(10)
+        transport = reader.transport
+    finally:
+        reader.close()
+    assert frame is not None and (frame.image == picture).all() and transport == "ros"
+
+
 def test_tf_static_to_a_late_ros_listener(ros_env, ours):
     """Our /tf_static, published once before tf2_echo started, reaches it (transient local: from the cache)."""
     env, _ = ros_env
@@ -283,11 +307,14 @@ def test_tf_static_of_ros_to_our_late_reader(ros_env, ours):
     assert any(t.child_frame_id == "ros_thing" and t.transform.translation.x == 4.0 for t in transforms), got
 
 
-def test_ros_parameter_client_on_our_node(ros_env, ours, rosprobe):
+def test_ros_parameter_client_on_our_node(ros_env, rosprobe):
     """rclcpp's parameter client on our node: reads; a set refused by default; with --ros-params-writable taken, and an
-    out-of-range one refused."""
+    out-of-range one refused. Sessions whose node name is a default (follow_parameters, as a program's), so that the
+    node takes the parameters' name (one node per program)."""
     env, port = ros_env
-    params = Parameters(ours, "boxer", "live/cam")
+    named = session.open_session(connect=[f"tcp/127.0.0.1:{port}"], ros_options=session.RosOptions(
+        DOMAIN, "xblick_live_params", follow_parameters=True))
+    params = Parameters(named, "boxer", "live/cam")
     params.declare("max_boxes", 10, range=(1, 100))
     params.declare("model", "base", read_only=True)
     try:
@@ -297,8 +324,9 @@ def test_ros_parameter_client_on_our_node(ros_env, ours, rosprobe):
         value_off = params["max_boxes"]
     finally:
         params.close()
+        named.close()
     with session.open_session(connect=[f"tcp/127.0.0.1:{port}"], ros_options=session.RosOptions(
-            DOMAIN, "xblick_live_writable", params_writable=True)) as writable:
+            DOMAIN, "xblick_live_writable", params_writable=True, follow_parameters=True)) as writable:
         params = Parameters(writable, "boxer", "live/cam2")
         params.declare("max_boxes", 10, range=(1, 100))
         try:

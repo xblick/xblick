@@ -562,7 +562,8 @@ def test_cpp_reads_the_tf_static_of_a_ros_node_late(ros_env):
                                stderr=subprocess.DEVNULL)
     try:
         time.sleep(2.0)
-        probe = CppOnRouter(port, "xblick-cpp-probe", "--tf-static", "unused", "--timeout", "15", ready=False)
+        probe = CppOnRouter(port, "xblick-cpp-probe", "--tf-static", "unused", "--via-ros", "--timeout", "15",
+                            ready=False)
         out, _ = probe.proc.communicate(timeout=60)
         probe.close()
     finally:
