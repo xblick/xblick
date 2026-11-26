@@ -13,7 +13,9 @@ Streams without a compressed form (float disparity, feature maps) are left out. 
 namespace: a robot's ``joint_states``, ``tf``, ``odom`` and ``wrench/*``, each camera's ``tf``, ``tf_static`` (also
 asked for at the start of each file, as it is published once), ``imu``, ``diagnostics`` and bodies, and a node's
 ``tf`` and ``odom`` (``<camera>/<node>/...``, e.g. cuVSLAM's). The recorder reads what goes over the network, never
-shared memory, so it runs on any PC that reaches the robot's routers.
+shared memory, so it runs on any PC that reaches the robot's routers. Each camera's ``tf_static`` is also copied onto
+ROS's global ``/tf_static`` (all cameras' static transforms so far in each message, transient local), so that ``ros2
+bag play`` feeds tf2 from a recording; ``play`` leaves that copy out (``ROS_COPY``).
 
 **One node records and plays** (``Recorder``; ``xblick record`` starts it recording, ``xblick play`` playing,
 both take every command later). On ``xblick/<name>/control`` (plain text or JSON ``{"command": ...}``) it takes
@@ -89,7 +91,7 @@ from .camera import (FIND_PERIOD, INFO_VERSION, SENT_VERSION, CameraPublisher, P
                      _check_encoding, _declare_advanced_history, congestion, find_streams, parse_attachment)
 from .codecs import CODEC_ENCODINGS, JPEG, RVL, decompress, parse_format
 from .encodings import image_to_numpy
-from .msg import CameraInfo, Clock, CompressedImage, Image, Message, PointCloud2, Time
+from .msg import CameraInfo, Clock, CompressedImage, Image, Message, PointCloud2, TFMessage, Time
 from .msgdefs import MSGDEFS
 from .parameters import Parameters
 from .session import CommandQuery, CommandRefused, answer_attachment, node_id, one_node, refuse, replies
@@ -200,8 +202,19 @@ def is_literal(key: str) -> bool:
 
 
 
+ROS_COPY = "xblick_ros_copy"  # channel metadata of a copy for ROS's tools (ROS's /tf_static): not played back
+# rosbag2's offered_qos_profiles of tf2's static broadcaster (reliable, transient local, depth 1), as ros2 bag record
+# writes it: ros2 bag play then offers the copy transient local, so that a tf2 listener that starts later gets it
+TF_STATIC_QOS_PROFILE = (
+    "- history: keep_last\n  depth: 1\n  reliability: reliable\n  durability: transient_local\n  deadline:\n"
+    "    sec: 9223372036\n    nsec: 854775807\n  lifespan:\n    sec: 9223372036\n    nsec: 854775807\n"
+    "  liveliness: automatic\n  liveliness_lease_duration:\n    sec: 9223372036\n    nsec: 854775807\n"
+    "  avoid_ros_namespace_conventions: false")
+
+
 class _File:
-    """One MCAP file being written: its channels and schemas. Used by the writer thread only."""
+    """One MCAP file being written: its channels and schemas. Used by the writer thread only. Each camera's
+    ``tf_static`` also goes to a copy on ROS's ``/tf_static`` (``_write_ros_static``)."""
 
     def __init__(self, path: Path, compression: str):
         mcap = import_mcap()
@@ -211,8 +224,15 @@ class _File:
         self._writer.start(profile="ros2", library=f"xblick {_core.__version__}")
         self._schemas: dict[str, int] = {}
         self._channels: dict[tuple[str, str], int] = {}
-        self.messages = 0
+        self._static: dict[str, object] = {}  # child frame -> its TransformStamped, of every camera's tf_static so far
+        self._static_channel: int | None = None
+        self.messages = 0  # the samples recorded (the /tf_static copies left out)
         self.bytes = 0
+
+    def _schema(self, name: str) -> int:
+        if name not in self._schemas:
+            self._schemas[name] = self._writer.register_schema(name, "ros2msg", MSGDEFS[name].encode())
+        return self._schemas[name]
 
     def _channel(self, key: str, encoding: str, info: dict | None) -> int:
         channel = self._channels.get((key, encoding))
@@ -222,9 +242,7 @@ class _File:
         if encoding.startswith(CDR):
             name = encoding[len(CDR):]
             if name in MSGDEFS:
-                if name not in self._schemas:
-                    self._schemas[name] = self._writer.register_schema(name, "ros2msg", MSGDEFS[name].encode())
-                schema, message_encoding = self._schemas[name], "cdr"
+                schema, message_encoding = self._schema(name), "cdr"
         elif encoding == JSON:
             message_encoding = "json"
         metadata = {"zenoh_key": key, "zenoh_encoding": encoding}
@@ -240,6 +258,29 @@ class _File:
         self._writer.add_message(channel, log_ns, payload, received_ns)
         self.messages += 1
         self.bytes += len(payload)
+        if key.endswith("/" + topics.TF_STATIC) and encoding == CDR + TFMessage.TYPE:
+            self._write_ros_static(key, payload, log_ns, received_ns)
+
+    def _write_ros_static(self, key: str, payload: bytes, log_ns: int, received_ns: int):
+        """A camera's tf_static also on ROS's global ``/tf_static``, for ROS's tools (``ros2 bag play`` feeds tf2
+        from it): every camera's static transforms in this file so far in one message, as tf2's static broadcaster
+        sends them, so that the last message holds all; transient local, as rosbag2 records tf2's. Marked
+        ``ROS_COPY``: our playback leaves it out (its cameras' tf_static go to /tf_static themselves)."""
+        try:
+            transforms = TFMessage.deserialize(payload).transforms
+        except Exception as error:  # noqa: BLE001 - a sample that does not decode stays recorded, without a copy
+            log.warning(f"{key}: no TFMessage ({error}); not copied to /tf_static")
+            return
+        for t in transforms:
+            self._static[t.child_frame_id] = t
+        if self._static_channel is None:
+            self._static_channel = self._writer.register_channel(
+                ros.TF_STATIC_TOPIC, "cdr", self._schema(TFMessage.TYPE),
+                {"zenoh_key": topics.TF_STATIC, "zenoh_encoding": CDR + TFMessage.TYPE, ROS_COPY: ros.TF_STATIC_TOPIC,
+                 "offered_qos_profiles": TF_STATIC_QOS_PROFILE, "topic_type_hash": ros.hash_of(TFMessage.TYPE)})
+        copy = bytes(TFMessage(transforms=list(self._static.values())).serialize())
+        self._writer.add_message(self._static_channel, log_ns, copy, received_ns)
+        self.bytes += len(copy)
 
     def metadata(self, name: str, values: dict):
         """An MCAP metadata record: string values (others as JSON)."""
@@ -284,15 +325,20 @@ def sqlite_text(path: Path) -> str:
 
 def key_of(channel) -> str | None:
     """The key of a channel's messages: its ``zenoh_key`` (xblick record's), else a rosbag2's ROS topic as live
-    reading maps it (``/<key>``: the topic without its leading ``/``)."""
+    reading maps it (``/<key>``: the topic without its leading ``/``); None for a copy for ROS's tools (``ROS_COPY``),
+    which is not played."""
+    if ROS_COPY in channel.metadata:
+        return None
     key = channel.metadata.get("zenoh_key")
     return key if key is not None else channel.topic.lstrip("/")
 
 
-def channel_key(channel, schema) -> tuple[str, str]:
+def channel_key(channel, schema) -> tuple[str | None, str | None]:
     """(key, Zenoh encoding) of a channel: xblick record's from its metadata; a rosbag2's (ros2 bag record, no
-    zenoh_key) from its ROS topic (``key_of``) and its CDR type, ``application/cdr;<type>``. ValueError for a channel
-    that is neither."""
+    zenoh_key) from its ROS topic (``key_of``) and its CDR type, ``application/cdr;<type>``; (None, None) for a copy
+    for ROS's tools (``ROS_COPY``). ValueError for a channel that is neither."""
+    if ROS_COPY in channel.metadata:
+        return None, None
     key, encoding = channel.metadata.get("zenoh_key"), channel.metadata.get("zenoh_encoding")
     if key is not None and encoding is not None:
         return key, encoding

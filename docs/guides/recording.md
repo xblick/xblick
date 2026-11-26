@@ -38,6 +38,12 @@ The recorder finds streams in the same way as `xblick rerun`, and it looks again
 The recorder leaves out streams without a compressed form, such as float disparity and feature maps. It asks for
 `tf_static` at the start of every file.
 
+**ROS's `/tf_static`.** Each camera's `tf_static` also goes into the file on ROS's global topic `/tf_static`. Each
+message there holds the static transforms of every camera so far, as tf2's static broadcaster sends them. The
+channel is transient local, as `ros2 bag record` writes it. `ros2 bag play` therefore feeds tf2 from a recording,
+also a tf2 listener that starts later. `xblick play` leaves this copy out, because each camera's `tf_static` reaches
+`/tf_static` by itself.
+
 It stores each message as it arrived. ROS messages are CDR with the definition of their type, and bodies are JSON.
 Each channel keeps its Zenoh key, its encoding and the info record of its publisher. `play` can therefore serve the
 channel in the same way as the original publisher.

@@ -723,6 +723,7 @@ class Graph:
 
 
 CLOCK_TOPIC = "/clock"  # ROS's global clock, which a node with use_sim_time reads
+TF_STATIC_TOPIC = "/tf_static"  # ROS's global static transforms (tf2's static broadcaster and listener)
 TF_TOLERANCE = 1e-6     # m and quaternion units: two static transforms of one frame that differ less are the same
 
 

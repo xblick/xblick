@@ -112,6 +112,14 @@ def test_record_and_play(sessions, tmp_path):  # noqa: F811
     assert color.message_encoding == "cdr" and json.loads(color.metadata["xblick_info"])["encoding"] == "rgb8"
     assert channels[f"/{CAMERA}/gem_x/bodies"].message_encoding == "json"
     assert channels[f"/{CAMERA}/gem_x/bodies"].schema_id == 0
+    # the camera's tf_static also on ROS's /tf_static, transient local for ros2 bag play; our playback leaves it out
+    assert keys.count("tf_static") == 1
+    copy = channels["/tf_static"]
+    assert copy.metadata[recording.ROS_COPY] == "/tf_static" and "transient_local" in copy.metadata[
+        "offered_qos_profiles"]
+    copied = [m for k, m in messages if k == "tf_static"][0]
+    assert TFMessage.deserialize(copied.data).transforms[0].child_frame_id == "depth"
+    messages = [(k, m) for k, m in messages if k != "tf_static"]
 
     # played back below a prefix: found and read as the camera was (on this host from shared memory, decoded once)
     player = recording.Player(a, [path], prefix="replay", rate=1.0)
@@ -532,3 +540,30 @@ def test_rosbag2_directories_and_the_sqlite3_storage(tmp_path):
     (empty / "metadata.yaml").write_text("")
     with pytest.raises(recording.RosbagError, match="without MCAP files"):
         recording.rosbag_files(empty)
+
+
+def test_the_ros_copy_of_tf_static_holds_every_camera_and_is_not_played(sessions, tmp_path):  # noqa: F811
+    """Two cameras' tf_static: each message of the /tf_static copy holds the static transforms of both so far (the
+    last one all of them, as tf2's static broadcaster sends them). Playback serves each camera's key and its ROS copy
+    on /tf_static once, never the file's copy as well."""
+    a, b = sessions
+    one = StaticTransformPublisher(a, "robot/cam1", [transform("base", "cam1", 0.1)])
+    two = StaticTransformPublisher(a, "robot/cam2", [transform("base", "cam2", 0.2)])
+    recorder = recording.Recorder(b, tmp_path, name="static_rec", split=0, look_every=0.5)
+    recorder.record(keys=["robot/*/tf_static"])
+    time.sleep(1.0)
+    recorder.stop()
+    (path,) = recorder.files
+    for c in (one, two):
+        c.close()
+    _, messages = read(path)
+    copies = [TFMessage.deserialize(m.data) for k, m in messages if k == "tf_static"]
+    assert sorted(k for k, _ in messages if k != "tf_static") == ["robot/cam1/tf_static", "robot/cam2/tf_static"]
+    assert {t.child_frame_id for t in copies[-1].transforms} == {"cam1", "cam2"}
+    player = recording.Player(a, [path])
+    try:
+        assert "tf_static" not in player._publishers and set(player._publishers) == set(player._ros)
+        assert sum(p.topic == "/tf_static" for p in player._ros.values()) == 2  # one per camera's key, no third
+    finally:
+        player.close()
+        recorder.close()
