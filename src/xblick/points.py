@@ -388,14 +388,15 @@ class PointCloudSubscriber(Subscription):
     fixed rays, the module's text), ``"shm"`` or ``"cuda"``. ``remote``: ``"auto"`` (``"compressed"`` where every
     publisher offers it, that is where it has rays, else ``"raw"``), ``"compressed"`` or ``"raw"``.
     ``copy=False``: shm and cuda clouds are views into the ring (check ``PointCloudFrame.is_valid()``). ``"ros"``: the
-    ROS 2 topic ``/<base>/cloud`` (sensor_msgs/PointCloud2) of a ROS publisher, for a session in ROS 2."""
+    ROS 2 topic ``/<base>/cloud`` (sensor_msgs/PointCloud2) of a ROS publisher, for a session in ROS 2. A ``base``
+    with a leading ``/`` is a ROS 2 PointCloud2 topic of any name (``/points``), read with ``auto``, ``ros`` or
+    ``raw`` (Subscription)."""
 
     KIND = "points"
     TRANSPORTS = {"raw": topics.cloud, "shm": topics.cloud_shm, "cuda": topics.cloud_cuda,
                   "compressed": topics.cloud_compressed, ROS: topics.cloud}
     TYPES = {"raw": PointCloud2, "shm": ShmPointCloud2, "cuda": CudaPointCloud2, "compressed": CompressedPointCloud2,
              ROS: PointCloud2}
-    ROS_TOPICS = {"points": (topics.cloud, PointCloud2)}
     REMOTE = ("raw", "compressed")
     RAYS_TIMEOUT_S = 5.0
 
@@ -406,6 +407,9 @@ class PointCloudSubscriber(Subscription):
         self._remote_auto = remote == "auto"
         self._rays: tuple[str, np.ndarray] | None = None
         super().__init__(session, base, transport, local, "raw" if self._remote_auto else remote, copy, max_hz, device)
+
+    def _forms(self) -> dict:
+        return {ROS: (self.base if self.ros_topic else ros.topic_of(topics.cloud(self.base)), PointCloud2)}
 
     def _choice(self, records: list[dict]):
         if self._remote_auto:  # compressed where every source has rays; a relay's record names no network form

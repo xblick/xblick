@@ -618,10 +618,15 @@ class _Latest:
             return self._sample
 
 
-ROS = "ros"  # a transport: the stream's ROS 2 topic (/<base>/image_raw, /<base>/cloud), for a session with --ros
+ROS = "ros"  # a transport: a ROS 2 topic (a ROS name, or ours: /<base>/image_raw, /<base>/cloud), for a session in ROS 2
+# the transport of image_transport's compressed topic (<image topic>/compressed) of a ROS name, or the one auto takes
+# when a ROS publisher offers only that
+ROS_COMPRESSED = "ros_compressed"
+ROS_FORMS = (ROS, ROS_COMPRESSED)
 TRANSPORTS = {"compressed": topics.compressed, "raw": topics.image_raw, "shm": topics.shm, "cuda": topics.cuda,
               ROS: topics.image_raw}
-_TYPES = {"compressed": CompressedImage, "raw": Image, "shm": ShmImage, "cuda": CudaImageMsg, ROS: Image}
+_TYPES = {"compressed": CompressedImage, "raw": Image, "shm": ShmImage, "cuda": CudaImageMsg, ROS: Image,
+          ROS_COMPRESSED: CompressedImage}
 AUTO = "auto"
 # how long a subscription that changes its transport keeps the old one for the new one's first frame; after that, as
 # long again the new route's samples are compared with the newest frame kept (_Latest), and a stamp at most as far
@@ -629,10 +634,11 @@ AUTO = "auto"
 HANDOVER_S = 2.0
 HANDOVER_NS = int(HANDOVER_S * 1_000_000_000)  # the window in stamp time, an integer as C++'s
 WAIT_HINT_S = 5.0  # a subscription that has no publisher this long says once what may be wrong
+ROS_RECHECK_S = 1.0  # auto on a ROS name looks at ROS's graph this often besides when its listener tells it
 SETTLE_ROUNDS = 3  # info queries after a publisher came or went (its queryable can be known later than its token)
 # what a subscriber reads, for its start line: where the frames are (host or GPU memory) or how they come
 READS = {"shm": "the host ring", "cuda": "the CUDA ring", "compressed": "compressed frames over Zenoh",
-         "raw": "raw frames over Zenoh", ROS: "the ROS 2 topic"}
+         "raw": "raw frames over Zenoh", ROS: "the ROS 2 topic", ROS_COMPRESSED: "the ROS 2 compressed topic"}
 LOCAL = ("auto", "shm", "cuda")
 REMOTE = ("compressed", "raw")
 
@@ -946,27 +952,46 @@ class Subscription:
     it hands out only grow, except after a restart of the stream: no frame twice, none out of order (``_Latest`` names
     the other exceptions, and where frames are lost). Subclasses say what their transports are and decode the
     samples. ``max_hz``: at most so many frames a second (MaxRate), the others skipped before they are decoded or read
-    from their ring and counted in ``skipped_max_hz``; None: every frame."""
+    from their ring and counted in ``skipped_max_hz``; None: every frame.
+
+    ``base`` with a leading ``/`` is a ROS 2 topic as ROS's tools write it (``/image_raw``, ``/resize/image``, a
+    cloud's ``/points``), read from ROS publishers (``ros_topic``; a session in ROS 2): ``auto`` takes the form its
+    publishers offer (``ros_forms``: the topic itself, else image_transport's compressed topic of an image topic),
+    ``ros`` and ``raw`` the topic itself, ``compressed`` image_transport's compressed topic. After WAIT_HINT_S
+    without a sample of a ROS form, ROS's graph is looked at: a topic of another type, or a name that is no topic but
+    has image topics below it, is an error (a ValueError naming them), raised by ``latest``; nothing is chosen in
+    its place."""
 
     KIND = ""
     TRANSPORTS: dict = {}  # transport -> topic function
     TYPES: dict = {}  # transport -> message type
     REMOTE: tuple = ()
-    ROS_TOPICS: dict = {}  # kind -> (topic function, message type) of transport ros
 
     def __init__(self, session: zenoh.Session, base: str, transport: str, local: str, remote: str, copy: bool,
                  max_hz: float | None = None, device=None):
         if transport not in self.TRANSPORTS and transport != AUTO:
             raise ValueError(f"transport {transport!r}: auto or one of {', '.join(self.TRANSPORTS)}")
-        if transport == ROS and getattr(session, "ros", None) is None:
+        self.ros_topic = ros.is_topic(base)
+        if self.ros_topic:
+            if getattr(session, "ros", None) is None:
+                raise ValueError(f"{base}: a ROS 2 topic (a leading /); reading it needs {ros.NEEDS_ROS}")
+            transport = self._ros_transport(ros.check_ros_name(base), transport)
+        elif transport == ROS and getattr(session, "ros", None) is None:
             raise ValueError(f"transport ros reads the stream's ROS 2 topic: it needs {ros.NEEDS_ROS}")
         if local not in LOCAL:
             raise ValueError(f"local {local!r}: one of {', '.join(LOCAL)}")
         if remote not in self.REMOTE:
             raise ValueError(f"remote {remote!r}: one of {', '.join(self.REMOTE)}")
-        if not copy and (transport in self.REMOTE or transport == ROS):
+        if not copy and (transport in self.REMOTE or transport in ROS_FORMS):
             raise ValueError("copy=False is for the shm and cuda transports (and auto)")
-        self.base = topics.check_name(base)
+        self.base = base if self.ros_topic else topics.check_name(base)
+        self._ros_forms_error: Exception | None = None
+        try:
+            self.ros_forms = self._forms() if getattr(session, "ros", None) is not None else {}
+        except ros.RosError as error:  # a base that is no ROS name ("-" in it): no ROS form
+            self.ros_forms, self._ros_forms_error = {}, error
+        if transport in ROS_FORMS and transport not in self.ros_forms:
+            raise self._ros_forms_error or ValueError(f"{self.base}: no ROS form {transport}")
         self.requested = transport
         self.local = local
         # the GPU it works on (local auto: the CUDA ring if it is on it); None or "cpu": the CPU, so auto takes shm
@@ -997,13 +1022,37 @@ class Subscription:
         self._alive = None
         self._chooser = None
         self._want = None  # the liveliness token that asks this host's relay for the stream (_tell_relay)
+        self._started = time.monotonic()
+        self._ros_checked = False  # the graph looked at, once, for a ROS form that brought nothing (_check_ros)
+        self._graph = None  # ROS's graph, listened to by auto for a ROS name
+        if self.ros_forms and (self.ros_topic or transport in ROS_FORMS):
+            self._graph = session.ros.graph  # made now, so that it knows the publishers when it is asked
         if transport == AUTO:
-            self._alive = session.liveliness().declare_subscriber(topics.alive_all(self.base),
-                                                                  lambda sample: self._recheck.set(), history=True)
+            if self.ros_topic:
+                self._graph.listen(self._recheck.set)
+            else:
+                self._alive = session.liveliness().declare_subscriber(topics.alive_all(self.base),
+                                                                      lambda sample: self._recheck.set(), history=True)
             self._chooser = threading.Thread(target=self._choose, name=f"xblick-auto {self.base}", daemon=True)
             self._chooser.start()
         else:
             self._use(transport)
+
+    def _ros_transport(self, topic: str, transport: str) -> str:
+        """The transport of a ROS name (``ros_topic``): auto, ros for ``ros`` and ``raw`` (the topic itself),
+        ROS_COMPRESSED for ``compressed`` (image_transport's compressed topic, if the kind has one)."""
+        if transport in (ROS, "raw"):
+            return ROS
+        if transport == AUTO:
+            return AUTO
+        if transport == "compressed" and ROS_COMPRESSED in self.TYPES:
+            return ROS_COMPRESSED
+        kinds = "auto, ros, raw" + (" or compressed" if ROS_COMPRESSED in self.TYPES else "")
+        raise ValueError(f"{topic} is a ROS 2 topic: transport {kinds}, not {transport}")
+
+    def _forms(self) -> dict:
+        """ROS form -> (topic, message type), in the order auto takes them (``ros_forms``). Subclasses."""
+        return {}
 
     def keep_recent(self, n: int, on_put=None):
         """Keep the last ``n`` samples as they came (not decoded) for ``at``, a partner stream's frames taken at the
@@ -1058,13 +1107,14 @@ class Subscription:
             route = self._route
             old = self._subscriber
             latest.move(route)
-            if transport == ROS:
-                self._subscriber = self._ros_subscriber(latest, route)
+            if transport in ROS_FORMS:
+                self._subscriber = self._ros_subscriber(transport, latest, route)
             else:
                 self._subscriber = self._session.declare_subscriber(
                     self._key(transport, gpu), lambda sample: latest.put(sample, transport, route))
             self.transport, self._using = transport, (transport, gpu)
             self._chosen.set()
+        self._used(transport)
         if old is None:
             return
         end = time.monotonic() + HANDOVER_S
@@ -1074,15 +1124,61 @@ class Subscription:
         latest.leave_old()
         _undeclare(old)
 
-    def _ros_subscriber(self, latest: _Latest, route: int):
-        """The ROS 2 subscription of transport ``ros`` (``ROS_TOPICS``): its samples as ours of TYPES["ros"],
-        without our attachment (no seq, source or publish time)."""
-        topic_of_key, message_type = self.ROS_TOPICS[self.KIND]
-        topic = ros.topic_of(topic_of_key(self.base))
+    def _used(self, transport: str):
+        """Called after the subscription took ``transport`` (ImageSubscriber: its camera_info follows)."""
+
+    def _ros_subscriber(self, transport: str, latest: _Latest, route: int):
+        """The ROS 2 subscription of a ROS form (``ros_forms``): its samples as ours of TYPES[transport], without our
+        attachment (no seq, source or publish time)."""
+        topic, message_type = self.ros_forms[transport]
         return self._session.ros.node.subscriber(
             topic, message_type.TYPE,
             lambda payload, seq, stamp, publisher: latest.offer((payload, None, topic, time.time_ns(),
-                                                                 message_type.ENCODING, ROS), route))
+                                                                 message_type.ENCODING, transport), route))
+
+    def _ros_choice(self, foreign_only: bool = False) -> str | None:
+        """The first ROS form (``ros_forms``) that a ROS publisher offers now, of the form's type; None without one.
+        ``foreign_only``: publishers of other programs than ours (Graph.by_xblick): the ROS copies of a stream of
+        ours are never read in place of its own forms."""
+        for form, (topic, message_type) in self.ros_forms.items():
+            for token in self._graph.publishers(topic):
+                if token.type_name == message_type.TYPE and not (foreign_only and self._graph.by_xblick(token.zid)):
+                    return form
+        return None
+
+    def _check_ros(self):
+        """Once, WAIT_HINT_S after the start without a sample, for a subscription that reads or looks for a ROS form:
+        a ROS publisher of its topic with another type is a ProtocolError, a ROS name that is no topic but has topics
+        of the kind below it a ValueError naming them (both kept and raised by ``latest``); else one line that it
+        waits."""
+        if (self._ros_checked or self._latest.received or not self.ros_forms
+                or time.monotonic() - self._started < WAIT_HINT_S):
+            return
+        if not (self.ros_topic or self.transport in ROS_FORMS):
+            return
+        self._ros_checked = True
+        forms = ({self.transport: self.ros_forms[self.transport]} if self.transport in ROS_FORMS
+                 else self.ros_forms)
+        kinds = {m.TYPE for _, m in self.ros_forms.values()}
+        for topic, message_type in forms.values():
+            other = sorted({t.type_name for t in self._graph.publishers(topic)} - {message_type.TYPE})
+            if other:
+                hint = ""
+                if other == [ros.COMPRESSED_TYPE] and topic.endswith("/" + ros.COMPRESSED):
+                    hint = (f": image_transport's compressed topic of {topic.rpartition('/')[0]}, which transport "
+                            "compressed reads")
+                self._error = ProtocolError(f"{topic}: its ROS publishers send {', '.join(other)}, this subscriber "
+                                            f"reads {message_type.TYPE}{hint}")
+                raise self._error
+        if self.ros_topic and not any(self._graph.publishers(t) for t, _ in self.ros_forms.values()):
+            below = sorted({t.topic for t in self._graph.publishers() if t.type_name in kinds
+                            and t.topic.startswith(self.base + "/")})
+            if below:
+                self._error = ValueError(f"{self.base}: no ROS topic of this name, and these are below it: "
+                                         f"{', '.join(below)}; name one of them")
+                raise self._error
+        log.info(f"{self.base}: no ROS publisher of {' or '.join(t for t, _ in forms.values())} within "
+                 f"{WAIT_HINT_S:g} s, waiting for one")
 
     def _choice(self, records: list[dict]) -> tuple[str, str, str, bool]:
         """(transport, gpu, why, local) for the publishers that answered ``<base>/info``."""
@@ -1129,6 +1225,10 @@ class Subscription:
                 self._recheck.clear()
                 if self._closed.is_set():  # after the clear: close() sets closed, then recheck
                     break
+                if self.ros_topic:  # a ROS name: ROS's publishers only, told by the graph's listener
+                    self._choose_ros()
+                    self._recheck.wait(ROS_RECHECK_S)
+                    continue
                 records = query_info(self._session, self.base)
                 if not records and not self._closed.is_set():
                     self._check_not_below_a_stream()
@@ -1158,6 +1258,20 @@ class Subscription:
         except BaseException as error:  # noqa: BLE001 - raised in the caller's thread by latest()
             self._error = error
             self._chosen.set()
+
+    def _choose_ros(self, foreign_only: bool = False, why: str = "") -> bool:
+        """Takes the ROS form a ROS publisher offers (``_ros_choice``) when it is not the one in use. True when one is
+        offered."""
+        chosen = self._ros_choice(foreign_only)
+        if chosen is None:
+            return False
+        if (chosen, topics.ANY_GPU) != self._using:
+            before = self.transport_reason
+            self.transport_reason = f"{chosen} ({why or 'a ROS publisher'})"
+            log.info(f"{self.base}: ROS publisher found, reading {READS[chosen]} {self.ros_forms[chosen][0]}"
+                     + (f" (was {before})" if before else ""))
+            self._use(chosen)
+        return True
 
     def _check_not_below_a_stream(self):
         """While no publisher answers the stream: StreamGivenAsCamera when the name before its last part answers as a
@@ -1208,6 +1322,8 @@ class Subscription:
         if self._error is not None:
             return f"failed: {self._error}"
         if self.transport is None:
+            if self.ros_topic:
+                return f"no ROS publisher of {self.base} yet"
             return f"no publisher answers {topics.info(self.base)} yet"
         n = self.received
         limit = f", at most {self.max_rate.hz:g} Hz ({self.skipped_max_hz} skipped)" if self.max_rate else ""
@@ -1224,6 +1340,9 @@ class Subscription:
         """(payload, meta, key, receive_ns, transport) of the newest sample, its type checked; None if there is
         none."""
         start = time.monotonic()
+        if self._error is not None:
+            raise self._error
+        self._check_ros()
         if not self._chosen.wait(timeout if timeout is not None else 0.0):
             return None
         if self._error is not None:
@@ -1309,6 +1428,8 @@ class Subscription:
             self._want = None
         if self._alive is not None:
             self._alive.undeclare()
+        if self._graph is not None:
+            self._graph.unlisten(self._recheck.set)
         with self._lock:
             if self._subscriber is not None:
                 _undeclare(self._subscriber)
@@ -1328,32 +1449,67 @@ class ImageSubscriber(Subscription):
       (``transport`` says which, None until then) and again when the publisher shows up on another host.
     * ``"compressed"`` (JPEG, PNG or RVL), ``"raw"`` (sensor_msgs/Image), ``"shm"`` (host ring, same host only) or ``"cuda"``
       (CUDA ring, same host only; frames are gpu.CudaImage) to choose it yourself.
-    * ``"ros"``: the ROS 2 topic ``/<base>/image_raw`` (sensor_msgs/Image) of a ROS publisher, for a session with
-      ``--ros``; with ``camera_info`` its ``/<base>/camera_info``. Its frames carry no seq, source or publish time.
+    * ``"ros"``: the ROS 2 topic ``/<base>/image_raw`` (sensor_msgs/Image) of a ROS publisher, for a session in ROS 2;
+      with ``camera_info`` its ``/<base>/camera_info``. Its frames carry no seq, source or publish time.
+
+    A ``base`` with a leading ``/`` is a ROS 2 image topic of any name, as ROS publishes it (``/image_raw``,
+    ``/resize/image``; Subscription): ``auto`` reads the topic, or image_transport's compressed topic
+    ``<topic>/compressed`` where a publisher offers only that; ``ros`` or ``raw`` the topic, ``compressed`` the
+    compressed one. Its camera_info is ROS's convention, ``camera_info`` beside the image topic (``/resize/image`` ->
+    ``/resize/camera_info``), or the topic ``camera_info`` names.
 
     With ``copy=False`` the shm and cuda transports hand out views into the ring instead of copies: check
     ``Frame.is_valid()`` after using one. With ``camera_info=True`` the stream's CameraInfo is received as well
-    (``camera_info``: the newest one). ``max_hz``: at most so many frames a second, the newest (Subscription)."""
+    (``camera_info``: the newest one); a ROS topic (``/cam/info``) as ``camera_info`` reads that one while a ROS form
+    is read. ``max_hz``: at most so many frames a second, the newest (Subscription)."""
 
     KIND = "image"
     TRANSPORTS = TRANSPORTS
     TYPES = _TYPES
     REMOTE = REMOTE
-    ROS_TOPICS = {"image": (topics.image_raw, Image)}
 
-    def __init__(self, session: zenoh.Session, base: str, transport: str = "compressed", camera_info: bool = False,
-                 copy: bool = True, remote: str = "compressed", local: str = "auto", max_hz: float | None = None,
-                 device=None):
-        super().__init__(session, base, transport, local, remote, copy, max_hz, device)
+    def __init__(self, session: zenoh.Session, base: str, transport: str = "compressed",
+                 camera_info: bool | str = False, copy: bool = True, remote: str = "compressed", local: str = "auto",
+                 max_hz: float | None = None, device=None):
+        if isinstance(camera_info, str):
+            ros.check_ros_name(camera_info, "camera_info topic")
+            if not (ros.is_topic(base) or transport in (ROS, AUTO)):
+                raise ValueError(f"camera_info {camera_info}: a ROS topic, for a ROS form (a base with a leading /, "
+                                 f"transport ros or auto), not transport {transport}")
         self._info_latest = _Latest() if camera_info else None
-        self._info_subscriber = None
-        if camera_info and transport == ROS:
-            topic = ros.topic_of(topics.camera_info(self.base))
-            self._info_subscriber = session.ros.node.subscriber(
-                topic, CameraInfo.TYPE, lambda payload, *_: self._info_latest.offer(
-                    (payload, None, topic, time.time_ns(), CameraInfo.ENCODING, ROS)))
-        elif camera_info:
+        self._info_named = camera_info if isinstance(camera_info, str) else None
+        self._info_lock = threading.Lock()
+        self._info_subscriber = None  # our key's
+        self._ros_info = None  # a ROS form's, while one is read (_used)
+        self._info_hinted = False
+        super().__init__(session, base, transport, local, remote, copy, max_hz, device)
+        if camera_info and not self.ros_topic and transport != ROS:
             self._info_subscriber = session.declare_subscriber(topics.camera_info(self.base), self._info_latest.put)
+
+    def _forms(self) -> dict:
+        image = self.base if self.ros_topic else ros.topic_of(topics.image_raw(self.base))
+        return {ROS: (image, Image), ROS_COMPRESSED: (ros.compressed_topic(image), CompressedImage)}
+
+    def info_topic(self) -> str | None:
+        """The ROS topic of the camera_info read with a ROS form: the one named, else image_transport's beside the
+        image topic; None without camera_info or a ROS form."""
+        if self._info_latest is None or not self.ros_forms:
+            return None
+        return self._info_named or ros.camera_info_topic(self.ros_forms[ROS][0])
+
+    def _used(self, transport: str):
+        """A ROS form taken: its camera_info read from ROS too (``info_topic``); our form taken: no longer."""
+        if self._info_latest is None:
+            return
+        with self._info_lock:
+            if transport in ROS_FORMS and self._ros_info is None:
+                topic = self.info_topic()
+                self._ros_info = self._session.ros.node.subscriber(
+                    topic, CameraInfo.TYPE, lambda payload, *_: self._info_latest.offer(
+                        (payload, None, topic, time.time_ns(), CameraInfo.ENCODING, ROS)))
+            elif transport not in ROS_FORMS and self._ros_info is not None:
+                self._ros_info.close()
+                self._ros_info = None
 
     def latest(self, consume: bool = True, timeout: float | None = None) -> Frame | None:
         """The newest frame; with ``consume`` each frame is returned once (None until the next arrives). With a
@@ -1371,7 +1527,7 @@ class ImageSubscriber(Subscription):
 
     def _frame(self, payload, meta, key, receive_ns, transport) -> Frame | None:
         valid = None
-        if transport == "compressed":
+        if transport in ("compressed", ROS_COMPRESSED):
             message = CompressedImage.deserialize(payload)
             image, encoding = decompress(message)
         elif transport in ("raw", ROS):
@@ -1408,12 +1564,31 @@ class ImageSubscriber(Subscription):
             raise RuntimeError("this subscriber was created without camera_info=True")
         item = self._info_latest.take(consume=False, timeout=None)
         if item is None:
+            self._hint_info()
             return None
         _check_encoding(item[2], item[4], CameraInfo)
         return CameraInfo.deserialize(item[0])
 
+    def _hint_info(self):
+        """Once, while a ROS form is read and frames came for WAIT_HINT_S but no camera_info: one line naming the
+        CameraInfo topics in ROS's graph (none is taken in its place)."""
+        if (self._info_hinted or self._ros_info is None or not self.received
+                or time.monotonic() - self._started < WAIT_HINT_S):
+            return
+        self._info_hinted = True
+        topic = self.info_topic()
+        others = sorted({t.topic for t in self._graph.publishers() if t.type_name == ros.CAMERA_INFO_TYPE} - {topic})
+        log.warning(f"{self.base}: frames, but no CameraInfo on {topic}"
+                    + ("" if self._info_named else " (ROS's convention: camera_info beside the image topic)")
+                    + (f"; CameraInfo topics in ROS's graph: {', '.join(others)}; name one (camera_info=TOPIC)"
+                       if others else "; ROS's graph has no other CameraInfo topic"))
+
     def close(self):
         super().close()
         if self._info_subscriber is not None:
-            self._info_subscriber.close() if isinstance(self._info_subscriber, ros.RosSubscriber) \
-                else self._info_subscriber.undeclare()
+            self._info_subscriber.undeclare()
+            self._info_subscriber = None
+        with self._info_lock:
+            if self._ros_info is not None:
+                self._ros_info.close()
+                self._ros_info = None

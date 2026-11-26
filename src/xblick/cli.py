@@ -39,9 +39,10 @@ from pathlib import Path
 
 import numpy as np
 
-from . import cam, clean, diagnostics, mps, poses, recording, rerun_bridge, router, survey, topics, view
+from . import cam, clean, diagnostics, mps, poses, recording, rerun_bridge, ros, router, survey, topics, view
 from . import session as zsession
-from .camera import CameraPublisher, ImageSubscriber, StaticTransformPublisher, find_streams, wait_for_info
+from .camera import (CameraPublisher, ImageSubscriber, ProtocolError, StaticTransformPublisher, find_streams,
+                     wait_for_info)
 from .node import end_on_signals
 from .paths import expand_path
 from .points import PointCloudSubscriber
@@ -86,9 +87,23 @@ def _list_streams(args) -> int:
 
 
 def _is_cloud(z, base: str) -> bool:
-    """True if the stream's publisher says it is a point cloud stream (a stream that does not answer is taken as
-    images; its subscriber refuses it later if it is not)."""
+    """True if the stream's publisher says it is a point cloud stream, or a ROS topic's publishers send
+    sensor_msgs/PointCloud2 (a stream that does not answer is taken as images; its subscriber refuses it later if it is
+    not)."""
+    if ros.is_topic(base):
+        return z.ros is not None and _ros_types(z, base) == {ros.CLOUD_TYPE}
     return any(r.get("kind") == "points" for r in wait_for_info(z, base))
+
+
+def _ros_types(z, topic: str, timeout: float = 2.0) -> set[str]:
+    """The types the ROS publishers of ``topic`` send, asked until one answers or ``timeout`` passed (a session just
+    opened knows none yet)."""
+    end = time.monotonic() + timeout
+    while True:
+        found = {t.type_name for t in ros.publishers(z, min(0.5, max(end - time.monotonic(), 0.05)), topic)}
+        if found or time.monotonic() >= end:
+            return found
+        time.sleep(0.1)
 
 
 def _hz(args) -> int:
@@ -718,7 +733,8 @@ def build_parser(prog: str = "xblick") -> argparse.ArgumentParser:
     for name, run, help_text in (("hz", _hz, "rate and latency of a camera stream"),
                                  ("snapshot", _snapshot, "save the next frame of a camera stream")):
         p = commands.add_parser(name, help=help_text)
-        p.add_argument("stream", help="stream base, e.g. test/camera/color")
+        p.add_argument("stream", help="stream base, e.g. test/camera/color, or a ROS 2 topic with its leading /, e.g. "
+                                      "/image_raw or /resize/image (an image or point cloud topic of any name)")
         if name == "snapshot":
             p.add_argument("output", help="image file (PNG keeps 16-bit depth)")
             p.add_argument("--timeout", type=float, default=5.0)
@@ -726,7 +742,9 @@ def build_parser(prog: str = "xblick") -> argparse.ArgumentParser:
             p.add_argument("--seconds", type=float, default=0.0, help="stop after this time (default: never)")
         p.add_argument("--transport", choices=("auto", "compressed", "raw", "shm", "ros"), default="auto",
                        help="auto: shared memory on the publisher's host, else compressed; ros: the "
-                            "stream's ROS 2 image topic /<stream>/image_raw")
+                            "stream's ROS 2 image topic /<stream>/image_raw. A ROS topic: auto (the topic, or "
+                            "<topic>/compressed when a publisher offers only that), ros or raw (the topic), "
+                            "compressed (<topic>/compressed)")
         zsession.add_arguments(p)
         p.set_defaults(run=run)
 
@@ -1037,6 +1055,11 @@ def main(argv=None) -> int:
     try:
         return args.run(args)
     except (TimeoutError, zsession.NoAnswer) as error:  # did not answer, or a command sent once: one line
+        print(f"{prog} {args.command}: {error}", file=sys.stderr)
+        return 1
+    except (ValueError, ProtocolError) as error:
+        if args.command not in ("hz", "snapshot"):  # a name or a stream that does not fit there: one line
+            raise
         print(f"{prog} {args.command}: {error}", file=sys.stderr)
         return 1
     except RuntimeError as error:

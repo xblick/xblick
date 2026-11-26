@@ -91,16 +91,18 @@ queries the info records and subscribes to nothing.
 ### `xblick hz <stream>`
 
 Subscribes to an image or point cloud stream. Prints the rate, the age at send and at receive, and the missing
-frames.
+frames. A `<stream>` with a leading `/` is a ROS 2 topic of any name, such as `/image_raw` or `/resize/image`. Its
+type in ROS's graph decides between images and point clouds.
 
 | Option | Meaning |
 | --- | --- |
-| `--transport auto\|compressed\|raw\|shm\|ros` | the transport to measure. `ros` reads the ROS 2 topic `/<stream>/image_raw` of a ROS camera. |
+| `--transport auto\|compressed\|raw\|shm\|ros` | the transport to measure. `ros` reads the ROS 2 topic `/<stream>/image_raw` of a ROS camera. For a ROS topic `/T`: `auto` reads `/T`, or `/T/compressed` when only that is published. `ros` and `raw` read `/T`, `compressed` reads `/T/compressed`. |
 | `--seconds S` | stop after this time |
 
 ### `xblick snapshot <stream> <file>`
 
-Saves one frame as an image file. PNG keeps 16-bit depth. Options: `--transport`, `--timeout`.
+Saves one frame as an image file. PNG keeps 16-bit depth. Options: `--transport`, `--timeout`. A `<stream>` with a
+leading `/` is a ROS 2 image topic, as for `xblick hz`.
 
 ### `xblick diagnostics [prefix]`
 
