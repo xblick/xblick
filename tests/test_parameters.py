@@ -342,7 +342,7 @@ def test_a_nodes_options_as_parameters():
     # every option but argparse's, the parameters' own and the connection's; the ROS options too (read-only: they
     # say whether and how the node takes part in ROS 2)
     assert set(names) == {"camera", "threshold", "words", "checkpoint", "gpu", "mode", "out", "no_depth", "max_hz",
-                          "ros", "ros_domain", "ros_node", "ros_params_writable"}
+                          "ros", "no_ros", "ros_domain", "ros_node", "ros_params_writable", "ros_clock"}
     assert params["ros"] is False and params.descriptor("ros").read_only
     # a value given at the start reaches args, with the option's type
     assert (args.gpu, args.threshold, args.checkpoint, args.out) == (3, 0.7, "/w.pt", Path("/tmp/out"))

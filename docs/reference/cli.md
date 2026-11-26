@@ -36,19 +36,25 @@ result (`no stream answered`, `nothing received`, `no publisher answers`) then n
 
 ## ROS 2 options
 
-Every command and every node that opens its session with `session.open_from_args` accepts these options. Without
-`--ros` no command sends anything for ROS 2. [Durchblick and ROS 2](../integrations/ros2.md) explains what takes part.
+Every command and every node that opens its session with `session.open_from_args` takes part in ROS 2 by default and
+accepts these options. [Durchblick and ROS 2](../integrations/ros2.md) explains what takes part.
 
 | Option | Meaning |
 | --- | --- |
-| `--ros` | Take part in ROS 2 (rmw_zenoh, ROS 2 Jazzy) as well. The program is a ROS node, and its streams, results, transforms and parameters also appear on ROS's keys. Our keys stay as they are. |
-| `--ros-domain ID` | The ROS domain id. The default is `ROS_DOMAIN_ID`, else 0. Only with `--ros`. |
-| `--ros-node NAME` | The program's ROS node name. The default is the program's name with every character other than a letter, digit or `_` written as `_`, such as `xblick_cam`. Only with `--ros`. |
-| `--ros-params-writable` | ROS clients may set the program's parameters. Without it the ROS parameter services answer reads only and refuse sets. A ROS set is unchecked and uncounted: two nodes of one name both execute it, and the ROS client shows one success. Only with `--ros`. |
+| `--no-ros` | Take no part in ROS 2. The program is no ROS node and sends nothing on ROS's keys. |
+| `--ros` | Accepted and does nothing. ROS 2 is on by default. |
+| `--ros-domain ID` | The ROS domain id. The default is `ROS_DOMAIN_ID`, else 0. |
+| `--ros-node NAME` | The program's ROS node, as `NAME` or `/namespace/NAME`. The default is the name of the program's parameters, such as `/test/camera/yolox`. A program without parameters takes its own name in the namespace of its `--camera`, such as `/test/camera/xblick_test_camera`. Every character other than a letter, digit or `_` is written as `_`. |
+| `--ros-params-writable` | ROS clients may set the program's parameters. Without it the ROS parameter services answer reads only and refuse sets. A ROS set is unchecked and uncounted: two nodes of one name both execute it, and the ROS client shows one success. |
+| `--ros-clock KEY` | The program's clock key `KEY` (`rosgraph_msgs/Clock`, such as `sim/clock`) goes to ROS's global `/clock` instead of `/KEY`. ROS nodes with `use_sim_time` read it. The default is no key. |
 
-A node also declares the four options as read-only parameters `ros`, `ros_domain`, `ros_node` and
-`ros_params_writable`. With `--ros` a
-program prints one line at the start with its ROS node and domain.
+| Variable | Meaning |
+| --- | --- |
+| `XBLICK_ROS` | `0`: no part in ROS 2, as `--no-ros`. `1` or unset: a part. Any other value ends the program with one line. |
+
+`--ros-domain`, `--ros-node`, `--ros-params-writable` and `--ros-clock` end the program with one line while ROS 2 is
+off. A node also declares these options as read-only parameters. A program prints one line at the start with its ROS
+node and domain. It prints a second line when it takes the name of its parameters.
 
 A client whose `--connect` endpoints do not answer ends with one line and exit code 1. The line names the endpoints
 and says that a client needs its router there. In our tests Zenoh gave up within 10 s. Another error at the start of a
@@ -89,7 +95,7 @@ frames.
 
 | Option | Meaning |
 | --- | --- |
-| `--transport auto\|compressed\|raw\|shm\|ros` | the transport to measure. `ros` (with `--ros`) reads the ROS 2 topic `/<stream>/image_raw` of a ROS camera. |
+| `--transport auto\|compressed\|raw\|shm\|ros` | the transport to measure. `ros` reads the ROS 2 topic `/<stream>/image_raw` of a ROS camera. |
 | `--seconds S` | stop after this time |
 
 ### `xblick snapshot <stream> <file>`
@@ -186,7 +192,7 @@ Publishes a moving test pattern on `test/camera/color`.
 | `--fps` | 15 |
 | `--camera-info FILE` | none: a ROS calibration file of `--size`, read as by `xblick cam` |
 | `--hfov`, `--vfov` | without `--camera-info`: the field of view of the pinhole camera. With none of the three: an assumed vertical field of view of 60 degrees, said in the start line. |
-| `--frame-id` | `TestCamera`: the frame id of the images. With `--pose` the body frame's, and the images are in `<ID>_optical`. |
+| `--frame-id` | the frame id of the images. The default is the stream's name with `/` written as `_`, such as `test_camera_color`, so that every test camera has frames of its own. With `--pose` the body frame's, and the images are in `<ID>_optical`. |
 | `--pose X Y Z YAW PITCH ROLL` | none: the camera's fixed pose in the room, as `xblick cam --pose` |
 | `--cuda-device N` | none: the frames also in a CUDA ring on GPU `N`, as `xblick cam --cuda-device` |
 
@@ -212,7 +218,7 @@ Reads and changes the parameters of a node. See [parameters](parameters.md).
 | `--atomically` | with `--set`: change all or none |
 | `--dump FILE` | write the parameters as a ROS params file |
 | `--timeout S` | how long to wait for the node |
-| `--via-ros` | with `--ros`: the parameters of the ROS node `/<--node>` through ROS 2's keys, such as `--node talker`. A set carries no node and no deadline, because ROS has neither. |
+| `--via-ros` | the parameters of the ROS node `/<--node>` through ROS 2's keys, such as `--node talker`. A set carries no node and no deadline, because ROS has neither. |
 
 ## Record and play
 

@@ -35,7 +35,7 @@ class RobotStatePublisher:
         self.source = source
         self._session = session
         self._joint_states = self._publisher(topics.joint_states(robot), JointState)
-        self._tf = self._publisher(topics.tf(robot), TFMessage, ros_tf=True)  # with --ros: ROS's /tf
+        self._tf = self._publisher(topics.tf(robot), TFMessage, ros_tf=True)  # in ROS 2: ROS's /tf
         self._odom = self._publisher(topics.odom(robot), Odometry)
         self._wrenches: dict[str, CountedPublisher] = {}
 

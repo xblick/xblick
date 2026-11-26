@@ -158,7 +158,7 @@ class PointCloudPublisher:
     and slower). ``set_rays()`` changes them (a camera back with another size). Every cloud is checked against its
     rays: one that does not lie on them raises ValueError.
 
-    A session with ``--ros`` also offers the clouds to ROS 2 as sensor_msgs/PointCloud2 on ``/<base>/cloud``, the
+    A session in ROS 2 also offers the clouds to ROS 2 as sensor_msgs/PointCloud2 on ``/<base>/cloud``, the
     plain cloud whatever forms our readers take, while a ROS subscriber is there."""
 
     def __init__(self, session: zenoh.Session, base: str, *, fields: list, point_step: int, frame_id: str,
@@ -388,7 +388,7 @@ class PointCloudSubscriber(Subscription):
     fixed rays, the module's text), ``"shm"`` or ``"cuda"``. ``remote``: ``"auto"`` (``"compressed"`` where every
     publisher offers it, that is where it has rays, else ``"raw"``), ``"compressed"`` or ``"raw"``.
     ``copy=False``: shm and cuda clouds are views into the ring (check ``PointCloudFrame.is_valid()``). ``"ros"``: the
-    ROS 2 topic ``/<base>/cloud`` (sensor_msgs/PointCloud2) of a ROS publisher, for a session with ``--ros``."""
+    ROS 2 topic ``/<base>/cloud`` (sensor_msgs/PointCloud2) of a ROS publisher, for a session in ROS 2."""
 
     KIND = "points"
     TRANSPORTS = {"raw": topics.cloud, "shm": topics.cloud_shm, "cuda": topics.cloud_cuda,

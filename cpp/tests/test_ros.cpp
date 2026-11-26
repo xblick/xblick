@@ -190,15 +190,40 @@ int main()
     refused([] { ros::domain_from(std::nullopt); }, "ROS_DOMAIN_ID=abc");
     ::unsetenv(ros::kDomainEnv);
 
-    // the option family's rules
-    refused([] { ros::options_from(false, 3, std::nullopt, false, "p"); }, "--ros-domain without --ros");
-    refused([] { ros::options_from(false, std::nullopt, "n", false, "p"); }, "--ros-node without --ros");
-    refused([] { ros::options_from(false, std::nullopt, std::nullopt, true, "p"); },
-            "--ros-params-writable without --ros");
-    check(not ros::options_from(false, std::nullopt, std::nullopt, false, "p"), "no --ros: none");
-    const auto o = ros::options_from(true, std::nullopt, std::nullopt, false, "xblick-cpp-camera");
-    check(o and o->domain == 0 and o->node == "xblick_cpp_camera" and not o->params_writable, "--ros alone");
-    refused([] { ros::options_from(true, std::nullopt, "bad-name", false, "p"); }, "a node name with -");
+    // the option family's rules (Python's session.ros_options_from_args): on by default, off with --no-ros or
+    // XBLICK_ROS=0, the ROS options refused then
+    ::unsetenv(ros::kEnableEnv);
+    const std::nullopt_t none = std::nullopt;
+    refused([] { ros::options_from(true, 3, std::nullopt, false, std::nullopt, "p"); }, "--ros-domain with --no-ros");
+    refused([] { ros::options_from(true, std::nullopt, "n", false, std::nullopt, "p"); }, "--ros-node with --no-ros");
+    refused([] { ros::options_from(true, std::nullopt, std::nullopt, true, std::nullopt, "p"); },
+            "--ros-params-writable with --no-ros");
+    refused([] { ros::options_from(true, std::nullopt, std::nullopt, false, "sim/clock", "p"); },
+            "--ros-clock with --no-ros");
+    check(not ros::options_from(true, none, none, false, none, "p"), "--no-ros: none");
+    const auto o = ros::options_from(false, none, none, false, none, "xblick-cpp-camera");
+    check(o and o->domain == 0 and o->node == "xblick_cpp_camera" and o->ns == "/" and o->follow_parameters and
+              not o->params_writable,
+          "the default: on, the program's name, renamed after its parameters");
+    const auto c = ros::options_from(false, none, none, false, "/sim/clock", "xblick-yolox", "test/cam-2");
+    check(c and c->ns == "/test/cam_2" and c->node == "xblick_yolox" and c->clock == "sim/clock",
+          "the camera's namespace, written as ROS takes it; the clock key");
+    const auto n = ros::options_from(false, none, "/lab/eye", false, none, "p");
+    check(n and n->ns == "/lab" and n->node == "eye" and not n->follow_parameters, "--ros-node /lab/eye");
+    refused([] { ros::options_from(false, std::nullopt, "bad-name", false, std::nullopt, "p"); }, "a node name with -");
+    ::setenv(ros::kEnableEnv, "0", 1);
+    check(not ros::options_from(false, none, none, false, none, "p") and not ros::from_environment(),
+          "XBLICK_ROS=0: none");
+    refused([] { ros::options_from(false, 3, std::nullopt, false, std::nullopt, "p"); }, "--ros-domain, XBLICK_ROS=0");
+    ::setenv(ros::kEnableEnv, "yes", 1);
+    refused([] { ros::from_environment(); }, "XBLICK_ROS=yes");
+    ::setenv(ros::kEnableEnv, "1", 1);
+    check(ros::from_environment().has_value(), "XBLICK_ROS=1");
+    ::unsetenv(ros::kEnableEnv);
+    check(ros::namespace_of("test/cam-1") == "/test/cam_1" and ros::namespace_of("") == "/", "namespace_of");
+    check(ros::node_of("test/cam-1/probe") == std::make_pair(std::string("/test/cam_1"), std::string("probe")) and
+              ros::node_of("/probe") == std::make_pair(std::string("/"), std::string("probe")),
+          "node_of");
 
     // hashes
     check(ros::type_hashes().size() == 24, "24 type hashes, as Python's table");

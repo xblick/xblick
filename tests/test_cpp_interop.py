@@ -78,9 +78,13 @@ def cpp_camera():
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
         started.append(proc)
         assert proc.stdout.readline().strip() == "ready", "the C++ camera did not start"
-        return open_session(connect=[f"127.0.0.1:{port}"])
+        sessions.append(open_session(connect=[f"127.0.0.1:{port}"]))
+        return sessions[-1]
 
+    sessions = []  # closed at the end: a session left open keeps its threads (its ROS node's) running
     yield start
+    for session in sessions:
+        session.close()
     for proc in started:
         proc.terminate()
         proc.wait(10)

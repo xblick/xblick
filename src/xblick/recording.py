@@ -1372,7 +1372,7 @@ class Player(Paced):
         self._file = ""
         self._start_ns, self._end_ns = self._span()
         self._publishers: dict[str, zenoh.Publisher] = {}
-        self._ros: dict[str, ros.RosPublisher] = {}  # with --ros: the ROS publisher of a key (ros.mirror, /tf)
+        self._ros: dict[str, ros.RosPublisher] = {}  # in ROS 2: the ROS publisher of a key (ros.mirror, /tf)
         self._cameras: dict[str, CameraPublisher] = {}  # recorded stream base -> its publisher
         self._queryables: list = []
         self._encodings: dict[str, str] = {}  # key -> its Zenoh encoding
@@ -1580,7 +1580,7 @@ class Player(Paced):
                     self._out(key), encoding=zenoh.Encoding(self._encodings[key]), congestion_control=self._congestion)
 
     def _ros_publisher(self, out: str, encoding: str):
-        """With --ros: ROS's publisher of a played key: a camera's, robot's or world's tf on /tf, a camera's tf_static
+        """In ROS 2: ROS's publisher of a played key: a camera's, robot's or world's tf on /tf, a camera's tf_static
         on /tf_static, every other key on its own topic (ros.mirror). A command key (ros.commanding, e.g. a simulated
         robot's command/joints and command/tf) is never offered: None."""
         if getattr(self.session, "ros", None) is None:
@@ -1629,7 +1629,7 @@ class Player(Paced):
         seq = self._seq[key] = self._seq.get(key, 0) + 1
         self._publishers[key].put(payload, attachment=_attachment(seq, "play"))
         mirrored = self._ros.get(key)
-        if mirrored is not None and (mirrored.matched or key.endswith(topics.TF_STATIC)):  # tf_static: for its cache
+        if mirrored is not None and (key.endswith(topics.TF_STATIC) or mirrored.matched):  # tf_static: for its cache
             mirrored.put(payload)
         if key.endswith(topics.TF_STATIC):
             self._static[key] = payload

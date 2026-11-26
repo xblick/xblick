@@ -63,10 +63,11 @@ namespace xblick
         // An option without a default (integer, double or string): not set until given.
         Options& add_optional(const std::string& name, std::uint8_t type, OptionSpec spec = {});
         // --connect ENDPOINT..., --listen ENDPOINT..., --zenoh-mode peer|client, --zenoh-config FILE: the Zenoh
-        // session's (session_options); not parameters. And --ros, --ros-domain ID, --ros-node NAME,
-        // --ros-params-writable: the session's part in ROS 2 (ros.hpp, SessionOptions::ros), read-only parameters as
-        // in Python; parse refuses --ros-domain, --ros-node or --ros-params-writable without --ros, a domain that is no
-        // integer from 0 and a node name ROS does not take.
+        // session's (session_options); not parameters. And --ros (does nothing), --no-ros, --ros-domain ID,
+        // --ros-node NAME, --ros-params-writable, --ros-clock KEY: the session's part in ROS 2 (ros.hpp,
+        // SessionOptions::ros; on by default), read-only parameters as in Python; parse refuses the ROS options while
+        // ROS is off (--no-ros, XBLICK_ROS=0), an XBLICK_ROS other than 0 and 1, a domain that is no integer from 0
+        // and a node name ROS does not take.
         Options& add_session_options();
         // --param NAME:=VALUE (repeated), --params-file FILE (repeated), --dump-params FILE, --params-read-only
         // (parameter_startup); not parameters.
@@ -102,7 +103,8 @@ namespace xblick
         ParameterValue value(const std::string& name) const;
 
         SessionOptions session_options() const;
-        // --ros and the others (add_session_options): none without --ros; the node name defaults to the program's
+        // --no-ros and the others (add_session_options, ros::options_from): none with --no-ros or XBLICK_ROS=0; the
+        // node name defaults to the program's in the namespace of its --camera (a text option of that name), if any
         std::optional<ros::Options> ros_options() const;
         ParameterStartup parameter_startup() const;
         std::string help() const;

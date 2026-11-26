@@ -27,7 +27,7 @@ DETECTION_TYPES = (Detection2DArray, Detection3DArray, Classification)
 
 class DetectionPublisher:
     """Publishes the messages of one type on one key; every message is sent (they are small). Answers ``<key>/info``
-    until :meth:`close`. A session with ``--ros`` sends them to the ROS 2 topic ``/<key>`` too, while a ROS
+    until :meth:`close`. A session in ROS 2 sends them to the ROS 2 topic ``/<key>`` too, while a ROS
     subscriber is there."""
 
     def __init__(self, session: zenoh.Session, key: str, message_type: type):
@@ -66,7 +66,7 @@ class DetectionSubscriber:
     encoding), in Zenoh's thread; ``age_at_send_ns`` is the message's then (stamps.py; None from a publisher before
     0.3.30). A sample of another type or that does not decode stops the deliveries; :meth:`check` raises it.
 
-    ``ros_type`` (one of DETECTION_TYPES, for a session with ``--ros``): reads the ROS 2 topic ``/<key>`` of that type
+    ``ros_type`` (one of DETECTION_TYPES, for a session in ROS 2): reads the ROS 2 topic ``/<key>`` of that type
     instead of our key (ROS's key names the type); its messages carry no seq or publish time."""
 
     def __init__(self, session: zenoh.Session, key: str, callback: Callable, ros_type: type | None = None):
@@ -80,7 +80,7 @@ class DetectionSubscriber:
             if ros_type not in DETECTION_TYPES:
                 raise TypeError(f"{ros_type.__name__}: one of " + ", ".join(t.__name__ for t in DETECTION_TYPES))
             if getattr(session, "ros", None) is None:
-                raise ValueError(f"{self.key}: reading its ROS 2 topic needs a session with --ros")
+                raise ValueError(f"{self.key}: reading its ROS 2 topic needs {ros.NEEDS_ROS}")
             self._subscriber = session.ros.node.subscriber(ros.topic_of(self.key), ros_type.TYPE,
                                                            lambda payload, *_: self._on_ros(ros_type, payload))
         else:

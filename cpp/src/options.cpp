@@ -180,18 +180,26 @@ namespace xblick
             options_[by_name_.at(name)].internal = true;
         }
         // as Python's session.add_arguments; parameters as there (read-only: they apply at the start)
-        add_flag("ros", {.help = "take part in ROS 2 as well (rmw_zenoh, ROS 2 Jazzy): streams, transforms and parameters "
-                                 "also on ROS's keys, as a ROS node (docs/integrations/ros2.md); our keys stay as they are"});
+        add_flag("ros", {.help = "accepted and does nothing: every program takes part in ROS 2 by default (rmw_zenoh, "
+                                 "ROS 2 Jazzy and Lyrical); --no-ros turns it off"});
+        add_flag("no-ros", {.help = "take no part in ROS 2: no ROS node, nothing on ROS's keys (default: a part, as a ROS "
+                                    "node, beside our own keys, which stay as they are; XBLICK_ROS=0 turns it off too, "
+                                    "XBLICK_ROS=1 or unset leaves it on; docs/integrations/ros2.md)"});
         add_optional("ros-domain", parameter_type::kInteger,
-                     {.help = "with --ros: the ROS domain id (default: ROS_DOMAIN_ID, else 0)", .metavar = "ID"});
+                     {.help = "the ROS domain id (default: ROS_DOMAIN_ID, else 0)", .metavar = "ID"});
         add_optional("ros-node", parameter_type::kString,
-                     {.help = "with --ros: the program's ROS node name (default: the program's name, every character "
-                              "other than a letter, digit or _ written as _, e.g. xblick_cam)",
+                     {.help = "the program's ROS node, NAME or /namespace/NAME (default: the name of the program's "
+                              "parameters when it has some; else the program's name in the namespace of its --camera, "
+                              "every character other than a letter, digit or _ written as _)",
                       .metavar = "NAME"});
         add_flag("ros-params-writable",
-                 {.help = "with --ros: ROS clients may set this program's parameters (default: they read them, sets "
+                 {.help = "ROS clients may set this program's parameters (default: they read them, sets "
                           "are refused). A ROS set is unchecked and uncounted: no node check, no deadline, and two "
                           "nodes of one name both execute it while the ROS client shows one success"});
+        add_optional("ros-clock", parameter_type::kString,
+                     {.help = "a clock key this program publishes (rosgraph_msgs/Clock, e.g. sim/clock) goes to ROS's "
+                              "global /clock instead of /KEY, for ROS nodes with use_sim_time (default: none)",
+                      .metavar = "KEY"});
         session_options_ = true;
         return *this;
     }
@@ -204,11 +212,19 @@ namespace xblick
         }
         const Option& domain = find("ros-domain");
         const Option& node = find("ros-node");
+        const Option& clock = find("ros-clock");
+        // the node's namespace: the program's --camera, when it has one (a node's)
+        const auto camera = by_name_.find("camera");
+        const std::string camera_name = camera != by_name_.end() and options_[camera->second].kind == Kind::text
+                                            ? options_[camera->second].value.string_value
+                                            : std::string();
         return ros::options_from(
-            flag("ros"),
+            flag("no-ros"),
             domain.value.type == T::kNotSet ? std::nullopt : std::optional<std::int64_t>(domain.value.integer_value),
             node.value.type == T::kNotSet ? std::nullopt : std::optional<std::string>(node.value.string_value),
-            flag("ros-params-writable"), program_);
+            flag("ros-params-writable"),
+            clock.value.type == T::kNotSet ? std::nullopt : std::optional<std::string>(clock.value.string_value),
+            program_, camera_name);
     }
 
     Options& Options::add_parameter_options()
@@ -403,7 +419,7 @@ namespace xblick
         {
             try
             {
-                ros_options();  // --ros-domain without --ros, a domain or node name ROS does not take: now
+                ros_options();  // --ros-domain with --no-ros, a domain or node name ROS does not take: now
             }
             catch (const ros::RosError& error)
             {

@@ -108,6 +108,11 @@ namespace xblick
         {
         }
         ~Parameters();
+        // A program's ROS node until its first Parameters (Python's Parameters.none_on; open_session): the six services
+        // on ROS's keys only, answering as a node without parameters (every set refused), so that ROS's parameter tools
+        // get an answer from every node. Kept by the session (background queryables); they stop answering, and their
+        // tokens go, when the program's first Parameters serve on the node (ros::Ros::until_parameters).
+        static void serve_none(zenoh::Session& session, const std::shared_ptr<ros::Ros>& part);
         Parameters(const Parameters&) = delete;
         Parameters& operator=(const Parameters&) = delete;
 
@@ -178,7 +183,7 @@ namespace xblick
         void declare_services(zenoh::Session& session);  // the constructor's, with a session
         void answer(const std::string& service, const zenoh::Query& query);
         // A ROS client's call on ROS's key (--ros): parameters.cpp has the rules.
-        void answer_ros(const std::string& service, const ros::Service& server, const zenoh::Query& query);
+        void answer_ros(const std::string& service, const std::string& key, const zenoh::Query& query);
 
         std::string key_, name_;
         std::string zid_;  // the session's Zenoh id: names this node in its replies (commands)
@@ -195,9 +200,12 @@ namespace xblick
         std::optional<zenoh::Publisher> events_;
         std::vector<zenoh::Queryable<void>> queryables_;
         std::optional<zenoh::LivelinessToken> token_;
-        // --ros: the ROS node /<namespace>/<name>, its six parameter services on ROS's keys, its events on
-        // /parameter_events (null without --ros)
+        // A session in ROS 2: the program's ROS node (ros::Ros::parameters_node; a node of their own, ros_node_, for
+        // further parameters of one program), its six parameter services on ROS's keys, its events on
+        // /parameter_events (none without a part in ROS)
         bool ros_params_writable_ = false;
+        std::shared_ptr<ros::Ros> ros_part_;  // the program's node serves them: released at the end
+        std::string ros_name_;                // the ROS node's fully qualified name
         std::unique_ptr<ros::RosNode> ros_node_;
         std::vector<std::unique_ptr<ros::Service>> ros_services_;
         std::unique_ptr<ros::Publisher> ros_events_;

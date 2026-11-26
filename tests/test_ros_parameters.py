@@ -34,16 +34,16 @@ def wait_until(condition, timeout=5.0):
 
 
 class Network:
-    """Sessions with --ros connected directly (``writable``: --ros-params-writable on the serving ones, a and c), and
-    one without."""
+    """Sessions in ROS 2 connected directly (``writable``: --ros-params-writable on the serving ones, a and c, whose
+    nodes take the name of their parameters), and one not in ROS 2."""
 
     def __init__(self, writable: bool = False):
         endpoint = f"tcp/127.0.0.1:{free_port()}"
-        serving = dict(params_writable=writable)
+        serving = dict(params_writable=writable, follow_parameters=True)  # named after their parameters
         self.a = session.open_session(listen=[endpoint], ros_options=session.RosOptions(DOMAIN, "xblick_a", **serving))
         self.b = session.open_session(connect=[endpoint], ros_options=session.RosOptions(DOMAIN, "xblick_reader"))
         self.c = session.open_session(connect=[endpoint], ros_options=session.RosOptions(DOMAIN, "xblick_c", **serving))
-        self.observer = session.open_session(connect=[endpoint], declare=False)
+        self.observer = session.open_session(connect=[endpoint], declare=False, ros_options=False)
 
     def close(self):
         for s in (self.b, self.c, self.a, self.observer):
@@ -86,7 +86,7 @@ def test_parameters_through_ros_keys():
         assert not refused.successful and params["model"] == "base"
         assert not client.set_atomically({"threshold": 2.0}).successful and params["threshold"] == 0.7
         wait_until(lambda: any(p.name == "threshold" for e in events for p in e.changed_parameters), 3.0)
-        with pytest.raises(ValueError, match="need a session with --ros"):
+        with pytest.raises(ValueError, match="takes part in ROS 2"):
             ParameterClient(net.observer, "rostest/cam/boxer", ros=True)
     finally:
         client.close()

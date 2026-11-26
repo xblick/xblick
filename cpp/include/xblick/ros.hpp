@@ -1,6 +1,6 @@
 // ROS 2 on Zenoh in C++: the keys, type names, type hashes, attachments, QoS strings and liveliness tokens of
-// rmw_zenoh_cpp 0.2.13 (ROS 2 Jazzy) and 0.10.6 or newer (ROS 2 Lyrical), so that a C++ program started with --ros
-// takes part in ROS 2 as well. The same rules, names and bytes as Python's xblick.ros (its module docstring and
+// rmw_zenoh_cpp 0.2.13 (ROS 2 Jazzy) and 0.10.6 or newer (ROS 2 Lyrical), so that every C++ program takes part in
+// ROS 2 as well (by default; --no-ros or XBLICK_ROS=0 turn it off). The same rules, names and bytes as Python's xblick.ros (its module docstring and
 // docs/integrations/ros2.md are the reference; tests/test_cpp_ros.py compares the two byte for byte):
 //
 //   data key   <domain>/<topic without the leading />/<pkg>::msg::dds_::<Name>_/RIHS01_<type hash>
@@ -18,10 +18,11 @@
 //              Subscriber of such a type says backends:cpu: and reads <key>/_buf_cpu as well (plain CDR, ROS's
 //              attachment). Publishers stay as they are: a Lyrical subscription reads the key.
 //
-// A session takes part when open_session got SessionOptions::ros (--ros, Options::add_session_options): ros::of(session)
-// is then its Ros, else null. CameraPublisher, PointCloudPublisher, the transform, robot state, diagnostics, IMU and
-// message publishers mirror their samples onto ROS's keys while a ROS subscriber is there (mirror, mirror_tf), and
-// Parameters serves ROS's parameter services. Without --ros nothing of ROS goes on the wire.
+// A session takes part when open_session got SessionOptions::ros (by default from_environment(); Options::
+// add_session_options): ros::of(session) is then its Ros, else null. CameraPublisher, PointCloudPublisher, the
+// transform, robot state, diagnostics, IMU and message publishers mirror their samples onto ROS's keys while a ROS
+// subscriber is there (mirror, mirror_tf), and Parameters serves ROS's parameter services on the program's node. A
+// session without a part sends nothing of ROS.
 //
 // /tf_static (transient local): rmw_zenoh uses zenoh-ext's AdvancedPublisher with a cache, which zenoh-c offers only
 // with its unstable API (not in its standalone release). Publisher here stands in for it with the parts a late ROS
@@ -30,6 +31,7 @@
 // cached sample twice (its history query and its late-publisher query), which tf2 takes as the same transform.
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <deque>
@@ -38,10 +40,12 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -89,6 +93,16 @@ namespace xblick::ros
     std::string node_name_of(const std::string& program);
     // /a/b/c -> (/a/b, c); /c -> (/, c).
     std::pair<std::string, std::string> split_node(const std::string& fully_qualified);
+    // A Durchblick name (a camera, test/cam-1) as a ROS namespace, each part as node_name_of writes it (/test/cam_1);
+    // "/" for an empty name.
+    std::string namespace_of(const std::string& name);
+    // (namespace, node) of a Durchblick name as a ROS node, each part as node_name_of writes it: test/cam-1/probe ->
+    // (/test/cam_1, probe). RosError for an empty name.
+    std::pair<std::string, std::string> node_of(const std::string& name);
+    inline constexpr const char* kEnableEnv = "XBLICK_ROS";  // 0: no part in ROS 2; 1 or unset: a part (the default)
+    // false when XBLICK_ROS is 0, true when it is 1 or unset; RosError for any other value.
+    bool enabled_by_environment();
+    inline constexpr std::string_view kClockTopic = "/clock";  // ROS's global clock (use_sim_time)
     // sensor_msgs/msg/Image -> sensor_msgs::msg::dds_::Image_ (a service: pkg/srv/Name -> pkg::srv::dds_::Name_).
     std::string dds_type(const std::string& type_name);
     std::string type_of_dds(const std::string& dds);
@@ -172,19 +186,33 @@ namespace xblick::ros
 
     // ---------------------------------------------------------------------------------- taking part on the wire
 
-    // --ros, --ros-domain, --ros-node, --ros-params-writable, read (Options::add_session_options).
+    // How a session takes part in ROS 2 (--ros-domain, --ros-node, --ros-params-writable, --ros-clock;
+    // Options::add_session_options): its node <ns>/<node>; follow_parameters: that name is a default, and the
+    // program's first parameters give the node theirs (Ros::parameters_node).
     struct Options
     {
         int domain = kDefaultDomain;
-        std::string node{};
+        std::string node{};  // empty: node_name_of(the program), filled in by open_session
         bool params_writable = false;  // ROS clients may set parameters; by default ROS's sets are refused
+        std::string ns = "/";
+        bool follow_parameters = false;
+        std::string clock{};  // --ros-clock: the key of ours that goes to ROS's /clock (empty: none)
     };
-    // The options of a command line's values; none without --ros. RosError for --ros-domain, --ros-node or
-    // --ros-params-writable without --ros, a domain that is no integer >= 0, a node name ROS does not take. The node
-    // name defaults to node_name_of(program).
-    std::optional<Options> options_from(bool ros, std::optional<std::int64_t> domain,
+    // A program's part when nothing is given (Python's session.default_ros_options): ROS_DOMAIN_ID's domain (else 0),
+    // the node the program's name (node_name_of; empty program: left empty) in camera's namespace (namespace_of),
+    // renamed after the program's first parameters.
+    Options default_options(const std::string& program, const std::string& camera = "");
+    // SessionOptions::ros by default: none when XBLICK_ROS is 0, else default_options(""). RosError for an XBLICK_ROS
+    // or ROS_DOMAIN_ID that is not understood.
+    std::optional<Options> from_environment();
+    // The options of a command line's values (Python's session.ros_options_from_args); none with --no-ros or
+    // XBLICK_ROS=0 (--ros changes nothing). RosError for --ros-domain, --ros-node, --ros-params-writable or
+    // --ros-clock while ROS is off, a domain that is no integer >= 0, a node name ROS does not take (NAME or
+    // /namespace/NAME). Without --ros-node: default_options(program, camera).
+    std::optional<Options> options_from(bool no_ros, std::optional<std::int64_t> domain,
                                         const std::optional<std::string>& node, bool params_writable,
-                                        const std::string& program);
+                                        const std::optional<std::string>& clock, const std::string& program,
+                                        const std::string& camera = "");
 
     // A ROS node: its name, namespace and id.
     struct NodeName
@@ -195,31 +223,83 @@ namespace xblick::ros
         std::string fully_qualified() const;
     };
 
-    // A session's part in ROS 2 (--ros): domain, its program's node, the entity ids (one counter per session, as
-    // rmw_zenoh's per context).
-    class Ros
+    class Subscriber;
+    struct Attachment;
+
+    namespace detail
+    {
+        using StaticTransform = std::tuple<std::string, std::array<double, 3>, std::array<double, 4>>;
+    }
+
+    // A session's part in ROS 2: domain, its program's node, the entity ids (one counter per session, as rmw_zenoh's
+    // per context). The program's node carries its publishers, subscribers and its first parameters' services
+    // (parameters_node); another node of its fully qualified name in ROS's graph (at the start or later) is said in
+    // one line, as ROS's tools only warn. Python's ros.Ros is the same.
+    class Ros : public std::enable_shared_from_this<Ros>
     {
     public:
         Ros(std::string zid, const Options& options);
+        ~Ros();
+        Ros(const Ros&) = delete;
+        Ros& operator=(const Ros&) = delete;
         int domain() const { return options_.domain; }
         const std::string& zid() const { return zid_; }
         bool params_writable() const { return options_.params_writable; }
-        const NodeName& node() const { return node_; }
+        bool follow_parameters() const { return options_.follow_parameters; }
+        const std::string& clock() const { return options_.clock; }  // --ros-clock's key, empty without
+        NodeName node() const;  // the program's node, now
         std::string next_id();
         // A new node's name and id (its token: RosNode).
         NodeName add_node(const std::string& name, const std::string& ns = "/");
+        // The program's node for the parameters `name` (their Durchblick name) when they are its first: renamed after
+        // them (node_of) when its name is a default (follow_parameters), its entities declared anew. None for further
+        // parameters, which make a node of their own (RosNode).
+        // `session`: the parameters' (open_session's own may have moved since).
+        std::optional<NodeName> parameters_node(const std::string& name, zenoh::Session& session);
+        void release_parameters();  // the program's parameters closed
+        // `retire` is called with the program's first parameters (parameters_node): the node's services without
+        // parameters (Parameters::serve_none) give way to theirs.
+        void until_parameters(std::function<void()> retire);
+        // An entity on the program's node, made as `as_made`: `rename` called with the node's new name whenever it is
+        // renamed (at once when that happened meanwhile). The id for leave().
+        std::uint64_t enroll(const NodeName& as_made, std::function<void(const NodeName&)> rename);
+        void leave(std::uint64_t id);
+        void own(const Gid& gid);  // a gid of this session's entities: its own samples
         // One error line on stderr per frame that this program gives two parents on /tf and /tf_static (tf2 takes
-        // one parent per frame). The transforms still go out.
+        // one parent per frame), and per static frame that another program sends on /tf_static with another parent
+        // or transform (read while a static publisher of it lives, mirror_tf). The transforms still go out.
         void check_tf(std::span<const std::uint8_t> payload, bool is_static);
+        // open_session: the node's token and the watch for a second node of its name; detach when the session goes.
+        void attach(zenoh::Session& session, const std::string& program);
+        void detach();
+        // a sample of ROS's /tf_static (a static Publisher's companion, mirror_tf): compared with this program's
+        void on_static_sample(std::span<const std::uint8_t> payload, const Attachment& attachment);
 
     private:
+        struct Duplicates;
+        void watch_duplicates(zenoh::Session& session);
+        void say_static(const std::string& child, const detail::StaticTransform& mine,
+                        const detail::StaticTransform& theirs);
+
         std::string zid_;
         Options options_;
         NodeName node_;
         std::atomic<std::uint64_t> ids_{0};
+        mutable std::recursive_mutex graph_mutex_;  // node_, the tokens, the enrolled entities (a rename)
+        bool attached_ = false;  // attach: its session open (open_session keeps no pointer to it: it moves)
+        std::string program_;
+        std::optional<zenoh::LivelinessToken> node_token_;
+        std::shared_ptr<Duplicates> duplicates_;
+        std::map<std::uint64_t, std::function<void(const NodeName&)>> enrolled_;
+        std::uint64_t enrolled_ids_ = 0;
+        bool parameters_taken_ = false;
+        std::function<void()> retire_;  // until_parameters
+        std::set<Gid> own_gids_;
         std::mutex tf_mutex_;
         std::map<std::string, std::string> tf_parents_;
         std::vector<std::string> tf_clashes_;
+        std::map<std::string, detail::StaticTransform> static_mine_, static_others_;
+        std::set<std::string> static_said_;
     };
 
     // The part in ROS 2 of `session` (opened by open_session with SessionOptions::ros), null when it takes none.
@@ -227,8 +307,9 @@ namespace xblick::ros
 
     namespace detail
     {
-        // open_session: the session takes part (its node's token lives as long as the session).
-        void take_part(zenoh::Session& session, const Options& options);
+        // open_session: the session takes part (its node's token lives as long as the session); an empty node name
+        // becomes node_name_of(program).
+        void take_part(zenoh::Session& session, const Options& options, const std::string& program);
     }
 
     // A node's liveliness token (a node besides the program's own: a node's parameters).
@@ -248,6 +329,8 @@ namespace xblick::ros
     {
         Entity(const Ros& ros, const NodeName& node, std::string_view kind, const std::string& name,
                const std::string& type_name, const Qos& qos, std::string entity_id);
+        // Its node renamed (Ros::parameters_node): its token, token key and gid of the node's new name.
+        void rename(const NodeName& node);
         Token token;
         std::string token_key;
         std::string key;
@@ -272,10 +355,15 @@ namespace xblick::ros
         const Entity& entity() const { return entity_; }
         // Called with each payload before it goes out (mirror_tf: the frames' parents).
         std::function<void(std::span<const std::uint8_t>)> check;
+        // A subscription that lives as long as this publisher (mirror_tf, static: ROS's /tf_static of others).
+        std::unique_ptr<Subscriber> companion_;
 
     private:
         struct Cache;
+        void renamed(zenoh::Session& session, const NodeName& node);
         Entity entity_;
+        std::weak_ptr<Ros> ros_;  // enrolled: on the program's node
+        std::uint64_t enrolled_ = 0;
         std::int64_t seq_ = 0;
         std::mutex mutex_;
         std::optional<zenoh::Publisher> publisher_;
@@ -304,6 +392,8 @@ namespace xblick::ros
     private:
         struct State;
         Entity entity_;
+        std::weak_ptr<Ros> ros_;
+        std::uint64_t enrolled_ = 0;
         std::shared_ptr<State> state_;
         std::optional<zenoh::Subscriber<void>> subscriber_;
         std::optional<zenoh::Subscriber<void>> history_;  // transient local: the publishers' cache tokens
@@ -331,13 +421,21 @@ namespace xblick::ros
 
     private:
         Entity entity_;
+        std::weak_ptr<Ros> ros_;
+        std::uint64_t enrolled_ = 0;
         std::optional<zenoh::Queryable<void>> queryable_;
         std::optional<zenoh::LivelinessToken> token_;
     };
 
+    // A ROS service's reply on `key` with ROS's attachment: the request's sequence number and client gid, the reply's
+    // time (Service::reply).
+    void reply(const zenoh::Query& query, const std::string& key, std::vector<std::uint8_t>&& payload,
+               const Attachment& request);
+
     // The ROS publisher that mirrors one of our keys (of `type`) on the key's topic when `session` takes part in ROS,
-    // else null. A command key (commanding) and a type without a ROS hash are not offered: one warning line, null.
-    // RosError for a key that is no ROS name.
+    // else null; on /clock for the session's clock key (--ros-clock; RosError when its type is not
+    // rosgraph_msgs/msg/Clock). A command key (commanding), a type without a ROS hash and a key that is no ROS name
+    // are not offered: one warning line, null.
     std::unique_ptr<Publisher> mirror(zenoh::Session& session, const std::string& key,
                                       const protocol::MessageType& type, const Qos& qos = kStreamQos);
     // The publisher on ROS's /tf (/tf_static with is_static, transient local) for our key `key` when `session` takes

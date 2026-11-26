@@ -15,6 +15,7 @@ import time
 
 import numpy as np
 import pytest
+import zenoh
 
 from xblick import _core, ros
 from xblick.camera import (CameraPublisher, ImageSubscriber, StaticTransformPublisher, StaticTransformSubscriber,
@@ -190,13 +191,14 @@ class CppCamera:
                  "--size", str(W), str(H), "--fps", "20", "--seconds", "60", *map(str, extra)],
                 stdout=subprocess.PIPE, stderr=log, text=True)
         assert self.proc.stdout.readline().strip() == "ready", self.log.read_text()
-        self.observer = open_session(connect=[f"tcp/127.0.0.1:{self.port}"], declare=False)
+        self.observer = open_session(connect=[f"tcp/127.0.0.1:{self.port}"], declare=False, ros_options=False)
         self.keys: dict[str, bytes | None] = {}
         self.tokens: set[str] = set()
         self._sub = self.observer.declare_subscriber(
             "**", lambda s: self.keys.setdefault(str(s.key_expr), s.attachment.to_bytes() if s.attachment else None))
-        self._live = self.observer.liveliness().declare_subscriber(
-            "@ros2_lv/**", lambda s: self.tokens.add(str(s.key_expr)), history=True)
+        self._live = self.observer.liveliness().declare_subscriber(  # the tokens there now (a rename drops some)
+            "@ros2_lv/**", lambda s: self.tokens.add(str(s.key_expr)) if s.kind == zenoh.SampleKind.PUT
+            else self.tokens.discard(str(s.key_expr)), history=True)
 
     def ros_session(self, node="py_reader"):
         return open_session(connect=[f"tcp/127.0.0.1:{self.port}"], ros_options=RosOptions(DOMAIN, node))
@@ -222,20 +224,20 @@ def ours(keys) -> set[str]:
 
 
 def test_cpp_without_ros_nothing_of_ros_goes_on_the_wire(tmp_path):
-    """Without --ros a C++ program sends what it sent before: our keys only, no rmw_zenoh key, no ROS token; with
-    --ros its own keys are the same."""
+    """With --no-ros a C++ program sends what it sent before ROS was on by default: our keys only, no rmw_zenoh key,
+    no ROS token; in ROS 2 (the default) its own keys are the same."""
     seen = {}
-    for flag in ([], ["--ros", "--ros-domain", DOMAIN]):
+    for on, flag in ((False, ["--no-ros"]), (True, ["--ros-domain", DOMAIN])):
         camera = CppCamera(tmp_path, "--tf", "--diagnostics", "--params", *flag)
         try:
             wait_until(lambda: f"{BASE}/image_raw" in camera.keys and "rc/cpp/tf" in camera.keys)
             time.sleep(1.5)
-            seen[bool(flag)] = (dict(camera.keys), set(camera.tokens))
+            seen[on] = (dict(camera.keys), set(camera.tokens))
         finally:
             camera.close()
     keys, tokens = seen[False]
     assert ours(keys) == set(keys) and tokens == set()
-    assert ours(seen[True][0]) == set(keys)  # our keys unchanged by --ros
+    assert ours(seen[True][0]) == set(keys)  # our keys unchanged by ROS
     assert set(seen[True][0]) - set(keys) and seen[True][1]  # and ROS's beside them
 
 
@@ -328,7 +330,7 @@ def test_cpp_reads_ros_tf_static_late():
         static = StaticTransformPublisher(session, "rc/py", [pose])
         time.sleep(1.5)
         done = subprocess.run([tool("xblick-cpp-probe"), "--connect", f"127.0.0.1:{port}", "--tf-static", "unused",
-                               "--ros", "--ros-domain", str(DOMAIN), "--timeout", "15"], capture_output=True, text=True,
+                               "--via-ros", "--ros-domain", str(DOMAIN), "--timeout", "15"], capture_output=True, text=True,
                               timeout=60)
         static.close()
     lines = [json.loads(line) for line in done.stdout.splitlines()]
@@ -368,8 +370,8 @@ def test_cpp_points_through_ros(tmp_path):
 
 
 def test_cpp_ros_options_refused():
-    for argv in (["--ros-domain", "3"], ["--ros-node", "x"], ["--ros-params-writable"], ["--ros", "--ros-node", "a-b"],
-                 ["--ros", "--ros-domain", "-1"]):
+    for argv in (["--no-ros", "--ros-domain", "3"], ["--no-ros", "--ros-node", "x"], ["--no-ros", "--ros-params-writable"],
+                 ["--ros-node", "a-b"], ["--ros-domain", "-1"]):
         done = subprocess.run([tool("xblick-cpp-camera"), "--listen", f"127.0.0.1:{free_port()}", "--seconds", "1",
                                *argv], capture_output=True, text=True, timeout=30)
         assert done.returncode == 1 and "xblick-cpp-camera:" in done.stderr, (argv, done.stderr)
@@ -381,21 +383,27 @@ NODE = "rc/cpp/cpp_camera"  # xblick-cpp-camera --params: fps, pattern.shift (re
 
 
 def test_cpp_parameters_are_a_ros_node(tmp_path):
-    """The C++ node's parameters: the ROS node /rc/cpp/cpp_camera with the six services (rcl_interfaces, QoS of
-    ROS's parameters), read through ROS's keys by our ROS client; sets refused by default with Python's reason."""
+    """The C++ node's parameters: the program's ROS node, renamed /rc/cpp/cpp_camera after them (its publishers
+    made before as well), with the six services (rcl_interfaces, QoS of ROS's parameters), read through ROS's keys by
+    our ROS client; sets refused by default with Python's reason."""
     camera = CppCamera(tmp_path, "--params", "--ros", "--ros-domain", DOMAIN)
     reader = camera.ros_session()
     client = ParameterClient(reader, NODE, timeout=5.0, ros=True)
     try:
-        wait_until(lambda: sum(ros.parse_token(t).kind == ros.SERVICE for t in set(camera.tokens)) == 6)
+        def camera_services():  # the reader's node has six services (without parameters) as well
+            return [t for t in map(ros.parse_token, set(camera.tokens))
+                    if t.kind == ros.SERVICE and t.fully_qualified_node == f"/{NODE}"]
+        wait_until(lambda: len(camera_services()) == 6)
         parsed = [ros.parse_token(t) for t in set(camera.tokens)]
-        services = {t.topic: t for t in parsed if t.kind == ros.SERVICE}
+        services = {t.topic: t for t in camera_services()}
         assert set(services) == {f"/{NODE}/{s}" for s in ("list_parameters", "describe_parameters", "get_parameters",
                                                           "get_parameter_types", "set_parameters",
                                                           "set_parameters_atomically")}
         assert all(t.qos == ros.PARAMETERS_QOS and t.type_name.startswith("rcl_interfaces/srv/")
                    for t in services.values())
         assert any(t.kind == ros.NODE and t.fully_qualified_node == f"/{NODE}" for t in parsed)
+        wait_until(lambda: any(ros.parse_token(t).topic == f"/{BASE}/image_raw" and ros.parse_token(t).node ==
+                               "cpp_camera" for t in set(camera.tokens) if "/MP/" in t))  # one node: renamed
         assert sorted(client.list()) == ["codec", "fps", "pattern.auto_shift", "pattern.shift"]
         assert [v.value() for v in client.get(["fps", "codec"])] == [20.0, "jpeg"]
         assert client.describe(["codec"])[0].read_only

@@ -20,9 +20,11 @@ Keys (protocol.hpp), the node's key ``<namespace>/<name>`` (its fully qualified 
   ``node`` the node's fully qualified name), after each change and at each declaration;
 * the liveliness token ``<node>/parameters`` while it offers them (``find_nodes``).
 
-With a session that takes part in ROS 2 (``--ros``, ros.py) the node is a ROS node as well, ``/<namespace>/<name>``:
-the same six services on rmw_zenoh's keys (``/<namespace>/<name>/get_parameters``, ...) and its events on ROS's
-``/parameter_events``, so that ``ros2 param`` works on it. By default its ROS services answer reads only and refuse
+With a session that takes part in ROS 2 (the default, ros.py) the program's ROS node serves them as well: the same
+six services on rmw_zenoh's keys (``<node>/get_parameters``, ...) and its events on ROS's ``/parameter_events``, so
+that ``ros2 param`` works on it. That node is ``/<namespace>/<name>`` (each part as ros.node_of writes it) unless the
+program was given a node name (``--ros-node``); a program's further Parameters are ROS nodes of their own
+(ros.Ros.parameters_node). By default its ROS services answer reads only and refuse
 sets. With ``--ros-params-writable`` a ROS client may set them: such a set is unchecked and uncounted (no node check,
 no deadline; two nodes of one name both execute it, and the ROS client shows one success; docs/integrations/ros2.md).
 Our own callers keep using our keys with the check. ``ParameterClient(..., ros=True)`` reads and sets a ROS node's
@@ -51,7 +53,7 @@ from .msg import (DescribeParametersRequest, DescribeParametersResponse, Floatin
                   ParameterType, ParameterValue, SetParametersAtomicallyRequest, SetParametersAtomicallyResponse,
                   SetParametersRequest, SetParametersResponse, SetParametersResult, Time)
 from .paths import expand_path
-from .ros import check_ros_name
+from .ros import NEEDS_ROS, check_ros_name
 from .session import (ASK_PERIOD, CommandQuery, CommandRefused, answer_attachment, ask, checked, command, count, log,
                       node_id, one_node, refuse, replies, timed_out)
 
@@ -73,6 +75,7 @@ SETS = (P.SET_PARAMETERS, P.SET_PARAMETERS_ATOMICALLY)  # the services that chan
 READ_ONLY_ACCESS = "parameters are read only on this node (--params-read-only)"
 RESTART = "read-only: applies at the next start"
 SERVE_PERIOD_S = 0.01  # how often the services look for queries: a parameter call waits at most this much longer
+NONE_SERVE_PERIOD_S = 0.05  # the same for a program node without parameters (none_on): every program has one
 # ROS calls answered per ROS service and round (_serve): a ROS client that floods a node does not hold up our own
 # (checked) calls, which are all answered every round
 ROS_CALLS_PER_ROUND = 4
@@ -184,8 +187,8 @@ class _Declared:
 
 class Parameters:
     """The parameters of one node ``<namespace>/<name>`` (module docstring), answering ROS 2's parameter services.
-    ``session`` None: no services (a node's own use, tests). A session with ``--ros``: the services on ROS's keys too,
-    as the ROS node ``/<namespace>/<name>`` (module docstring)."""
+    ``session`` None: no services (a node's own use, tests). A session in ROS 2: the services on ROS's keys too,
+    on the program's ROS node (module docstring)."""
 
     def __init__(self, session: zenoh.Session | None, name: str, namespace: str = "", read_only_access: bool = False):
         self.key = node_key(namespace, name)
@@ -197,6 +200,9 @@ class Parameters:
         self._lock = threading.RLock()
         self._events = self._queryables = self._token = self._server = None
         self._ros_node = self._ros_events = None
+        self._ros_own_node = False  # a ROS node of their own (not the program's: ros.Ros.parameters_node)
+        self._ros_none = False      # none_on: a program node's services while it has no parameters
+        self._ros_name = self.name  # the ROS node's fully qualified name
         self._ros_services: list[tuple[str, ros.RosService]] = []
         self._stop = threading.Event()
         self._zid = node_id(session) if session is not None else ""  # names this node in its replies (commands)
@@ -207,11 +213,11 @@ class Parameters:
             # while its model loads) would then wait for it for good
             self._queryables = [(service, session.declare_queryable(f"{self.key}/{service}")) for service in SERVICES]
             taking_part = getattr(session, "ros", None)
-            if taking_part is not None:  # the ROS node of this name: its services, its events on /parameter_events
-                namespace, name_part = ros.split_node(self.name)
-                self._ros_node = taking_part.add_node(name_part, namespace)
+            if taking_part is not None:  # the program's ROS node (ros.Ros.parameters_node): the services, the events
+                self._ros_node, self._ros_own_node = taking_part.parameters_node(self.name)
+                self._ros_name = self._ros_node.fully_qualified
                 self._ros_services = [
-                    (service, self._ros_node.service(f"{self.name}/{service}", ROS_SERVICES[service]))
+                    (service, self._ros_node.service(f"{self._ros_name}/{service}", ROS_SERVICES[service]))
                     for service in SERVICES]
                 self._ros_events = self._ros_node.publisher("/parameter_events", ParameterEvent.TYPE,
                                                             ros.PARAMETERS_QOS)
@@ -499,6 +505,9 @@ class Parameters:
             payload = bytes(event.serialize())
             self._events.put(payload)
             if self._ros_events is not None and self._ros_events.matched:
+                if self._ros_name != self.name:  # ROS's event names the ROS node
+                    event.node = self._ros_name
+                    payload = bytes(event.serialize())
                 self._ros_events.put(payload)
 
     # ---------------------------------------------------------------------------------------------- the services
@@ -639,20 +648,47 @@ class Parameters:
             return SetParametersResponse(self._set(request.parameters, atomic=False, gate=gate))
         return SetParametersAtomicallyResponse(self._set(request.parameters, atomic=True, gate=gate)[0])
 
+    @classmethod
+    def none_on(cls, ros_node: ros.RosNode) -> Parameters:
+        """No parameters, as the six services of ``ros_node`` on ROS's keys only: a program's ROS node until its
+        first Parameters (ros.Ros), so that ROS's parameter tools get an answer from every node, as from ROS's own.
+        Nothing on our keys. Every set is refused (no such parameter)."""
+        p = cls(None, ros_node.name, ros_node.namespace.strip("/"))
+        p._ros_node, p._ros_name, p._ros_none = ros_node, ros_node.fully_qualified, True
+        p._queryables = []
+        p._ros_services = [(service, ros_node.service(f"{p._ros_name}/{service}", ROS_SERVICES[service]))
+                           for service in SERVICES]
+        p._server = threading.Thread(target=p._serve, args=(NONE_SERVE_PERIOD_S,), name=f"parameters {p._ros_name}",
+                                     daemon=True)
+        p._server.start()
+        return p
+
     def close(self):
         """Ends the services (again: nothing). A node calls it at its end; without it the daemon thread ends with the
         process."""
+        if self._server is None:
+            return
         if self._token is not None:
             self._token.undeclare()
-            self._stop.set()
-            self._server.join(timeout=2.0)
-            for _, q in self._queryables:
-                q.undeclare()
+        self._stop.set()
+        self._server.join(timeout=2.0)
+        self._server = None
+        for _, q in self._queryables or []:
+            q.undeclare()
+        if self._events is not None:
             self._events.undeclare()
-            if self._ros_node is not None:
+        if self._ros_node is not None:
+            if self._ros_own_node:
                 self._ros_node.close()  # its services, its events publisher and its token
-                self._ros_node = None
-            self._token = None
+            else:  # the program's node: only what these parameters put on it
+                for _, server in self._ros_services:
+                    server.close()
+                if self._ros_events is not None:
+                    self._ros_events.close()
+                if not self._ros_none:
+                    self._ros_node.ros.release_parameters()
+            self._ros_node = None
+        self._token = None
 
 
 def _option_help(parser, action) -> str:
@@ -689,8 +725,8 @@ class ParameterClient:
     not sent again). ``last_checked``: the node of the last set said that it checked node and deadline before
     applying it (session.checked).
 
-    ``ros`` (a session with ``--ros``): the ROS node ``/<key>``'s parameters through ROS 2's keys (any ROS node's, or
-    a Durchblick node's with ``--ros``). Reads as above. A set: not sent unless exactly one node answered a
+    ``ros`` (a session in ROS 2): the ROS node ``/<key>``'s parameters through ROS 2's keys (any ROS node's, or
+    a Durchblick node's). Reads as above. A set: not sent unless exactly one node answered a
     list_parameters read first, then sent once, without node or deadline (ROS has neither: the receiver cannot
     refuse a late set, ``last_checked`` stays False); NotReached, NoAnswer, PartlyAnswered and SeveralExecuted as
     above. ``on_event``: ROS's ``/parameter_events``."""
@@ -705,7 +741,7 @@ class ParameterClient:
         self._ros_clients: dict[str, ros.RosClient] | None = None
         if ros:
             if getattr(session, "ros", None) is None:
-                raise ValueError(f"{self.name}: a ROS node's parameters need a session with --ros")
+                raise ValueError(f"{self.name}: a ROS node's parameters need {NEEDS_ROS}")
             check_ros_name(self.name, "node")
             self._ros_clients = {service: session.ros.node.client(f"{self.name}/{service}", ROS_SERVICES[service])
                                  for service in SERVICES}

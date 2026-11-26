@@ -29,7 +29,8 @@ except ImportError:
     LAVFI = False
 
 XBLICK = [sys.executable, "-m", "xblick.cli"]
-ENV = {**os.environ, "PYTHONUNBUFFERED": "1"}
+# XBLICK_ROS=0: these check the programs' own lines and keys; their part in ROS 2 is tests/test_ros_session.py's
+ENV = {**os.environ, "PYTHONUNBUFFERED": "1", "XBLICK_ROS": "0"}
 
 
 def start(*args, env=ENV) -> subprocess.Popen:

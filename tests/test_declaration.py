@@ -120,7 +120,8 @@ def test_a_node_declares_its_name_and_a_killed_one_disappears(network, tmp_path)
     port, z = network
     script = tmp_path / "mini-node.py"
     script.write_text(textwrap.dedent(NODE))
-    node = start([sys.executable, str(script), "--camera", "dt/cam", "--connect", f"tcp/127.0.0.1:{port}"])
+    node = start([sys.executable, str(script), "--camera", "dt/cam", "--connect", f"tcp/127.0.0.1:{port}",
+                  "--no-ros"])  # its own lines alone
     try:
         assert node.stdout.readline().strip().endswith("ready")
         wait_until(lambda: program_of(z, node.pid).names == ["dt/cam/mini"], timeout=10)

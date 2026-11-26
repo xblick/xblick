@@ -19,6 +19,7 @@
 #include <regex>
 #include <thread>
 
+#include "xblick/parameters.hpp"
 #include "xblick/protocol.hpp"
 #include "xblick/version.hpp"
 #include "json.hpp"
@@ -184,7 +185,7 @@ namespace xblick
 
     namespace
     {
-        // A session just opened: its program's declaration, its part in ROS 2 (--ros) with one line on stderr, as
+        // A session just opened: its program's declaration, its part in ROS 2 with one line on stderr, as
         // Python's open_from_args says it.
         void take_part(zenoh::Session& session, const SessionOptions& o)
         {
@@ -194,12 +195,19 @@ namespace xblick
             }
             if (o.ros)
             {
-                ros::detail::take_part(session, *o.ros);
+                ros::detail::take_part(session, *o.ros, o.program);
                 const std::shared_ptr<ros::Ros> part = ros::of(session);
-                std::fprintf(stderr, "%s: in ROS 2 as node %s on domain %d (rmw_zenoh keys besides our own)\n",
-                             o.program.empty() ? "xblick" : o.program.c_str(),
-                             part->node().fully_qualified().c_str(), part->domain());
-                std::fflush(stderr);
+                Parameters::serve_none(session, part);  // the node's services until its first Parameters
+                if (not o.program.empty())  // a program's session (Options::session_options), as Python's
+                {
+                    const std::string clock = part->clock().empty() ? "" : "; " + part->clock() + " on /clock";
+                    std::fprintf(stderr,
+                                 "%s: in ROS 2 as node %s on domain %d (rmw_zenoh keys besides our own%s; --no-ros: "
+                                 "none)\n",
+                                 o.program.c_str(), part->node().fully_qualified().c_str(), part->domain(),
+                                 clock.c_str());
+                    std::fflush(stderr);
+                }
             }
         }
     }  // namespace

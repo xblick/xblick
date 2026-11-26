@@ -11,7 +11,8 @@
 //
 // --tf: the fixed pose world -> TestCamera on <camera>/tf_static (translation 1 2 3) and TestCamera ->
 // TestCamera_moving (0 0 0.5) on <camera>/tf with every frame.
-// --ros, --ros-domain ID, --ros-node NAME, --ros-params-writable: take part in ROS 2 as well (ros.hpp).
+// In ROS 2 as well by default (ros.hpp); --no-ros, --ros-domain ID, --ros-node NAME, --ros-params-writable,
+// --ros-clock KEY as every program's (--ros does nothing).
 //
 // --diagnostics: also a DiagnosticArray (status "cpp_camera") on <camera>/diagnostics once a second, <camera> the base
 // without its last part.

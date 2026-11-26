@@ -71,10 +71,11 @@ namespace xblick
         // record (program, version, the core's version, names, host, the whole command line, process id, start time).
         // The command line is visible to everything that reaches the network. false: a session that does not.
         bool declare = true;
-        // Take part in ROS 2 as well (--ros, ros.hpp): the session is a ROS node of this name on this domain
-        // (ros::of), and the publishers and parameters made with it offer themselves to ROS too
-        // (docs/integrations/ros2.md). Without it nothing of ROS is sent.
-        std::optional<ros::Options> ros{};
+        // Take part in ROS 2 as well (ros.hpp): the session is a ROS node of this name on this domain (ros::of), and
+        // the publishers and parameters made with it offer themselves to ROS too (docs/integrations/ros2.md). By
+        // default as XBLICK_ROS says (ros::from_environment: a part unless it is 0; RosError for a value other than 0
+        // and 1); std::nullopt: no part, nothing of ROS is sent. An empty node name: the program's (node_name_of).
+        std::optional<ros::Options> ros = ros::from_environment();
     };
 
     // xblick/sessions/<zid>/program: a session's declaration (SessionOptions::declare).

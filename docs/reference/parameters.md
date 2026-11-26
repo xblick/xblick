@@ -315,8 +315,9 @@ The payload of a query is the request of the service in CDR (`rcl_interfaces/srv
 of the reply is its response. The key names are constants in `protocol.hpp` (`kListParameters` to
 `kParameterEvents`, `kParametersToken`) and in Python (`_core.protocol.LIST_PARAMETERS` and so on).
 
-A ROS mode would put the services at the keys of `rmw_zenoh` and the events on `/parameter_events`. The payloads
-would stay as they are. See [Durchblick and ROS 2](../integrations/ros2.md).
+A program in ROS 2 (the default) also serves the six services on the keys of `rmw_zenoh`, as the services of its
+ROS node, and sends the events on `/parameter_events` as well. The payloads stay as they are. See
+[Durchblick and ROS 2](../integrations/ros2.md#one-node-per-program).
 
 ## Messages
 

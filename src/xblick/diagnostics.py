@@ -40,7 +40,7 @@ def sender(sample: zenoh.Sample) -> str | None:
 
 
 class DiagnosticsPublisher:
-    """One node's status on ``<camera>/diagnostics``; with a session with ``--ros`` on ROS 2's ``/<camera>/diagnostics``
+    """One node's status on ``<camera>/diagnostics``; with a session in ROS 2 on ROS 2's ``/<camera>/diagnostics``
     too, while a ROS subscriber is there."""
 
     OK, WARN, ERROR, STALE = DiagnosticStatus.OK, DiagnosticStatus.WARN, DiagnosticStatus.ERROR, DiagnosticStatus.STALE

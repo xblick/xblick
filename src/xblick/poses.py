@@ -217,7 +217,7 @@ class TransformBuffer:
     extrapolated. :meth:`lookup` composes the chain between two frames. A child frame has one parent; a frame on
     both topics, or one whose parent changes, is an error (raised by :meth:`check` and :meth:`lookup`).
 
-    ``ros`` (a session with ``--ros``): ROS 2's global ``/tf_static`` and ``/tf`` instead of the camera's keys, as
+    ``ros`` (a session in ROS 2): ROS 2's global ``/tf_static`` and ``/tf`` instead of the camera's keys, as
     tf2's buffer reads them (every camera's and robot's frames; ``tf_key`` not with it)."""
 
     def __init__(self, session: zenoh.Session, camera: str, tf_key: str | None = None, max_gap: float = 0.1,

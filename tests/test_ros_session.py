@@ -1,6 +1,7 @@
-"""``--ros`` without a ROS install: the options, that nothing of ROS goes on the wire without them, and that with them
-the streams, transforms and parameters appear on rmw_zenoh's keys with its attachment and tokens, read back by our own
-ROS readers and clients. tests/test_ros_live.py checks the same against ROS 2's own programs."""
+"""ROS 2 without a ROS install: the options (ROS on by default, ``--no-ros``, ``XBLICK_ROS``), that nothing of ROS goes
+on the wire without it, and that with it the streams, transforms and parameters appear on rmw_zenoh's keys with its
+attachment and tokens, read back by our own ROS readers and clients; one node per program, its name, frames and
+/clock. tests/test_ros_live.py checks the same against ROS 2's own programs."""
 
 import argparse
 import socket
@@ -8,6 +9,7 @@ import time
 
 import numpy as np
 import pytest
+import zenoh
 
 from xblick import ros, session
 from xblick.camera import CameraPublisher, ImageSubscriber, StaticTransformPublisher, TransformPublisher
@@ -48,33 +50,81 @@ def test_the_default_node_name_is_the_parsers_program(monkeypatch):
 
 
 def test_ros_options(monkeypatch):
+    """ROS is on by default; --ros changes nothing; --no-ros and XBLICK_ROS=0 turn it off, and the ROS options then
+    are errors; XBLICK_ROS takes 0 and 1 only."""
     monkeypatch.delenv("ROS_DOMAIN_ID", raising=False)
-    assert session.ros_options_from_args(parse([]), prog="xblick cam") is None
-    assert session.ros_options_from_args(parse(["--ros"]), prog="xblick cam") == session.RosOptions(0, "xblick_cam")
+    monkeypatch.delenv("XBLICK_ROS", raising=False)
+    default = session.RosOptions(0, "xblick_cam", follow_parameters=True)
+    assert session.ros_options_from_args(parse([]), prog="xblick cam") == default
+    assert session.ros_options_from_args(parse(["--ros"]), prog="xblick cam") == default
+    assert session.ros_options_from_args(parse(["--no-ros"]), prog="xblick cam") is None
+    monkeypatch.setenv("XBLICK_ROS", "1")
+    assert session.ros_options_from_args(parse([]), prog="xblick cam") == default
+    monkeypatch.setenv("XBLICK_ROS", "0")
+    assert session.ros_options_from_args(parse(["--ros"]), prog="xblick cam") is None
+    with pytest.raises(ValueError, match="XBLICK_ROS=0"):
+        session.ros_options_from_args(parse(["--ros-domain", "3"]), prog="x")
+    for value in ("", "yes", "2", " 1"):
+        monkeypatch.setenv("XBLICK_ROS", value)
+        with pytest.raises(ValueError, match="0 .* or 1"):
+            session.ros_options_from_args(parse([]), prog="x")
+    monkeypatch.delenv("XBLICK_ROS")
     monkeypatch.setenv("ROS_DOMAIN_ID", "12")
-    assert session.ros_options_from_args(parse(["--ros", "--ros-node", "eye"]), prog="x").domain == 12
-    assert session.ros_options_from_args(parse(["--ros", "--ros-domain", "3"]), prog="x").domain == 3
-    assert not session.ros_options_from_args(parse(["--ros"]), prog="x").params_writable
-    assert session.ros_options_from_args(parse(["--ros", "--ros-params-writable"]), prog="x").params_writable
-    for argv in (["--ros-domain", "3"], ["--ros-node", "eye"], ["--ros-params-writable"],
-                 ["--ros", "--ros-node", "a-b"],
-                 ["--ros", "--ros-domain", "-1"]):
+    eye = session.ros_options_from_args(parse(["--ros-node", "eye"]), prog="x")
+    assert (eye.domain, eye.namespace, eye.node, eye.follow_parameters) == (12, "/", "eye", False)
+    lab = session.ros_options_from_args(parse(["--ros-node", "/lab/eye"]), prog="x")
+    assert (lab.namespace, lab.node) == ("/lab", "eye")
+    assert session.ros_options_from_args(parse(["--ros-domain", "3"]), prog="x").domain == 3
+    assert not session.ros_options_from_args(parse([]), prog="x").params_writable
+    assert session.ros_options_from_args(parse(["--ros-params-writable"]), prog="x").params_writable
+    assert session.ros_options_from_args(parse(["--ros-clock", "sim/clock"]), prog="x").clock == "sim/clock"
+    for argv in (["--no-ros", "--ros-domain", "3"], ["--no-ros", "--ros-node", "eye"],
+                 ["--no-ros", "--ros-params-writable"], ["--no-ros", "--ros-clock", "sim/clock"],
+                 ["--ros-node", "a-b"], ["--ros-node", "/a-b/c"], ["--ros-domain", "-1"]):
         with pytest.raises(ValueError):
             session.ros_options_from_args(parse(argv), prog="x")
 
 
+def test_the_default_node_is_in_the_cameras_namespace(monkeypatch):
+    """A program with --camera (a node): its node in the camera's namespace; a name ROS does not take is written as ROS
+    takes it, so that it does not stop a program that did not ask for ROS."""
+    monkeypatch.delenv("XBLICK_ROS", raising=False)
+    parser = argparse.ArgumentParser(prog="xblick-yolox")
+    session.add_arguments(parser)
+    parser.add_argument("--camera")
+    options = session.ros_options_from_args(parser.parse_args(["--camera", "test/cam-2"]))
+    assert (options.namespace, options.node, options.follow_parameters) == ("/test/cam_2", "xblick_yolox", True)
+    assert session.ros_options_from_args(parse([]), prog="x", camera="lab/1st").namespace == "/lab/_1st"
+
+
+def test_open_session_takes_part_by_default(monkeypatch):
+    monkeypatch.delenv("XBLICK_ROS", raising=False)
+    with session.open_session(local_router=False, program="xblick probe") as s:
+        assert s.ros is not None and s.ros.node.fully_qualified == "/xblick_probe" and s.ros.follow_parameters
+    with session.open_session(local_router=False, ros_options=False) as s:
+        assert s.ros is None
+    monkeypatch.setenv("XBLICK_ROS", "0")
+    with session.open_session(local_router=False) as s:
+        assert s.ros is None
+    with session.open_session(local_router=False, ros_options=True) as s:  # asked for explicitly
+        assert s.ros is not None
+    monkeypatch.setenv("XBLICK_ROS", "on")
+    with pytest.raises(ValueError, match="XBLICK_ROS"):
+        session.open_session(local_router=False)
+
+
 class Network:
-    """Two sessions connected directly (one listens on a free port), the first one ``--ros`` or not, and an observer
-    session that sees every key and every ROS token."""
+    """Two sessions connected directly (one listens on a free port), both in ROS 2 or both not, and an observer
+    session (not in ROS 2) that sees every key and every ROS token."""
 
     def __init__(self, with_ros: bool):
         port = free_port()
         self.endpoint = f"tcp/127.0.0.1:{port}"
-        options = session.RosOptions(DOMAIN, "xblick_test") if with_ros else None
+        options = session.RosOptions(DOMAIN, "xblick_test") if with_ros else False
         self.a = session.open_session(listen=[self.endpoint], ros_options=options)
         self.b = session.open_session(connect=[self.endpoint], ros_options=options and session.RosOptions(
             DOMAIN, "xblick_reader"))
-        self.observer = session.open_session(connect=[self.endpoint], declare=False)
+        self.observer = session.open_session(connect=[self.endpoint], declare=False, ros_options=False)
         self.keys: dict[str, bytes | None] = {}
         self.tokens: set[str] = set()
         self._sub = self.observer.declare_subscriber(
@@ -146,12 +196,12 @@ def test_with_ros_our_keys_and_rmw_zenohs_side_by_side():
             assert seq >= 1 and abs(stamp - time.time_ns()) < 10 * 10**9
         tokens = [ros.parse_token(t) for t in net.tokens]
         nodes = {t.fully_qualified_node for t in tokens if t.kind == ros.NODE}
-        assert {"/xblick_test", "/xblick_reader", "/rostest/cam/boxer"} <= nodes
+        assert nodes == {"/xblick_test", "/xblick_reader"}  # one node per program, its parameters' services on it
         publishers = {(t.topic, t.qos.key()) for t in tokens if t.kind == ros.PUBLISHER}
         assert ("/rostest/cam/color/image_raw", "::,1:,:,:,,") in publishers
         assert ("/tf_static", ":1:,1:,:,:,,") in publishers
         services = {t.topic for t in tokens if t.kind == ros.SERVICE}
-        assert {f"/rostest/cam/boxer/{s}" for s in ("get_parameters", "set_parameters", "list_parameters",
+        assert {f"/xblick_test/{s}" for s in ("get_parameters", "set_parameters", "list_parameters",
                                                     "describe_parameters", "get_parameter_types",
                                                     "set_parameters_atomically")} <= services
     finally:
@@ -191,7 +241,7 @@ def test_a_reader_with_ros_reads_the_ros_topics():
         assert got_boxes and got_boxes[0].header.frame_id == "rostest_cam"
         world_from_moving = buffer.lookup("world", "rostest_cam_moving", stamp, timeout=2.0)
         assert np.allclose(world_from_moving[:3, 3], [1, 2, 4])
-        with pytest.raises(ValueError, match="needs a session with --ros"):
+        with pytest.raises(ValueError, match="takes part in ROS 2"):
             ImageSubscriber(net.observer, "rostest/cam/color", transport="ros")
     finally:
         for p in (images, reader, buffer, camera, static, boxes, moving):
@@ -264,3 +314,123 @@ def test_matched_is_our_key_and_ros_matched_ros():
         publisher.close()
         b.close()
         a.close()
+
+
+def test_one_node_per_program_named_after_its_parameters(capsys):
+    """A default node name gives way to the name of the program's first parameters: one node, which carries the
+    publishers made before (their tokens declared anew), the six services and the publishers made after. Further
+    parameters are a node of their own."""
+    endpoint = f"tcp/127.0.0.1:{free_port()}"
+    a = session.open_session(listen=[endpoint], ros_options=session.RosOptions(DOMAIN, "xblick_x",
+                                                                              follow_parameters=True))
+    observer = session.open_session(connect=[endpoint], declare=False, ros_options=False)
+    tokens: set[str] = set()
+    live = observer.liveliness().declare_subscriber(
+        "@ros2_lv/**", lambda s: tokens.add(str(s.key_expr)) if s.kind == zenoh.SampleKind.PUT
+        else tokens.discard(str(s.key_expr)), history=True)
+    a.ros.prog = "xblick-x"
+    camera = CameraPublisher(a, "rostest/one/color", encoding="mono8", frame_id="rostest_one")
+    params = Parameters(a, "boxer", "rostest/one")
+    boxes = DetectionPublisher(a, "rostest/one/boxer/boxes", Detection2DArray)
+    more = Parameters(a, "other", "rostest/one")
+    try:
+        assert a.ros.node.fully_qualified == "/rostest/one/boxer"
+        assert "in ROS 2 as node /rostest/one/boxer (the name of its parameters)" in capsys.readouterr().err
+        time.sleep(0.5)
+        parsed = [ros.parse_token(t) for t in set(tokens)]
+        assert {t.fully_qualified_node for t in parsed if t.kind == ros.NODE} == {"/rostest/one/boxer",
+                                                                                   "/rostest/one/other"}
+        by_node = {(t.topic, t.fully_qualified_node) for t in parsed if t.kind != ros.NODE}
+        for topic in ("/rostest/one/color/image_raw", "/rostest/one/boxer/boxes", "/rostest/one/boxer/get_parameters"):
+            assert (topic, "/rostest/one/boxer") in by_node, topic
+        assert ("/rostest/one/other/get_parameters", "/rostest/one/other") in by_node
+        assert not [t for t in parsed if t.node == "xblick_x"]  # the old name's tokens are gone
+        assert camera._ros_raw.gid == ros.gid(camera._ros_raw.token.key())
+    finally:
+        for p in (more, boxes, params, camera):
+            p.close()
+        live.undeclare()
+        observer.close()
+        a.close()
+
+
+def test_a_second_node_of_one_name_is_one_warning_line(caplog):
+    endpoint = f"tcp/127.0.0.1:{free_port()}"
+    a = session.open_session(listen=[endpoint], ros_options=session.RosOptions(DOMAIN, "xblick_same"))
+    b = session.open_session(connect=[endpoint], ros_options=session.RosOptions(DOMAIN, "xblick_same"))
+    try:
+        wait_until(lambda: len([r for r in caplog.records if "ROS node /xblick_same is in ROS's graph already"
+                                in r.getMessage()]) == 2)
+        time.sleep(0.3)
+        assert len([r for r in caplog.records if "/xblick_same is in ROS's graph" in r.getMessage()]) == 2
+    finally:
+        b.close()
+        a.close()
+
+
+def test_keys_ros_does_not_take_are_left_out_with_a_warning(caplog):
+    """Our names are ROS names already (topics.check_name); a key that is not (a recording's, played) is not offered
+    to ROS: one warning line, no error, so that it does not stop a program that did not ask for ROS."""
+    from xblick.camera import cdr_encoding
+    from xblick.msg import JointState
+
+    with session.open_session(local_router=False, ros_options=session.RosOptions(DOMAIN, "xblick_names")) as a:
+        assert ros.mirror(a, "rostest/robot-1/joint_states", cdr_encoding(JointState)) is None
+        assert any("rostest/robot-1/joint_states: not offered to ROS" in r.getMessage() for r in caplog.records)
+
+
+def test_a_static_frame_another_program_sends_otherwise_is_one_error_line(caplog):
+    """Two programs (sessions) send one child frame on /tf_static with different parents: each says it once. The same
+    transform from both is no clash."""
+    net = Network(with_ros=True)
+    same = TransformStamped(Header(Time(1, 0), "world"), "rostest_shared", Transform(Vector3(1, 2, 3)))
+    other = TransformStamped(Header(Time(1, 0), "map"), "rostest_clash", Transform(Vector3(1, 2, 3)))
+    mine = TransformStamped(Header(Time(1, 0), "world"), "rostest_clash", Transform(Vector3(1, 2, 3)))
+    a = StaticTransformPublisher(net.a, "rostest/cam1", [same, mine])
+    time.sleep(0.5)
+    b = StaticTransformPublisher(net.b, "rostest/cam2", [same, other])
+    try:
+        def said(frame):
+            return [r for r in caplog.records if f"frame {frame!r} is sent by another program too" in r.getMessage()]
+        wait_until(lambda: len(said("rostest_clash")) == 2)
+        time.sleep(0.5)
+        assert len(said("rostest_clash")) == 2 and not said("rostest_shared")
+        assert "parent 'map' there, 'world' here" in said("rostest_clash")[0].getMessage() + \
+            said("rostest_clash")[1].getMessage()
+    finally:
+        b.close()
+        a.close()
+        net.close()
+
+
+def test_the_clock_key_goes_to_ros_clock():
+    from xblick.camera import CountedPublisher, cdr_encoding
+    from xblick.msg import Clock, JointState
+
+    options = session.RosOptions(DOMAIN, "xblick_sim", clock="rostest/world/clock")
+    with session.open_session(local_router=False, ros_options=options) as a:
+        clock = CountedPublisher(a, "rostest/world/clock", cdr_encoding(Clock))
+        other = CountedPublisher(a, "rostest/other/clock", cdr_encoding(Clock))
+        try:
+            assert clock._ros.topic == "/clock" and other._ros.topic == "/rostest/other/clock"
+            with pytest.raises(ros.RosError, match="not rosgraph_msgs/msg/Clock"):
+                CountedPublisher(a, "rostest/world/clock", cdr_encoding(JointState))
+        finally:
+            clock.close()
+            other.close()
+
+
+def test_a_program_without_parameters_answers_ros2_param_list():
+    """A program node without parameters still serves the six services (none, every set refused), so that
+    ``ros2 param list`` on it answers instead of waiting."""
+    from xblick.parameters import ParameterClient
+
+    net = Network(with_ros=True)
+    client = ParameterClient(net.b, "xblick_test", timeout=3.0, ros=True)
+    try:
+        assert client.list() == []
+        (refused,) = client.set({"x": 1})
+        assert not refused.successful
+    finally:
+        client.close()
+        net.close()

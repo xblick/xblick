@@ -24,8 +24,9 @@ session = db_session.open_from_args(args)
 
 [Sessions and routers](../concepts/sessions.md) explains the options.
 
-A session that takes part in ROS 2 (`--ros`) has `session.ros`. Its publishers also send on ROS's keys, and readers
-take ROS topics where you ask for them. [Durchblick and ROS 2](../integrations/ros2.md) lists both.
+A session takes part in ROS 2 by default and then has `session.ros`. Its publishers also send on ROS's keys, and
+readers take ROS topics where you ask for them. `open_session(ros_options=False)`, `--no-ros` and `XBLICK_ROS=0` turn
+it off. [Durchblick and ROS 2](../integrations/ros2.md) lists both.
 
 ```python
 session = db_session.open_session(ros_options=db_session.RosOptions(domain=0, node="my_program"))

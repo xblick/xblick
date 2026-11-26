@@ -52,9 +52,9 @@ class Network:
         return self._sessions[-1]
 
     def new_session(self):
-        # no declaration: the queries right after the start below are those of a bare session (a declaration's
-        # own exchange with the router delays the first query a little)
-        return open_session(connect=self.endpoint, listen=["127.0.0.1:0"], declare=False)
+        # no declaration and no part in ROS 2: the queries right after the start below are those of a bare session (a
+        # declaration's or a ROS node's own exchange with the router delays the first query a little)
+        return open_session(connect=self.endpoint, listen=["127.0.0.1:0"], declare=False, ros_options=False)
 
     def close(self):
         for q in self._queryables:
@@ -483,7 +483,7 @@ def test_the_command_line_says_which_case_it_was(network, capsys):
     twins = [Parameters(session, "node", "t/twin") for session in (network.server, second)]
     for twin in twins:
         twin.declare("x", 0.0)
-    endpoint = ["--connect", network.endpoint[0], "--listen", "tcp/127.0.0.1:0"]
+    endpoint = ["--connect", network.endpoint[0], "--listen", "tcp/127.0.0.1:0", "--no-ros"]  # its lines alone
     try:
         time.sleep(0.5)
         assert cli.main(["param", "--node", "t/cli/node", "--set", "x:=9.0", "--timeout", "0.5", *endpoint]) == 1
@@ -745,7 +745,10 @@ def test_a_command_reaches_every_queryable_of_its_key():
         "self._declared = self._raw.declare_querier(self.key, target=zenoh.QueryTarget.ALL_COMPLETE)": 1,
         'return {"payload": bytes(payload), "target": zenoh.QueryTarget.ALL_COMPLETE,': 1},
         # C++ (ros.hpp): ros::Service, whose entities refuse a key that does not start with the domain id (ros::Entity)
-        "cpp/src/ros.cpp": {"options.complete = true;  // ROS clients query with target ALL_COMPLETE (ros.hpp)": 1}}
+        "cpp/src/ros.cpp": {"options.complete = true;  // ROS clients query with target ALL_COMPLETE (ros.hpp)": 1},
+        # C++ Parameters::serve_none: a program node's services without parameters, on keys of ros::Entity as above
+        "cpp/src/parameters.cpp": {
+            "options.complete = true;  // as ros::Service: ROS clients query with target ALL_COMPLETE": 1}}
     found, allowed = [], {}
     for f in files:
         name = str(f.relative_to(root))

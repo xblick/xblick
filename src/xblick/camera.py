@@ -154,7 +154,7 @@ class CountedPublisher:
     control and the count on ``<key>/sent`` (SentCount), for recordings that must have every sample (the default
     drops: nothing is held up unless its publisher asks for it). Not thread-safe (call put from one thread).
 
-    A session with ``--ros`` also offers the samples to ROS 2 (ros.mirror), on the key's topic (``/<key>``), or on
+    A session in ROS 2 also offers the samples to ROS 2 (ros.mirror), on the key's topic (``/<key>``), or on
     ROS's global ``/tf`` with ``ros_tf`` (a camera's, a robot's, a world's transforms); while a ROS subscriber is
     there."""
 
@@ -176,7 +176,7 @@ class CountedPublisher:
 
     @property
     def ros_matched(self) -> bool:
-        """True if a subscriber of the ROS topic this key is mirrored to is known (``--ros``); False without one."""
+        """True if a subscriber of the ROS topic this key is mirrored to is known (session.ros); False without one."""
         return self._ros is not None and self._ros.matched
 
     def put(self, payload: bytes):
@@ -210,7 +210,7 @@ class CameraPublisher:
     ``publish`` up instead of losing frames), and their counts on ``<key>/sent`` (SentCount); the rings drop as
     always. The default drops.
 
-    A session with ``--ros`` (``session.ros``) also offers the stream to ROS 2 under ``/<base>/image_raw`` and
+    A session in ROS 2 (``session.ros``, the default) also offers the stream to ROS 2 under ``/<base>/image_raw`` and
     ``/<base>/camera_info`` (each frame's camera_info with the image's header, as image_transport has it), and under
     ``/<base>/image_raw/compressed`` with codec jpeg or png (image_transport's compressed format); RVL has no ROS
     topic. Each only while a ROS subscriber is there; the rings and our keys stay as they are."""
@@ -262,7 +262,8 @@ class CameraPublisher:
                        if p is not None} if blocking else {})
         self._ros_raw = self._ros_compressed = self._ros_info = None
         taking_part = getattr(session, "ros", None)
-        if taking_part is not None:
+        # a base that is no ROS name (a "-" in it): not offered to ROS, one warning line (ros.offered_topic)
+        if taking_part is not None and ros.offered_topic(topics.image_raw(self.base)) is not None:
             node = taking_part.node
             self._ros_raw = node.publisher(ros.topic_of(topics.image_raw(self.base)), Image.TYPE)
             if codec in (JPEG, PNG):  # image_transport's compressed plugin; RVL is no ROS format there
@@ -737,7 +738,7 @@ class StaticTransformPublisher:
     """A camera's fixed transforms between its streams' frames on ``<camera>/tf_static``: published once and answered
     on request until :meth:`close`, as ROS's latched ``/tf_static``. Also answered to zenoh-ext's AdvancedSubscriber
     (``_declare_advanced_history``), so that a late transient-local ROS subscriber behind zenoh-bridge-ros2dds gets
-    them. A session with ``--ros`` also publishes them once on ROS 2's global ``/tf_static``, transient local with a
+    them. A session in ROS 2 also publishes them once on ROS 2's global ``/tf_static``, transient local with a
     cache of one message (as tf2's static broadcaster), so that a ROS subscriber that starts later gets them until
     :meth:`close`."""
 
@@ -768,7 +769,7 @@ class StaticTransformSubscriber:
     connects, a query can end at once without answers) and every later publication. Errors (another protocol version)
     are kept and raised by :meth:`check`.
 
-    ``ros`` (a session with ``--ros``): ROS 2's global ``/tf_static`` instead, every publisher's (transient local:
+    ``ros`` (a session in ROS 2): ROS 2's global ``/tf_static`` instead, every publisher's (transient local:
     the messages of publishers that were there before come from their caches), ``camera`` unused."""
 
     def __init__(self, session: zenoh.Session, camera: str, callback, timeout: float = 10.0, ros: bool = False):
@@ -843,16 +844,16 @@ class TransformPublisher:
 
 def _ros_tf_subscriber(session, static: bool, callback):
     """A subscription to ROS 2's global ``/tf`` or ``/tf_static`` (as tf2's listener: depth 100, the static one
-    transient local) for a session with ``--ros``."""
+    transient local) for a session in ROS 2."""
     if getattr(session, "ros", None) is None:
-        raise ValueError(f"reading ROS 2's /tf{'_static' if static else ''} needs a session with --ros")
+        raise ValueError(f"reading ROS 2's /tf{'_static' if static else ''} needs {ros.NEEDS_ROS}")
     return session.ros.node.subscriber("/tf_static" if static else "/tf", TFMessage.TYPE, callback,
                                        ros.TF_STATIC_READ_QOS if static else ros.TF_QOS)
 
 
 class TransformSubscriber:
     """Calls ``callback(TFMessage)`` with every message on a camera's ``<camera>/tf``, in Zenoh's thread. Errors
-    (another protocol version) stop the deliveries; :meth:`check` raises them. ``ros`` (a session with ``--ros``):
+    (another protocol version) stop the deliveries; :meth:`check` raises them. ``ros`` (a session in ROS 2):
     ROS 2's global ``/tf`` instead, ``camera`` unused."""
 
     def __init__(self, session: zenoh.Session, camera: str, callback, ros: bool = False):
@@ -958,7 +959,7 @@ class Subscription:
         if transport not in self.TRANSPORTS and transport != AUTO:
             raise ValueError(f"transport {transport!r}: auto or one of {', '.join(self.TRANSPORTS)}")
         if transport == ROS and getattr(session, "ros", None) is None:
-            raise ValueError("transport ros reads the stream's ROS 2 topic: it needs a session with --ros")
+            raise ValueError(f"transport ros reads the stream's ROS 2 topic: it needs {ros.NEEDS_ROS}")
         if local not in LOCAL:
             raise ValueError(f"local {local!r}: one of {', '.join(LOCAL)}")
         if remote not in self.REMOTE:

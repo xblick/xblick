@@ -90,7 +90,7 @@ def make_config(connect: Sequence[str] = (), listen: Sequence[str] = (), mode: s
 def open_session(connect: Sequence[str] = (), listen: Sequence[str] = (), mode: str = "peer",
                  multicast_scouting: bool = False, config_file: str | None = None,
                  local_router: bool = True, program: str | None = None, declare: bool = True,
-                 ros_options: RosOptions | None = None) -> Session:
+                 ros_options: RosOptions | bool | None = None) -> Session:
     """A session (``make_config``). It keeps the endpoints of ``across_pcs`` for ``why_nothing``. OpenError (a
     zenoh.ZError) when Zenoh cannot open it, with a message that says why in one line.
 
@@ -98,11 +98,17 @@ def open_session(connect: Sequence[str] = (), listen: Sequence[str] = (), mode: 
     (default ``program_name()``), its version (``declaration.program_version``), host, command line, process id and
     start time. ``declare=False``: a session that does not (a test standing in for an older program).
 
-    ``ros_options`` (``--ros``): the session takes part in ROS 2 as well (``Session.ros``, ros.py): a ROS node of
-    that name on that domain, and the publishers, subscribers and parameters made with the session offer themselves
-    to ROS too (docs/integrations/ros2.md). Without it nothing of ROS is sent."""
-    from . import declaration
+    The session takes part in ROS 2 as well (``Session.ros``, ros.py): a ROS node, and the publishers, subscribers
+    and parameters made with the session offer themselves to ROS too (docs/integrations/ros2.md). ``ros_options``:
+    None (the default) as ``XBLICK_ROS`` says (0: no part; 1 or unset: ``default_ros_options`` of ``program``),
+    True those defaults, a RosOptions those, False no part: nothing of ROS is sent. RosError (a ValueError) for an
+    ``XBLICK_ROS`` or ``ROS_DOMAIN_ID`` that is not understood."""
+    from . import declaration, ros
 
+    if ros_options is None:
+        ros_options = ros.enabled_by_environment()
+    if ros_options is True:
+        ros_options = default_ros_options(program or program_name())
     config = make_config(connect, listen, mode, multicast_scouting, config_file, local_router)
     try:
         opened = zenoh.open(config)
@@ -117,11 +123,11 @@ def open_session(connect: Sequence[str] = (), listen: Sequence[str] = (), mode: 
             close(opened)
             raise
     taking_part = None
-    if ros_options is not None:
-        from . import ros
+    if ros_options:
         try:
-            taking_part = ros.Ros(opened, ros_options.domain, ros_options.node,
-                                  params_writable=ros_options.params_writable)
+            taking_part = ros.Ros(opened, ros_options.domain, ros_options.node, ros_options.namespace,
+                                  params_writable=ros_options.params_writable,
+                                  follow_parameters=ros_options.follow_parameters, clock=ros_options.clock)
         except BaseException:
             if declared is not None:
                 declared.close()
@@ -255,55 +261,94 @@ def add_arguments(parser, prefix: str = ""):
     parser.add_argument(f"{p}config", default=None, metavar="FILE",
                         help="a Zenoh JSON5 configuration file instead of the endpoints")
     parser.add_argument(f"{p}ros", action="store_true",
-                        help="take part in ROS 2 as well (rmw_zenoh, ROS 2 Jazzy): streams, transforms and parameters "
-                             "also on ROS's keys, as a ROS node (docs/integrations/ros2.md); our keys stay as they are")
+                        help="accepted and does nothing: every program takes part in ROS 2 by default (rmw_zenoh, "
+                             f"ROS 2 Jazzy and Lyrical); --{prefix}no-ros turns it off")
+    parser.add_argument(f"{p}no-ros", action="store_true",
+                        help="take no part in ROS 2: no ROS node, nothing on ROS's keys (default: a part, as a ROS "
+                             "node, beside our own keys, which stay as they are; XBLICK_ROS=0 turns it off too, "
+                             "XBLICK_ROS=1 or unset leaves it on; docs/integrations/ros2.md)")
     parser.add_argument(f"{p}ros-domain", type=int, default=None, metavar="ID",
-                        help="with --ros: the ROS domain id (default: ROS_DOMAIN_ID, else 0)")
+                        help="the ROS domain id (default: ROS_DOMAIN_ID, else 0)")
     parser.add_argument(f"{p}ros-node", default=None, metavar="NAME",
-                        help="with --ros: the program's ROS node name (default: the program's name, every character "
-                             "other than a letter, digit or _ written as _, e.g. xblick_cam)")
+                        help="the program's ROS node, NAME or /namespace/NAME (default: the name of the program's "
+                             "parameters when it has some, e.g. /test/camera/yolox; else the program's name in the "
+                             "namespace of its --camera, every character other than a letter, digit or _ written as "
+                             "_, e.g. /test/camera/xblick_test_camera)")
     parser.add_argument(f"{p}ros-params-writable", action="store_true",
-                        help="with --ros: ROS clients may set this program's parameters (default: they read them, "
+                        help="ROS clients may set this program's parameters (default: they read them, "
                              "sets are refused). A ROS set is unchecked and uncounted: no node check, no deadline, "
                              "and two nodes of one name both execute it while the ROS client shows one success")
+    parser.add_argument(f"{p}ros-clock", default=None, metavar="KEY",
+                        help="a clock key this program publishes (rosgraph_msgs/Clock, e.g. sim/clock) goes to ROS's "
+                             "global /clock instead of /KEY, for ROS nodes with use_sim_time (default: none)")
     # the program's name as the parser sees it (its prog): the default ROS node name (ros_options_from_args)
     parser.set_defaults(**{f"{prefix.replace('-', '_')}ros_program": parser.prog})
 
 
 @dataclasses.dataclass(frozen=True)
 class RosOptions:
-    """How a session takes part in ROS 2 (``--ros``, ``--ros-domain``, ``--ros-node``)."""
+    """How a session takes part in ROS 2 (``--ros-domain``, ``--ros-node``, ``--ros-params-writable``,
+    ``--ros-clock``): its node ``<namespace>/<node>``; ``follow_parameters``: that name is a default, and the
+    program's first parameters give the node theirs (ros.Ros.parameters_node)."""
 
     domain: int
     node: str
     params_writable: bool = False  # --ros-params-writable: ROS clients may set parameters
+    namespace: str = "/"
+    follow_parameters: bool = False
+    clock: str | None = None       # --ros-clock: the key of ours that goes to ROS's /clock
 
 
-def ros_options_from_args(args, prefix: str = "", prog: str | None = None) -> RosOptions | None:
-    """The ROS options of a script's arguments (``add_arguments``); None without ``--ros``. The node name defaults to
-    ``prog``, else the parser's prog (as the parser sees the program: a node started from ``python -c`` or a test gets
-    its parser's name), else ``program_name()``. ValueError (ros.RosError)
-    for a domain or node name ROS does not take, or for ``--ros-domain``/``--ros-node`` without ``--ros``."""
+def default_ros_options(program: str, camera: str | None = None) -> RosOptions:
+    """A program's part in ROS 2 when nothing is given: the domain of ``ROS_DOMAIN_ID`` (else 0), the node the
+    program's name (ros.node_name_of) in the namespace of ``camera`` (ros.namespace_of; ``/`` without), renamed after
+    the program's first parameters."""
+    from . import ros
+    return RosOptions(ros.domain_from(None), ros.node_name_of(program),
+                      namespace=ros.namespace_of(camera) if camera else "/", follow_parameters=True)
+
+
+def ros_options_from_args(args, prefix: str = "", prog: str | None = None,
+                          camera: str | None = None) -> RosOptions | None:
+    """The ROS options of a script's arguments (``add_arguments``); None with ``--no-ros`` or ``XBLICK_ROS=0``.
+    ``--ros`` changes nothing. The node name defaults to ``prog``, else the parser's prog (as the parser sees the
+    program: a node started from ``python -c`` or a test gets its parser's name), else ``program_name()``, in the
+    namespace of ``camera``, else of ``args.camera`` when that is one name (a node's ``--camera``), else ``/``; such a
+    default name gives way to the name of the program's first parameters. ValueError (ros.RosError) for a domain or
+    node name ROS does not take, an ``XBLICK_ROS`` other than 0 and 1, or for ``--ros-domain``, ``--ros-node``,
+    ``--ros-params-writable`` or ``--ros-clock`` while ROS is off."""
     from . import ros
     key = prefix.replace("-", "_")
     domain, node = getattr(args, f"{key}ros_domain", None), getattr(args, f"{key}ros_node", None)
     writable = getattr(args, f"{key}ros_params_writable", False)
-    if not getattr(args, f"{key}ros", False):
-        if domain is not None or node is not None or writable:
-            raise ros.RosError(f"--{prefix}ros-domain, --{prefix}ros-node and --{prefix}ros-params-writable need "
-                               f"--{prefix}ros")
+    clock = getattr(args, f"{key}ros_clock", None)
+    off = getattr(args, f"{key}no_ros", False)
+    if off or not ros.enabled_by_environment():
+        if domain is not None or node is not None or writable or clock is not None:
+            raise ros.RosError(f"--{prefix}ros-domain, --{prefix}ros-node, --{prefix}ros-params-writable and "
+                               f"--{prefix}ros-clock need ROS 2, which "
+                               + (f"--{prefix}no-ros" if off else f"{ros.ENABLE_ENV}=0") + " turns off")
         return None
+    if clock is not None:
+        from .topics import check_name
+        check_name(clock.strip("/"))
+    if node is not None:
+        namespace, name = ros.split_node(node) if node.startswith("/") else ("/", ros.check_node_name(node))
+        return RosOptions(ros.domain_from(domain), name, bool(writable), namespace, False, clock)
     program = prog or getattr(args, f"{key}ros_program", None) or program_name()
-    return RosOptions(ros.domain_from(domain), ros.check_node_name(node or ros.node_name_of(program)),
-                      bool(writable))
+    if camera is None and isinstance(getattr(args, "camera", None), str):
+        camera = args.camera
+    default = default_ros_options(program, camera)
+    return dataclasses.replace(default, domain=ros.domain_from(domain), params_writable=bool(writable), clock=clock)
 
 
-def open_from_args(args, prefix: str = "", prog: str | None = None) -> Session:
+def open_from_args(args, prefix: str = "", prog: str | None = None, camera: str | None = None) -> Session:
     """The session of a script's options (``add_arguments``), declaring the program ``prog`` (default:
-    ``program_name()``, a node's console script) on the network (``open_session``). A peer that connects only to other
-    PCs and listens on loopback only (``across_pcs``) is said on stderr first, as ``<prog>: ...``. Only a notice: the
-    session opens as given. A session that Zenoh cannot open (OpenError) ends the program with one line,
-    ``<prog>: ...``, and exit code 1."""
+    ``program_name()``, a node's console script) on the network (``open_session``), in ROS 2 as well unless
+    ``--no-ros`` or ``XBLICK_ROS=0`` (``ros_options_from_args``; ``camera``: the camera the program serves, for the
+    node's namespace, by default ``args.camera``). A peer that connects only to other PCs and listens on loopback
+    only (``across_pcs``) is said on stderr first, as ``<prog>: ...``. Only a notice: the session opens as given. A
+    session that Zenoh cannot open (OpenError) ends the program with one line, ``<prog>: ...``, and exit code 1."""
     key = prefix.replace("-", "_")
     mode = getattr(args, f"{key}zenoh_mode")
     connect, listen, config_file = getattr(args, f"{key}connect"), getattr(args, f"{key}listen"), getattr(
@@ -313,18 +358,20 @@ def open_from_args(args, prefix: str = "", prog: str | None = None) -> Session:
     given = prog
     prog = prog or program_name()
     try:
-        ros_options = ros_options_from_args(args, prefix, given)
+        ros_options = ros_options_from_args(args, prefix, given, camera)
     except ValueError as error:
         raise SystemExit(f"{prog}: {error}") from None
     say_across_pcs(connect, listen, mode, config_file, prog, prefix)
     try:
         session = open_session(connect=connect, listen=listen, mode=mode, config_file=config_file, program=prog,
-                               ros_options=ros_options)
+                               ros_options=ros_options or False)
     except OpenError as error:
         raise SystemExit(f"{prog}: {error}") from None
     if session.ros is not None:
+        session.ros.prog = prog
+        clock = f"; {session.ros.clock} on /clock" if session.ros.clock else ""
         print(f"{prog}: in ROS 2 as node {session.ros.node.fully_qualified} on domain {session.ros.domain} "
-              "(rmw_zenoh keys besides our own)", file=sys.stderr, flush=True)
+              f"(rmw_zenoh keys besides our own{clock}; --no-ros: none)", file=sys.stderr, flush=True)
     return session
 
 

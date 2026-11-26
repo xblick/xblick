@@ -70,8 +70,8 @@ class TrafficMeter:
     publish_ns minus the stamp, the publisher's clock alone) and at receive (this host's receive time minus the stamp:
     with the way here, and two hosts' clocks). ``take_ages`` hands out the ages since it was called last; ``recent``
     the last samples' of a key. ``keep`` (keys) also keeps their last sample (``last``), for a look at its content.
-    Subscribing makes publishers produce what nobody else takes (raw images, every transport): meter what you look
-    at."""
+    Subscribing makes publishers produce what nobody else takes (raw images, every transport, and with ``**`` also
+    their ROS 2 mirrors): meter what you look at. ROS 2's keys (``ros_key``) are not counted: Durchblick's own only."""
 
     RECENT = 20  # samples per key in ``recent``
     WINDOW_MAX = 10_000  # ages per key between two take_ages (a fast topic and a slow reader)
@@ -88,7 +88,10 @@ class TrafficMeter:
 
     def _on_sample(self, sample: zenoh.Sample):
         received = time.time_ns()
-        key, encoding, payload = str(sample.key_expr), str(sample.encoding), sample.payload.to_bytes()
+        key = str(sample.key_expr)
+        if ros_key(key):
+            return
+        encoding, payload = str(sample.encoding), sample.payload.to_bytes()
         stamp = _stamp(key, encoding, payload)
         try:
             meta = parse_attachment(sample.attachment.to_bytes() if sample.attachment is not None else None)
@@ -437,7 +440,8 @@ def common_prefix(keys: Iterable[str]) -> str:
 def query_network(session: zenoh.Session, timeout: float = 1.0) -> Network:
     """The routers' admin space (``@/<router>/router``, ``@/<router>/router/<kind>/<key>``) as a Network. A
     declaration a router knows only from another router (a session attached there) is that router's: its own admin
-    space has the session, when it answers too."""
+    space has the session, when it answers too. The keys and tokens of ROS 2 on rmw_zenoh (``ros_key``) are left
+    out: every program's part in ROS 2 mirrors its keys there, and this is Durchblick's graph."""
     network = Network()
     for key, payload in _admin(session, "@/*/router", timeout):
         record = json.loads(payload)
@@ -458,12 +462,20 @@ def query_network(session: zenoh.Session, timeout: float = 1.0) -> Network:
     for kind in ADMIN_KINDS:
         for key, payload in _admin(session, f"@/*/router/{kind}/**", timeout):
             router_zid, declared = _admin_key(key, kind)
+            if ros_key(declared):
+                continue
             record = json.loads(payload)
             zids = set(record.get("peers") or []) | set(record.get("clients") or [])
             zids |= set(record.get("routers") or []) - {router_zid}
             for zid in zids:
                 network.node(zid).declared(kind).add(declared)
     return network
+
+
+def ros_key(key: str) -> bool:
+    """True for a key or token of ROS 2 on rmw_zenoh: a data or service key starts with the domain id (no key of ours
+    does, topics.check_name), a token with ``@ros2_lv/``."""
+    return key[:1].isdigit() or key.startswith("@ros2_lv/")
 
 
 def _router_program(record: dict) -> Program | None:

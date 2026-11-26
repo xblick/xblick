@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <charconv>
 #include <chrono>
 #include <cstdio>
@@ -141,6 +142,48 @@ namespace xblick::ros
         const std::size_t slash = fully_qualified.rfind('/');
         const std::string ns = fully_qualified.substr(0, slash);
         return {ns.empty() ? "/" : ns, fully_qualified.substr(slash + 1)};
+    }
+
+    std::string namespace_of(const std::string& name)
+    {
+        std::string out;
+        for (const std::string& part : split(name, '/'))
+        {
+            if (not part.empty())
+            {
+                out += "/" + node_name_of(part);
+            }
+        }
+        return out.empty() ? "/" : out;
+    }
+
+    std::pair<std::string, std::string> node_of(const std::string& name)
+    {
+        std::string n = name;
+        n.erase(0, n.find_first_not_of('/'));
+        n.erase(n.find_last_not_of('/') + 1);
+        const std::size_t slash = n.rfind('/');
+        const std::string last = slash == std::string::npos ? n : n.substr(slash + 1);
+        if (last.empty())
+        {
+            throw RosError(repr(name) + ": no node name");
+        }
+        return {namespace_of(slash == std::string::npos ? "" : n.substr(0, slash)), node_name_of(last)};
+    }
+
+    bool enabled_by_environment()
+    {
+        const char* value = std::getenv(kEnableEnv);
+        if (value == nullptr or std::string(value) == "1")
+        {
+            return true;
+        }
+        if (std::string(value) == "0")
+        {
+            return false;
+        }
+        throw RosError(std::string(kEnableEnv) + "=" + repr(value) +
+                       ": 0 (no part in ROS 2) or 1 (ROS 2 beside our own keys, the default)");
     }
 
     std::string dds_type(const std::string& type_name)
@@ -497,22 +540,66 @@ namespace xblick::ros
 
     // ------------------------------------------------------------------------------------------ taking part
 
-    std::optional<Options> options_from(bool ros, std::optional<std::int64_t> domain,
-                                        const std::optional<std::string>& node, bool params_writable,
-                                        const std::string& program)
+    Options default_options(const std::string& program, const std::string& camera)
     {
-        if (not ros)
+        Options o;
+        o.domain = domain_from(std::nullopt);
+        o.node = program.empty() ? std::string() : node_name_of(program);
+        o.ns = camera.empty() ? "/" : namespace_of(camera);
+        o.follow_parameters = true;
+        return o;
+    }
+
+    std::optional<Options> from_environment()
+    {
+        if (not enabled_by_environment())
         {
-            if (domain or node or params_writable)
+            return std::nullopt;
+        }
+        return default_options("");
+    }
+
+    std::optional<Options> options_from(bool no_ros, std::optional<std::int64_t> domain,
+                                        const std::optional<std::string>& node, bool params_writable,
+                                        const std::optional<std::string>& clock, const std::string& program,
+                                        const std::string& camera)
+    {
+        if (no_ros or not enabled_by_environment())
+        {
+            if (domain or node or params_writable or clock)
             {
-                throw RosError("--ros-domain, --ros-node and --ros-params-writable need --ros");
+                throw RosError(std::string("--ros-domain, --ros-node, --ros-params-writable and --ros-clock need ROS "
+                                           "2, which ") +
+                               (no_ros ? "--no-ros" : std::string(kEnableEnv) + "=0") + " turns off");
             }
             return std::nullopt;
         }
         Options o;
+        if (node)
+        {
+            if (not node->empty() and node->front() == '/')
+            {
+                std::tie(o.ns, o.node) = split_node(*node);
+            }
+            else
+            {
+                o.node = check_node_name(*node);
+            }
+        }
+        else
+        {
+            o = default_options(program, camera);
+        }
         o.domain = domain_from(domain);
-        o.node = check_node_name(node ? *node : node_name_of(program));
         o.params_writable = params_writable;
+        if (clock)
+        {
+            std::string c = *clock;
+            c.erase(0, c.find_first_not_of('/'));
+            c.erase(c.find_last_not_of('/') + 1);
+            check_ros_name("/" + c, "--ros-clock");
+            o.clock = c;
+        }
         return o;
     }
 
@@ -528,12 +615,23 @@ namespace xblick::ros
 
     Ros::Ros(std::string zid, const Options& options) : zid_(std::move(zid)), options_(options)
     {
-        node_ = add_node(options_.node);
+        node_ = add_node(options_.node.empty() ? std::string("xblick") : options_.node, options_.ns);
+    }
+
+    Ros::~Ros()
+    {
+        detach();
     }
 
     std::string Ros::next_id()
     {
         return std::to_string(ids_.fetch_add(1));
+    }
+
+    NodeName Ros::node() const
+    {
+        std::lock_guard lock(graph_mutex_);
+        return node_;
     }
 
     NodeName Ros::add_node(const std::string& name, const std::string& ns)
@@ -547,45 +645,15 @@ namespace xblick::ros
         return n;
     }
 
-    void Ros::check_tf(std::span<const std::uint8_t> payload, bool is_static)
-    {
-        TFMessage message;
-        try
-        {
-            message = TFMessage::deserialize(payload);
-        }
-        catch (const std::exception& e)
-        {
-            say(std::string(is_static ? "/tf_static" : "/tf") + ": a message that is no TFMessage (" + e.what() + ")");
-            return;
-        }
-        std::lock_guard lock(tf_mutex_);
-        for (const auto& t : message.transforms)
-        {
-            const std::string& child = t.child_frame_id;
-            const std::string& parent = t.header.frame_id;
-            const auto [it, added] = tf_parents_.emplace(child, parent);
-            if (not added and it->second != parent and
-                std::find(tf_clashes_.begin(), tf_clashes_.end(), child) == tf_clashes_.end())
-            {
-                tf_clashes_.push_back(child);
-                say("ROS tf: frame " + repr(child) + " has parent " + repr(it->second) + " and parent " +
-                    repr(parent) + " in this program; tf2 takes one parent per frame: give each camera and robot "
-                    "frame names of its own (--frame-id)");
-            }
-        }
-    }
-
     namespace
     {
         std::mutex registry_mutex;
         std::map<std::string, std::weak_ptr<Ros>> registry;  // zid -> its part in ROS, while its session is open
 
-        // The program's node: its Ros and its token, kept by the session (released when it closes).
+        // Keeps the program's Ros while its session is open (released when it closes).
         struct Holder
         {
             std::shared_ptr<Ros> ros;
-            std::optional<zenoh::LivelinessToken> token;
         };
 
         Token node_token(const Ros& ros, const NodeName& node)
@@ -605,7 +673,297 @@ namespace xblick::ros
         // the ids of the stand-ins for zenoh-ext's publication caches: far from zenoh-ext's own counters, which start
         // at 0 per session
         std::atomic<std::uint32_t> cache_ids{3'000'000'000U};
+
+        using detail::StaticTransform;
+
+        StaticTransform static_of(const TransformStamped& t)
+        {
+            const auto& tr = t.transform.translation;
+            const auto& q = t.transform.rotation;
+            return {t.header.frame_id, {tr.x, tr.y, tr.z}, {q.x, q.y, q.z, q.w}};
+        }
+
+        constexpr double kTfTolerance = 1e-6;  // two static transforms of one frame that differ less are the same
+
+        // Why two static transforms of one frame clash, or empty (q and -q are the same rotation), as Python's
+        std::string static_differs(const StaticTransform& a, const StaticTransform& b)
+        {
+            if (std::get<0>(a) != std::get<0>(b))
+            {
+                return "parent " + repr(std::get<0>(b)) + " there, " + repr(std::get<0>(a)) + " here";
+            }
+            bool same_t = true, same_q = true, same_minus_q = true;
+            for (int i = 0; i < 3; ++i)
+            {
+                same_t = same_t and std::abs(std::get<1>(a)[i] - std::get<1>(b)[i]) <= kTfTolerance;
+            }
+            for (int i = 0; i < 4; ++i)
+            {
+                same_q = same_q and std::abs(std::get<2>(a)[i] - std::get<2>(b)[i]) <= kTfTolerance;
+                same_minus_q = same_minus_q and std::abs(std::get<2>(a)[i] + std::get<2>(b)[i]) <= kTfTolerance;
+            }
+            return same_t and (same_q or same_minus_q) ? ""
+                                                       : "parent " + repr(std::get<0>(a)) + " in both, another transform";
+        }
     }  // namespace
+
+    // The watch for a second node of the program node's name: what its callback compares with, changed by a rename.
+    struct Ros::Duplicates
+    {
+        std::mutex mutex;
+        std::string own;   // the program node's token key
+        std::string name;  // its fully qualified name
+        std::set<std::string> said;
+        int domain = 0;
+
+        void seen(const std::string& key)
+        {
+            std::string name_now;
+            {
+                std::lock_guard lock(mutex);
+                if (key == own)
+                {
+                    return;
+                }
+                Token t;
+                try
+                {
+                    t = Token::parse(key);
+                }
+                catch (const RosError&)  // not a node token rmw_zenoh would take: no node of ROS's graph
+                {
+                    return;
+                }
+                if (t.fully_qualified_node() != name or not said.insert(name).second)
+                {
+                    return;
+                }
+                name_now = name;
+            }
+            say("ROS node " + name_now + " is in ROS's graph already (another program, or another session of this one, "
+                "on domain " + std::to_string(domain) + "): ROS's tools then show two nodes of one name and reach one "
+                "of them; give each program a node name of its own (--ros-node)");
+        }
+    };
+
+    void Ros::attach(zenoh::Session& session, const std::string& program)
+    {
+        std::lock_guard lock(graph_mutex_);
+        attached_ = true;
+        program_ = program;
+        node_token_.emplace(session.liveliness_declare_token(zenoh::KeyExpr(node_token(*this, node_).key())));
+        duplicates_ = std::make_shared<Duplicates>();
+        duplicates_->domain = domain();
+        duplicates_->own = node_token(*this, node_).key();
+        duplicates_->name = node_.fully_qualified();
+        // a background subscriber on every node token of the domain (those there now too): Zenoh ends it with the
+        // session. A subscriber of ours undeclared while the session closes (its drop callback, take_part) would wait
+        // for the closing session for good.
+        zenoh::Session::LivelinessSubscriberOptions options;
+        options.history = true;
+        session.liveliness_declare_background_subscriber(
+            zenoh::KeyExpr(std::string(kAdminSpace) + "/" + std::to_string(domain()) + "/*/*/*/" + std::string(kNode) +
+                           "/**"),
+            [watch = duplicates_](const zenoh::Sample& sample) {
+                if (sample.get_kind() == Z_SAMPLE_KIND_PUT)
+                {
+                    watch->seen(std::string(sample.get_keyexpr().as_string_view()));
+                }
+            },
+            [] {}, std::move(options));
+    }
+
+    void Ros::detach()
+    {
+        std::lock_guard lock(graph_mutex_);
+        node_token_.reset();  // a token may go while the session closes (it did before, take_part)
+        attached_ = false;
+    }
+
+    void Ros::watch_duplicates(zenoh::Session& session)
+    {
+        {
+            std::lock_guard lock(duplicates_->mutex);
+            duplicates_->own = node_token(*this, node_).key();
+            duplicates_->name = node_.fully_qualified();
+        }
+        // the nodes of the new name there now: the subscriber's history had those of the old one
+        const std::string pattern = std::string(kAdminSpace) + "/" + std::to_string(domain()) + "/*/*/*/" +
+                                    std::string(kNode) + "/*/" + mangle(node_.ns) + "/" + mangle(node_.name);
+        session.liveliness_get(
+            zenoh::KeyExpr(pattern),
+            [watch = duplicates_](const zenoh::Reply& reply) {
+                if (reply.is_ok())
+                {
+                    watch->seen(std::string(reply.get_ok().get_keyexpr().as_string_view()));
+                }
+            },
+            [] {});
+    }
+
+    std::uint64_t Ros::enroll(const NodeName& as_made, std::function<void(const NodeName&)> rename)
+    {
+        std::lock_guard lock(graph_mutex_);
+        const std::uint64_t id = ++enrolled_ids_;
+        if (as_made.ns != node_.ns or as_made.name != node_.name)  // made while the node was renamed
+        {
+            rename(node_);
+        }
+        enrolled_.emplace(id, std::move(rename));
+        return id;
+    }
+
+    void Ros::leave(std::uint64_t id)
+    {
+        std::lock_guard lock(graph_mutex_);
+        enrolled_.erase(id);
+    }
+
+    void Ros::own(const Gid& gid)
+    {
+        std::lock_guard lock(graph_mutex_);
+        own_gids_.insert(gid);
+    }
+
+    std::optional<NodeName> Ros::parameters_node(const std::string& name, zenoh::Session& session)
+    {
+        const auto [ns, node] = node_of(name);
+        std::lock_guard lock(graph_mutex_);
+        if (parameters_taken_)
+        {
+            return std::nullopt;
+        }
+        parameters_taken_ = true;
+        if (retire_)
+        {
+            std::exchange(retire_, {})();
+        }
+        if (options_.follow_parameters and (ns != node_.ns or node != node_.name))
+        {
+            check_node_name(node);
+            if (ns != "/")
+            {
+                check_ros_name(ns, "namespace");
+            }
+            node_.ns = ns;
+            node_.name = node;
+            if (attached_)
+            {
+                node_token_.reset();
+                node_token_.emplace(session.liveliness_declare_token(zenoh::KeyExpr(node_token(*this, node_).key())));
+                for (auto& [id, rename] : enrolled_)
+                {
+                    rename(node_);
+                }
+                watch_duplicates(session);
+                if (not program_.empty())
+                {
+                    std::fprintf(stderr, "%s: in ROS 2 as node %s (the name of its parameters)\n", program_.c_str(),
+                                 node_.fully_qualified().c_str());
+                    std::fflush(stderr);
+                }
+            }
+        }
+        return node_;
+    }
+
+    void Ros::until_parameters(std::function<void()> retire)
+    {
+        std::lock_guard lock(graph_mutex_);
+        retire_ = std::move(retire);
+    }
+
+    void Ros::release_parameters()
+    {
+        std::lock_guard lock(graph_mutex_);
+        parameters_taken_ = false;
+    }
+
+    void Ros::check_tf(std::span<const std::uint8_t> payload, bool is_static)
+    {
+        TFMessage message;
+        try
+        {
+            message = TFMessage::deserialize(payload);
+        }
+        catch (const std::exception& e)
+        {
+            say(std::string(is_static ? "/tf_static" : "/tf") + ": a message that is no TFMessage (" + e.what() + ")");
+            return;
+        }
+        std::vector<std::pair<std::string, std::pair<StaticTransform, StaticTransform>>> compare;
+        {
+            std::lock_guard lock(tf_mutex_);
+            for (const auto& t : message.transforms)
+            {
+                const std::string& child = t.child_frame_id;
+                const std::string& parent = t.header.frame_id;
+                const auto [it, added] = tf_parents_.emplace(child, parent);
+                if (not added and it->second != parent and
+                    std::find(tf_clashes_.begin(), tf_clashes_.end(), child) == tf_clashes_.end())
+                {
+                    tf_clashes_.push_back(child);
+                    say("ROS tf: frame " + repr(child) + " has parent " + repr(it->second) + " and parent " +
+                        repr(parent) + " in this program; tf2 takes one parent per frame: give each camera and robot "
+                        "frame names of its own (--frame-id)");
+                }
+                if (is_static)
+                {
+                    static_mine_[child] = static_of(t);
+                    if (const auto other = static_others_.find(child); other != static_others_.end())
+                    {
+                        compare.push_back({child, {static_mine_[child], other->second}});
+                    }
+                }
+            }
+        }
+        for (const auto& [child, pair] : compare)
+        {
+            say_static(child, pair.first, pair.second);
+        }
+    }
+
+    void Ros::say_static(const std::string& child, const StaticTransform& mine, const StaticTransform& theirs)
+    {
+        const std::string why = static_differs(mine, theirs);
+        {
+            std::lock_guard lock(tf_mutex_);
+            if (why.empty() or not static_said_.insert(child).second)
+            {
+                return;
+            }
+        }
+        say("ROS /tf_static: frame " + repr(child) + " is sent by another program too, " + why +
+            "; tf2 keeps one of them: give each camera and robot frame names of its own (--frame-id)");
+    }
+
+    void Ros::on_static_sample(std::span<const std::uint8_t> payload, const Attachment& attachment)
+    {
+        {
+            std::lock_guard lock(graph_mutex_);
+            if (own_gids_.contains(attachment.gid))
+            {
+                return;
+            }
+        }
+        for (const auto& t : TFMessage::deserialize(payload).transforms)
+        {
+            const StaticTransform theirs = static_of(t);
+            std::optional<StaticTransform> mine;
+            {
+                std::lock_guard lock(tf_mutex_);
+                static_others_[t.child_frame_id] = theirs;
+                if (const auto found = static_mine_.find(t.child_frame_id); found != static_mine_.end())
+                {
+                    mine = found->second;
+                }
+            }
+            if (mine)
+            {
+                say_static(t.child_frame_id, *mine, theirs);
+            }
+        }
+    }
 
     std::shared_ptr<Ros> of(const zenoh::Session& session)
     {
@@ -616,19 +974,24 @@ namespace xblick::ros
 
     namespace detail
     {
-        void take_part(zenoh::Session& session, const Options& options)
+        void take_part(zenoh::Session& session, const Options& options, const std::string& program)
         {
             const std::string zid = session.get_zid().to_string();
+            Options o = options;
+            if (o.node.empty())
+            {
+                o.node = node_name_of(program.empty() ? std::string("xblick") : program);
+            }
             auto holder = std::make_shared<Holder>();
-            holder->ros = std::make_shared<Ros>(zid, options);
+            holder->ros = std::make_shared<Ros>(zid, o);
+            holder->ros->attach(session, program);
             const std::string key = node_token(*holder->ros, holder->ros->node()).key();
-            holder->token.emplace(session.liveliness_declare_token(zenoh::KeyExpr(key)));
             {
                 std::lock_guard lock(registry_mutex);
                 registry[zid] = holder->ros;
             }
             // Kept by the session: a background liveliness subscriber on the node's own token, whose drop callback
-            // (when the session closes) releases the node's token and its Ros (as the declaration's queryable keeps
+            // (when the session closes) releases the node's tokens and its Ros (as the declaration's queryable keeps
             // the declaration's token, declaration.cpp).
             session.liveliness_declare_background_subscriber(
                 zenoh::KeyExpr(key), [](const zenoh::Sample&) {},
@@ -637,7 +1000,7 @@ namespace xblick::ros
                         std::lock_guard lock(registry_mutex);
                         registry.erase(zid);
                     }
-                    holder->token.reset();
+                    holder->ros->detach();
                     holder.reset();
                 });
         }
@@ -677,6 +1040,41 @@ namespace xblick::ros
             throw RosError(name + ": best-effort ROS entities are not offered by the C++ API");
         }
     }
+
+    void Entity::rename(const NodeName& node)
+    {
+        token.ns = node.ns;
+        token.node = node.name;
+        token_key = token.key();
+        gid = ros::gid(token_key);
+    }
+
+    namespace
+    {
+        // An entity made on the program's node (its id): enrolled, so that a rename of the node reaches it
+        // (Ros::enroll); its gid counted as the session's own.
+        template <typename Renamed>
+        std::uint64_t enroll_if_program_node(Ros& ros, std::weak_ptr<Ros>& kept, const NodeName& node, const Gid& gid,
+                                             Renamed renamed)
+        {
+            ros.own(gid);
+            std::shared_ptr<Ros> shared = ros.weak_from_this().lock();
+            if (not shared or node.id != ros.node().id)  // a Ros of no session (a test), or a node of its own
+            {
+                return 0;
+            }
+            kept = shared;
+            return ros.enroll(node, std::move(renamed));
+        }
+
+        void leave(std::weak_ptr<Ros>& kept, std::uint64_t id)
+        {
+            if (const std::shared_ptr<Ros> ros = kept.lock(); ros and id != 0)
+            {
+                ros->leave(id);
+            }
+        }
+    }  // namespace
 
     namespace
     {
@@ -747,10 +1145,23 @@ namespace xblick::ros
             cache_token_.emplace(session.liveliness_declare_token(zenoh::KeyExpr(cache_key)));
         }
         token_.emplace(session.liveliness_declare_token(zenoh::KeyExpr(entity_.token_key)));
+        enrolled_ = enroll_if_program_node(ros, ros_, node, entity_.gid, [this, &session, &ros](const NodeName& n) {
+            renamed(session, n);
+            ros.own(entity_.gid);
+        });
+    }
+
+    void Publisher::renamed(zenoh::Session& session, const NodeName& node)
+    {
+        std::lock_guard lock(mutex_);  // put's gid
+        entity_.rename(node);
+        token_.reset();
+        token_.emplace(session.liveliness_declare_token(zenoh::KeyExpr(entity_.token_key)));
     }
 
     Publisher::~Publisher()
     {
+        leave(ros_, enrolled_);
         token_.reset();
         cache_token_.reset();
         cache_queryable_.reset();
@@ -883,10 +1294,17 @@ namespace xblick::ros
                 [state](const zenoh::Sample& sample) { state->take(sample); }, zenoh::closures::none));
         }
         token_.emplace(session.liveliness_declare_token(zenoh::KeyExpr(entity_.token_key)));
+        enrolled_ = enroll_if_program_node(ros, ros_, node, entity_.gid, [this, &session, &ros](const NodeName& n) {
+            entity_.rename(n);
+            ros.own(entity_.gid);
+            token_.reset();
+            token_.emplace(session.liveliness_declare_token(zenoh::KeyExpr(entity_.token_key)));
+        });
     }
 
     Subscriber::~Subscriber()
     {
+        leave(ros_, enrolled_);
         state_->closed.store(true);
         token_.reset();
         history_.reset();
@@ -918,10 +1336,17 @@ namespace xblick::ros
             },
             zenoh::closures::none, std::move(options)));
         token_.emplace(session.liveliness_declare_token(zenoh::KeyExpr(entity_.token_key)));
+        enrolled_ = enroll_if_program_node(ros, ros_, node, entity_.gid, [this, &session, &ros](const NodeName& n) {
+            entity_.rename(n);
+            ros.own(entity_.gid);
+            token_.reset();
+            token_.emplace(session.liveliness_declare_token(zenoh::KeyExpr(entity_.token_key)));
+        });
     }
 
     Service::~Service()
     {
+        leave(ros_, enrolled_);
         token_.reset();
         queryable_.reset();
     }
@@ -934,9 +1359,15 @@ namespace xblick::ros
 
     void Service::reply(const zenoh::Query& query, std::vector<std::uint8_t>&& payload, const Attachment& request) const
     {
+        ros::reply(query, entity_.key, std::move(payload), request);
+    }
+
+    void reply(const zenoh::Query& query, const std::string& key, std::vector<std::uint8_t>&& payload,
+               const Attachment& request)
+    {
         zenoh::Query::ReplyOptions options;
         options.attachment = zenoh::Bytes(encode_attachment(request.seq, now_ns(), request.gid));
-        query.reply(zenoh::KeyExpr(entity_.key), zenoh::Bytes(std::move(payload)), std::move(options));
+        query.reply(zenoh::KeyExpr(key), zenoh::Bytes(std::move(payload)), std::move(options));
     }
 
     std::unique_ptr<Publisher> mirror(zenoh::Session& session, const std::string& key,
@@ -953,12 +1384,37 @@ namespace xblick::ros
             return nullptr;
         }
         const std::string type_name(type.name);
+        std::string topic;
+        std::string k = key;
+        k.erase(0, k.find_first_not_of('/'));
+        k.erase(k.find_last_not_of('/') + 1);
+        if (not ros->clock().empty() and k == ros->clock())
+        {
+            if (type.version != 0 or type_name != "rosgraph_msgs/msg/Clock")
+            {
+                throw RosError("--ros-clock " + key + ": its type is " + type.schema() +
+                               ", not rosgraph_msgs/msg/Clock");
+            }
+            topic = std::string(kClockTopic);
+        }
         if (type.version != 0 or not type_hashes().contains(type_name))
         {
             say(key + ": not offered to ROS (" + type.schema() + " has no ROS type hash here)");
             return nullptr;
         }
-        return std::make_unique<Publisher>(session, *ros, ros->node(), topic_of(key), type_name, qos);
+        if (topic.empty())
+        {
+            try
+            {
+                topic = topic_of(key);
+            }
+            catch (const RosError& error)  // a key that is no ROS name: ours only, the program goes on
+            {
+                say(key + ": not offered to ROS (" + error.what() + ")");
+                return nullptr;
+            }
+        }
+        return std::make_unique<Publisher>(session, *ros, ros->node(), topic, type_name, qos);
     }
 
     std::unique_ptr<Publisher> mirror_tf(zenoh::Session& session, bool is_static, const std::string& key)
@@ -977,6 +1433,21 @@ namespace xblick::ros
                                                      std::string(protocol::kTFMessageType.name),
                                                      is_static ? kTfStaticQos : kTfQos);
         publisher->check = [ros, is_static](std::span<const std::uint8_t> payload) { ros->check_tf(payload, is_static); };
+        if (is_static)
+        {
+            // ROS's /tf_static of other programs, compared with this program's (Ros::check_tf): read while this
+            // publisher lives, so that it goes with an object of the program, before the session
+            std::weak_ptr<Ros> weak = ros;
+            publisher->companion_ = std::make_unique<Subscriber>(
+                session, *ros, ros->node(), "/tf_static", std::string(protocol::kTFMessageType.name),
+                [weak](std::vector<std::uint8_t>&& payload, const Attachment& attachment) {
+                    if (const std::shared_ptr<Ros> part = weak.lock())
+                    {
+                        part->on_static_sample(payload, attachment);
+                    }
+                },
+                kTfStaticReadQos);
+        }
         return publisher;
     }
 }  // namespace xblick::ros

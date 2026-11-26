@@ -201,5 +201,5 @@ def test_a_command_that_finds_nothing_says_why_in_one_line(capsys):
     assert cli.main(["list", "--connect", nobody, "--seconds", "0.3"]) == 1
     err = capsys.readouterr().err
     assert "no stream answered within 0.3 s; this session reached no Zenoh router" in err
-    assert cli.main(["param", "--node", "t/nobody", "--connect", nobody, "--timeout", "0.3"]) == 1
+    assert cli.main(["param", "--node", "t/nobody", "--connect", nobody, "--timeout", "0.3", "--no-ros"]) == 1
     assert capsys.readouterr().err == "xblick param: no answer from t/nobody/list_parameters within 0.3 s\n"

@@ -5,7 +5,7 @@
 //                        [--view] [--frames 10] [--timeout 10] [--camera-info] [--points [--local cuda]]
 //                        [--max-hz 5]
 //   xblick-cpp-probe --connect host:7447 --params <namespace>/<name> [--set NAME:=VALUE]
-//   xblick-cpp-probe --connect host:7447 --tf-static <camera> [--ros] [--timeout 10]
+//   xblick-cpp-probe --connect host:7447 --tf-static <camera> [--via-ros] [--timeout 10]
 //
 // --params: a node's parameters (parameters.hpp, ParameterClient): with --set that change first (a line with its
 // result and "checked": its node checked node and deadline), then a line per parameter (name, type, value, read_only,
@@ -250,14 +250,15 @@ namespace
         return 0;
     }
 
-    // --tf-static CAMERA: the camera's fixed transforms (with --ros: ROS's /tf_static, CAMERA unused), one line per
+    // --tf-static CAMERA: the camera's fixed transforms (with --via-ros: ROS's /tf_static, CAMERA unused), one line per
     // transform once they came, within --timeout
     int probe_tf_static(zenoh::Session& session, const xblick::tools::Args& args)
     {
         using namespace xblick;
         const auto timeout = std::chrono::duration<double>(std::stod(args.get("timeout", "10")));
         StaticTransformSubscriber fixed(session, args.get("tf-static", ""),
-                                        std::chrono::duration_cast<std::chrono::milliseconds>(timeout), args.flag("ros"));
+                                        std::chrono::duration_cast<std::chrono::milliseconds>(timeout),
+                                        args.flag("via-ros"));
         const auto deadline = std::chrono::steady_clock::now() + timeout;
         while (std::chrono::steady_clock::now() < deadline and fixed.received() == 0)
         {

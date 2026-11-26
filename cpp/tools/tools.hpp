@@ -147,8 +147,9 @@ namespace xblick::tools
         std::vector<std::string> args_;
     };
 
-    // --ros, --ros-domain ID, --ros-node NAME, --ros-params-writable of a tool (Options::add_session_options has them
-    // for programs on Options): the same rules (ros::options_from), std::invalid_argument for a wrong one.
+    // --no-ros, --ros-domain ID, --ros-node NAME, --ros-params-writable, --ros-clock KEY of a tool (--ros does nothing;
+    // Options::add_session_options has them for programs on Options): the same rules (ros::options_from, the
+    // namespace of --camera), std::invalid_argument for a wrong one.
     inline std::optional<ros::Options> ros_options(const Args& args, const std::string& program)
     {
         const auto value = [&](const std::string& name) -> std::optional<std::string> {
@@ -173,7 +174,7 @@ namespace xblick::tools
                 throw std::invalid_argument("--ros-domain " + *d + ": an integer expected");
             }
         }
-        return ros::options_from(args.flag("ros"), domain, value("ros-node"), args.flag("ros-params-writable"),
-                                 program);
+        return ros::options_from(args.flag("no-ros"), domain, value("ros-node"), args.flag("ros-params-writable"),
+                                 value("ros-clock"), program, value("camera").value_or(""));
     }
 }  // namespace xblick::tools

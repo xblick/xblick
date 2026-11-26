@@ -845,28 +845,80 @@ namespace xblick
         token_.emplace(session.liveliness_declare_token(zenoh::KeyExpr(key_ + "/" + std::string(p::kParametersToken))));
         if (const std::shared_ptr<ros::Ros> part = ros::of(session))
         {
-            // the ROS node of this name (Python's Parameters with session.ros): its six services on ROS's keys, its
-            // events on ROS's /parameter_events; a name ROS does not take stops it here (RosError)
-            const auto [node_ns, node_name] = ros::split_node(name_);
+            // the program's ROS node (Python's Parameters with session.ros, ros::Ros::parameters_node), else one of
+            // their own: the six services on ROS's keys, the events on ROS's /parameter_events
             ros_params_writable_ = part->params_writable();
-            ros_node_ = std::make_unique<ros::RosNode>(session, part, node_name, node_ns);
+            ros::NodeName node;
+            if (const std::optional<ros::NodeName> program_node = part->parameters_node(name_, session))
+            {
+                node = *program_node;
+                ros_part_ = part;
+            }
+            else
+            {
+                const auto [node_ns, node_name] = ros::node_of(name_);
+                ros_node_ = std::make_unique<ros::RosNode>(session, part, node_name, node_ns);
+                node = ros_node_->name();
+            }
+            ros_name_ = node.fully_qualified();
             for (const std::string_view service : services())
             {
                 const std::string s(service);
                 ros_services_.push_back(std::make_unique<ros::Service>(
-                    session, *part, ros_node_->name(), name_ + "/" + s, ros_service_type(s),
+                    session, *part, node, ros_name_ + "/" + s, ros_service_type(s),
                     [this, s, calls = calls_](const zenoh::Query& query, const ros::Service& server) {
                         const CallGuard::Call call(*calls);
                         if (call)
                         {
-                            answer_ros(s, server, query);
+                            answer_ros(s, server.key(), query);
                         }
                     }));
             }
-            ros_events_ = std::make_unique<ros::Publisher>(session, *part, ros_node_->name(), "/parameter_events",
+            ros_events_ = std::make_unique<ros::Publisher>(session, *part, node, "/parameter_events",
                                                            std::string(p::kParameterEventType.name),
                                                            ros::kParametersQos);
         }
+    }
+
+    void Parameters::serve_none(zenoh::Session& session, const std::shared_ptr<ros::Ros>& part)
+    {
+        struct State
+        {
+            State(const std::string& name, const std::string& ns) : parameters(nullptr, name, ns) {}
+            Parameters parameters;  // none declared: what they answer
+            std::atomic<bool> retired{false};
+        };
+        const ros::NodeName node = part->node();
+        std::string ns = node.ns;
+        ns.erase(0, ns.find_first_not_of('/'));
+        auto state = std::make_shared<State>(node.name, ns);
+        state->parameters.ros_params_writable_ = part->params_writable();
+        state->parameters.ros_name_ = node.fully_qualified();
+        auto tokens = std::make_shared<std::vector<zenoh::LivelinessToken>>();
+        for (const std::string_view service : services())
+        {
+            const std::string s(service);
+            const ros::Entity e(*part, node, ros::kService, node.fully_qualified() + "/" + s, ros_service_type(s),
+                                ros::kParametersQos, part->next_id());
+            zenoh::Session::QueryableOptions options;
+            options.complete = true;  // as ros::Service: ROS clients query with target ALL_COMPLETE
+            // background: the session ends it; one undeclared while the session closes would wait for good
+            session.declare_background_queryable(
+                zenoh::KeyExpr(e.key),
+                [state, s, key = e.key](const zenoh::Query& query) {
+                    if (state->retired.load())
+                    {
+                        return;  // the program's parameters answer now: dropped, no reply
+                    }
+                    state->parameters.answer_ros(s, key, query);
+                },
+                [] {}, std::move(options));
+            tokens->push_back(session.liveliness_declare_token(zenoh::KeyExpr(e.token_key)));
+        }
+        part->until_parameters([state, tokens] {
+            state->retired.store(true);
+            tokens->clear();
+        });
     }
 
     Parameters::~Parameters()
@@ -875,6 +927,10 @@ namespace xblick
         ros_services_.clear();
         ros_events_.reset();
         ros_node_.reset();
+        if (ros_part_)
+        {
+            ros_part_->release_parameters();
+        }
         token_.reset();
         queryables_.clear();
         events_.reset();
@@ -1258,7 +1314,16 @@ namespace xblick
         std::vector<std::uint8_t> payload = e.serialize();
         if (ros_events_ and ros_events_->matched())
         {
-            ros_events_->put(payload);
+            if (ros_name_ != name_)  // ROS's event names the ROS node
+            {
+                ParameterEvent r = e;
+                r.node = ros_name_;
+                ros_events_->put(r.serialize());
+            }
+            else
+            {
+                ros_events_->put(payload);
+            }
         }
         events_->put(zenoh::Bytes(std::move(payload)));
     }
@@ -1418,7 +1483,7 @@ namespace xblick
         }
     }
 
-    void Parameters::answer_ros(const std::string& service, const ros::Service& server, const zenoh::Query& query)
+    void Parameters::answer_ros(const std::string& service, const std::string& key, const zenoh::Query& query)
     {
         // A ROS client's call on ROS's key (Python's Parameters._answer_ros), in Zenoh's thread, whatever it holds:
         // nothing it holds escapes into Zenoh's thread, and the query is dropped when this returns (replied to or
@@ -1526,7 +1591,7 @@ namespace xblick
                 query.reply_err(zenoh::Bytes(name_ + "/" + service + ": " + e.what()));
                 return;
             }
-            server.reply(query, std::move(response), request_id);
+            ros::reply(query, key, std::move(response), request_id);
         }
         catch (const std::exception& e)  // a reply that cannot go out: said, not raised
         {

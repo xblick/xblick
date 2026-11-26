@@ -1,8 +1,8 @@
 """ROS 2 on Zenoh: the keys, type names, type hashes, attachments, QoS strings and liveliness tokens of rmw_zenoh_cpp
-0.2.13 (ROS 2 Jazzy) and 0.10.6 or newer (ROS 2 Lyrical), so that a program started with ``--ros`` takes part in
-ROS 2 as well (docs/integrations/ros2.md). Durchblick's payloads are the CDR bytes ROS 2 writes already
-(protocol.md); ROS needs them on its own keys, with its own attachment, and announces every entity by a liveliness
-token.
+0.2.13 (ROS 2 Jazzy) and 0.10.6 or newer (ROS 2 Lyrical), so that every program takes part in ROS 2 as well (by
+default; ``--no-ros`` or ``XBLICK_ROS=0`` turn it off; docs/integrations/ros2.md). Durchblick's payloads are the
+CDR bytes ROS 2 writes already (protocol.md); ROS needs them on its own keys, with its own attachment, and announces
+every entity by a liveliness token.
 
 * data key: ``<domain>/<topic without the leading />/<pkg>::msg::dds_::<Name>_/RIHS01_<type hash>``;
   a service's key the same with the service's name and ``<pkg>::srv::dds_::<Name>_`` and the service type's hash;
@@ -45,6 +45,7 @@ import logging
 import os
 import re
 import struct
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -120,6 +121,50 @@ def split_node(fully_qualified: str) -> tuple[str, str]:
     check_ros_name(fully_qualified, "node")
     namespace, _, name = fully_qualified.rpartition("/")
     return namespace or "/", name
+
+
+def namespace_of(name: str) -> str:
+    """A Durchblick name (a camera, ``test/cam-1``) as a ROS namespace: each part as ``node_name_of`` writes it
+    (``/test/cam_1``); ``/`` for an empty name."""
+    parts = [node_name_of(p) for p in str(name).strip("/").split("/") if p]
+    return "/" + "/".join(parts) if parts else "/"
+
+
+def node_of(name: str) -> tuple[str, str]:
+    """(namespace, node) of a Durchblick name as a ROS node, each part as ``node_name_of`` writes it:
+    ``test/cam-1/probe`` -> (``/test/cam_1``, ``probe``). RosError for an empty name."""
+    namespace, _, last = str(name).strip("/").rpartition("/")
+    if not last:
+        raise RosError(f"{name!r}: no node name")
+    return namespace_of(namespace), node_name_of(last)
+
+
+ENABLE_ENV = "XBLICK_ROS"  # 0: no part in ROS 2; 1 or unset: ROS 2 beside our own keys (the default)
+
+
+def enabled_by_environment() -> bool:
+    """False when ``XBLICK_ROS`` is 0, True when it is 1 or unset; RosError for any other value."""
+    value = os.environ.get(ENABLE_ENV)
+    if value is None or value == "1":
+        return True
+    if value == "0":
+        return False
+    raise RosError(f"{ENABLE_ENV}={value!r}: 0 (no part in ROS 2) or 1 (ROS 2 beside our own keys, the default)")
+
+
+# what a reader of ROS's topics needs, said when it was opened without
+NEEDS_ROS = ("a session that takes part in ROS 2 (the default of open_session and every program; not one opened with "
+             "--no-ros, XBLICK_ROS=0 or ros_options=False, nor a plain zenoh.open)")
+
+
+def offered_topic(key: str) -> str | None:
+    """The ROS topic of one of our keys (``topic_of``), or None with one warning line for a key that is no ROS name
+    (``-`` in it): such a key stays ours only, the program goes on."""
+    try:
+        return topic_of(key)
+    except RosError as error:
+        log.warning(f"{key}: not offered to ROS ({error})")
+        return None
 
 
 def dds_type(type_name: str) -> str:
@@ -530,23 +575,102 @@ def _raw(session):
     return getattr(session, "_session", session)
 
 
-class Ros:
-    """A session's part in ROS 2 (``--ros``): ``domain``, and the nodes it shows ROS (its own ``node``, made at the
-    start, and those ``add_node`` adds: a node's parameters). Entity ids count up per session, as rmw_zenoh's per
-    context. ``params_writable`` (``--ros-params-writable``): ROS clients may set the parameters of this session's
-    nodes; by default the ROS parameter services answer reads only and refuse sets."""
+POLL_PERIOD_S = 0.05  # how often a _Polled subscriber looks for samples
 
-    def __init__(self, session, domain: int, node: str, namespace: str = "/", params_writable: bool = False):
+
+class _Polled:
+    """A declared subscriber's channel, read by a daemon thread of its own (``try_recv`` every POLL_PERIOD_S), for a
+    subscription the program did not ask for: zenoh-python's callback thread is no daemon and would keep a program
+    alive that ends without closing its session, and a channel cannot be undeclared during a blocking ``recv``.
+    ``undeclare`` ends the thread first."""
+
+    def __init__(self, declared, take: Callable, name: str):
+        self.declared = declared
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, args=(take,), name=name, daemon=True)
+        self._thread.start()
+
+    def _run(self, take: Callable):
+        while not self._stop.is_set():
+            try:
+                while (sample := self.declared.try_recv()) is not None:
+                    try:
+                        take(sample)
+                    except Exception:  # noqa: BLE001 - a bad sample must not end the subscription
+                        log.exception("a ROS sample its reader could not take")
+            except zenoh.ZError:  # closed with its session
+                return
+            self._stop.wait(POLL_PERIOD_S)
+
+    def undeclare(self):
+        self._stop.set()
+        if self._thread is not threading.current_thread():
+            self._thread.join(timeout=2.0)
+        self.declared.undeclare()
+
+
+CLOCK_TOPIC = "/clock"  # ROS's global clock, which a node with use_sim_time reads
+TF_TOLERANCE = 1e-6     # m and quaternion units: two static transforms of one frame that differ less are the same
+
+
+def _static_of(t) -> tuple:
+    """(parent, translation, rotation) of a TransformStamped, for comparing static transforms."""
+    tr, q = t.transform.translation, t.transform.rotation
+    return t.header.frame_id, (tr.x, tr.y, tr.z), (q.x, q.y, q.z, q.w)
+
+
+def _static_differs(a: tuple, b: tuple) -> str:
+    """Why two static transforms of one frame (``_static_of``) clash, or empty when they are the same (q and -q are
+    the same rotation)."""
+    if a[0] != b[0]:
+        return f"parent {b[0]!r} there, {a[0]!r} here"
+    same_t = all(abs(x - y) <= TF_TOLERANCE for x, y in zip(a[1], b[1]))
+    same_q = (all(abs(x - y) <= TF_TOLERANCE for x, y in zip(a[2], b[2]))
+              or all(abs(x + y) <= TF_TOLERANCE for x, y in zip(a[2], b[2])))
+    return "" if same_t and same_q else f"parent {a[0]!r} in both, another transform"
+
+
+class Ros:
+    """A session's part in ROS 2 (every program's by default): ``domain``, and the nodes it shows ROS: its own
+    ``node``, made at the start, which carries its publishers, subscribers and its first parameters' services
+    (``parameters_node``; until then six services without parameters, Parameters.none_on), and those ``add_node``
+    adds (further parameters of one program). Entity ids count up per
+    session, as rmw_zenoh's per context. ``params_writable`` (``--ros-params-writable``): ROS clients may set the
+    parameters of this session's nodes; by default the ROS parameter services answer reads only and refuse sets.
+    ``follow_parameters``: the node's name is a default, and the program's first parameters give it theirs.
+    ``clock`` (``--ros-clock``): the key of ours that goes to ROS's ``/clock`` (``mirror``).
+
+    Another node of the node's fully qualified name in ROS's graph (at the start or later) is said in one warning
+    line, as ROS's tools only warn. A static transform of ours whose frame another program sends on ``/tf_static``
+    with another parent or transform is said in one error line (``check_tf``)."""
+
+    def __init__(self, session, domain: int, node: str, namespace: str = "/", params_writable: bool = False,
+                 follow_parameters: bool = False, clock: str | None = None):
         self.session = session
         self.domain = domain
         self.params_writable = params_writable
+        self.follow_parameters = follow_parameters
+        self.clock = clock.strip("/") if clock else None
+        self.prog: str | None = None  # set by session.open_from_args: a rename of the node is said as "<prog>: ..."
         self.zid = str(_raw(session).info.zid())
         self._ids = itertools.count()
         self._lock = threading.Lock()
         self._nodes: list[RosNode] = []
         self._tf_parents: dict[str, str] = {}  # child frame -> parent, of what this program sent to /tf, /tf_static
         self._tf_clashes: set[str] = set()     # frames said already
+        self._parameters_taken = False         # the node serves a Parameters' services
+        self._own_gids: set[bytes] = set()     # every gid an entity of this session had: its own samples
+        self._static_mine: dict[str, tuple] = {}    # child -> _static_of, sent by this program on /tf_static
+        self._static_others: dict[str, tuple] = {}  # child -> _static_of, sent by other programs
+        self._static_said: set[str] = set()
+        self._static_reader: RosSubscriber | None = None
+        self._duplicates = None
+        self._duplicates_said: set[str] = set()
+        self._no_parameters = None
         self.node = self.add_node(node, namespace)
+        self._watch_duplicates()
+        from .parameters import Parameters
+        self._no_parameters = Parameters.none_on(self.node)  # until the program's first Parameters
 
     def next_id(self) -> str:
         with self._lock:
@@ -558,22 +682,116 @@ class Ros:
             self._nodes.append(node)
         return node
 
+    def _watch_duplicates(self):
+        """A liveliness subscriber (with the tokens there now) on node tokens of the node's fully qualified name: one
+        warning line for the first one that is not ours. Declared anew when the node is renamed."""
+        if self._duplicates is not None:
+            self._duplicates.undeclare()
+        own, name = self.node.token.key(), self.node.fully_qualified
+        pattern = "/".join([ADMIN_SPACE, str(self.domain), "*", "*", "*", NODE, "*", mangle(self.node.namespace),
+                            mangle(self.node.name)])
+
+        def seen(sample):
+            if sample.kind != zenoh.SampleKind.PUT or str(sample.key_expr) == own:
+                return
+            with self._lock:
+                if name in self._duplicates_said:
+                    return
+                self._duplicates_said.add(name)
+            log.warning(f"ROS node {name} is in ROS's graph already (another program, or another session of this "
+                        f"one, on domain {self.domain}): ROS's tools then show two nodes of one name and reach one of "
+                        "them; give each program a node name of its own (--ros-node)")
+
+        self._duplicates = _Polled(_raw(self.session).liveliness().declare_subscriber(pattern, history=True), seen,
+                                   f"ros node {name}")
+
+    def parameters_node(self, name: str) -> tuple[RosNode, bool]:
+        """The ROS node that serves the parameters ``name`` (their Durchblick name, ``test/camera/probe``), and True
+        when it is a node of their own. The program's first parameters: its node, which takes their name
+        (``node_of``) when its own is a default (``follow_parameters``); its publishers and subscribers made before
+        are declared anew under it. Further parameters of the program: a node of their own of their name."""
+        namespace, node = node_of(name)
+        with self._lock:
+            first, self._parameters_taken = not self._parameters_taken, True
+            no_parameters, self._no_parameters = self._no_parameters, None
+        if not first:
+            return self.add_node(node, namespace), True
+        if no_parameters is not None:
+            no_parameters.close()
+        if self.follow_parameters and (namespace, node) != (self.node.namespace, self.node.name):
+            self.node.rename(node, namespace)
+            self._watch_duplicates()
+            if self.prog is not None:
+                print(f"{self.prog}: in ROS 2 as node {self.node.fully_qualified} (the name of its parameters)",
+                      file=sys.stderr, flush=True)
+        return self.node, False
+
+    def release_parameters(self):
+        """The node's parameters closed: the next Parameters serve on it again."""
+        with self._lock:
+            self._parameters_taken = False
+
+    def own(self, gid_: bytes):
+        with self._lock:
+            self._own_gids.add(gid_)
+
     def close(self):
+        if self._no_parameters is not None:
+            self._no_parameters.close()
+            self._no_parameters = None
+        if self._duplicates is not None:
+            self._duplicates.undeclare()
+            self._duplicates = None
         with self._lock:
             nodes, self._nodes = self._nodes, []
         for node in nodes:
             node.close()
 
+    def _read_static(self):
+        """The subscription to ROS's /tf_static that compares other programs' static transforms with this program's
+        (``check_tf``), made with this program's first static transform: a program that sends none reads none."""
+        with self._lock:
+            if self._static_reader is not None:
+                return
+            self._static_reader = True  # being made
+        from .msg import TFMessage
+        self._static_reader = self.node.subscriber("/tf_static", TFMessage.TYPE, self._on_static, TF_STATIC_READ_QOS,
+                                                   daemon=True)
+
+    def _on_static(self, payload: bytes, seq, stamp, publisher: bytes):
+        from .msg import TFMessage
+        with self._lock:
+            if publisher in self._own_gids:
+                return
+        for t in TFMessage.deserialize(payload).transforms:
+            theirs = _static_of(t)
+            with self._lock:
+                self._static_others[t.child_frame_id] = theirs
+                mine = self._static_mine.get(t.child_frame_id)
+            if mine is not None:
+                self._say_static(t.child_frame_id, mine, theirs)
+
+    def _say_static(self, child: str, mine: tuple, theirs: tuple):
+        why = _static_differs(mine, theirs)
+        with self._lock:
+            if not why or child in self._static_said:
+                return
+            self._static_said.add(child)
+        log.error(f"ROS /tf_static: frame {child!r} is sent by another program too, {why}; tf2 keeps one of them: "
+                  "give each camera and robot frame names of its own (--frame-id)")
+
     def check_tf(self, payload, static: bool):
         """One error line per frame that this program gives two parents on ROS's /tf and /tf_static (tf2 takes one
-        parent per frame: frame names must be unique across cameras and robots). The transforms still go out: a
-        consumer sees the clash too."""
+        parent per frame: frame names must be unique across cameras and robots). Static ones are also compared with
+        what other programs send on /tf_static (``_read_static``): one error line per frame another program sends
+        with another parent or transform. The transforms still go out: a consumer sees the clash too."""
         from .msg import TFMessage
         try:
             transforms = TFMessage.deserialize(bytes(payload)).transforms
         except Exception as error:  # noqa: BLE001 - a payload of ours that does not decode: said, not raised
             log.error(f"/tf{'_static' if static else ''}: a message that is no TFMessage ({error})")
             return
+        compare = []
         with self._lock:
             for t in transforms:
                 child, parent = t.child_frame_id, t.header.frame_id
@@ -583,6 +801,14 @@ class Ros:
                     log.error(f"ROS tf: frame {child!r} has parent {known!r} and parent {parent!r} in this program; "
                               "tf2 takes one parent per frame: give each camera and robot frame names of its own "
                               "(--frame-id)")
+                if static:
+                    self._static_mine[child] = _static_of(t)
+                    if child in self._static_others:
+                        compare.append((child, self._static_mine[child], self._static_others[child]))
+        for clash in compare:
+            self._say_static(*clash)
+        if static:
+            self._read_static()
 
 
 def commanding(key: str) -> bool:
@@ -594,21 +820,28 @@ def commanding(key: str) -> bool:
 
 
 def mirror(session, key: str, encoding, topic: str | None = None, qos: Qos = STREAM_QOS) -> RosPublisher | None:
-    """The ROS publisher that mirrors one of our keys when ``session`` takes part in ROS (``--ros``), else None.
+    """The ROS publisher that mirrors one of our keys when ``session`` takes part in ROS (the default), else None.
     ``encoding``: the key's Zenoh encoding (``application/cdr;<ROS type>``); ``topic``: ROS's topic, by default the
-    key's (``topic_of``). A command key (``commanding``) and a key whose type ROS has no hash for (Durchblick's own
-    types, JSON, moveit_msgs) are not offered: one warning line, None. RosError for a key that is no ROS name."""
+    key's (``topic_of``), ``/clock`` for the session's clock key (``--ros-clock``; RosError when its type is not
+    rosgraph_msgs/msg/Clock). A command key (``commanding``), a key whose type ROS has no hash for (Durchblick's own
+    types, JSON, moveit_msgs) and a key that is no ROS name (``-`` in it) are not offered: one warning line, None."""
     taking_part = getattr(session, "ros", None)
     if taking_part is None:
         return None
     if commanding(key):
         log.warning(f"{key}: not offered to ROS (a command key: what a robot is told never goes to ROS)")
         return None
-    topic = topic or topic_of(key)
     schema = str(encoding).partition(";")
     type_name = schema[2] if schema[0] == "application/cdr" else ""
+    if taking_part.clock is not None and str(key).strip("/") == taking_part.clock:
+        if type_name != "rosgraph_msgs/msg/Clock":
+            raise RosError(f"--ros-clock {key}: its type is {type_name or str(encoding)}, not rosgraph_msgs/msg/Clock")
+        topic = CLOCK_TOPIC
     if not type_name or "@" in type_name or type_name not in TYPE_HASHES:
         log.warning(f"{key}: not offered to ROS ({type_name or str(encoding)} has no ROS type hash here)")
+        return None
+    topic = topic or offered_topic(key)
+    if topic is None:
         return None
     return taking_part.node.publisher(topic, type_name, qos)
 
@@ -616,7 +849,7 @@ def mirror(session, key: str, encoding, topic: str | None = None, qos: Qos = STR
 def mirror_tf(session, static: bool = False, key: str = "") -> RosPublisher | None:
     """The publisher on ROS's global ``/tf`` (``/tf_static`` with ``static``, transient local) when ``session`` takes
     part in ROS, else None; None too for a command key (``commanding``, one warning line). Its ``put`` checks the
-    frames for a second parent (``Ros.check_tf``)."""
+    frames for a second parent and, static, for other programs' transforms of the same frames (``Ros.check_tf``)."""
     taking_part = getattr(session, "ros", None)
     if taking_part is None:
         return None
@@ -647,6 +880,22 @@ class RosNode:
     def fully_qualified(self) -> str:
         return self.token.fully_qualified_node
 
+    def rename(self, name: str, namespace: str = "/"):
+        """The node under another name (its id kept): its token and those of its entities declared anew (their gids
+        follow the token). Their keys stay as they are."""
+        check_node_name(name)
+        if namespace != "/":
+            check_ros_name(namespace, "namespace")
+        with self._lock:
+            self.name, self.namespace = name, namespace
+            self.token = Token(self.ros.domain, self.ros.zid, self.id, self.id, NODE, "/", namespace, name)
+            if self._token is not None:
+                self._token.undeclare()
+                self._token = _raw(self.ros.session).liveliness().declare_token(self.token.key())
+            entities = list(self._entities)
+        for entity in entities:
+            entity._rename()
+
     def entity_token(self, kind: str, name: str, type_name: str, qos: Qos) -> Token:
         return Token(self.ros.domain, self.ros.zid, self.id, self.ros.next_id(), kind, "/", self.namespace, self.name,
                      check_ros_name(name), type_name, hash_of(type_name), qos, backends_of(kind, type_name, qos))
@@ -654,6 +903,9 @@ class RosNode:
     def _add(self, entity):
         with self._lock:
             self._entities.append(entity)
+            stale = (entity.token.namespace, entity.token.node) != (self.namespace, self.name)
+        if stale:  # made while the node was renamed
+            entity._rename()
         return entity
 
     def _forget(self, entity):
@@ -664,8 +916,9 @@ class RosNode:
     def publisher(self, topic: str, type_name: str, qos: Qos = STREAM_QOS) -> RosPublisher:
         return self._add(RosPublisher(self, topic, type_name, qos))
 
-    def subscriber(self, topic: str, type_name: str, callback: Callable, qos: Qos = STREAM_QOS) -> RosSubscriber:
-        return self._add(RosSubscriber(self, topic, type_name, callback, qos))
+    def subscriber(self, topic: str, type_name: str, callback: Callable, qos: Qos = STREAM_QOS,
+                   daemon: bool = False) -> RosSubscriber:
+        return self._add(RosSubscriber(self, topic, type_name, callback, qos, daemon))
 
     def service(self, name: str, type_name: str, qos: Qos = PARAMETERS_QOS) -> RosService:
         return self._add(RosService(self, name, type_name, qos))
@@ -704,12 +957,23 @@ class _Entity:
         if not re.match(r"\d+/", self.key):  # a ROS key starts with the domain: no key of ours does (topics.check_name)
             raise RosError(f"{self.key!r} is no rmw_zenoh key")
         self.gid = gid(self.token.key())
+        node.ros.own(self.gid)
         self._raw = _raw(node.ros.session)
         self._declared = None
         self._live = None
 
     def _announce(self):
         self._live = self._raw.liveliness().declare_token(self.token.key())
+
+    def _rename(self):
+        """Its node renamed (RosNode.rename): its token and gid of the node's new name."""
+        node = self.node
+        token = dataclasses.replace(self.token, namespace=node.namespace, node=node.name)
+        self.token, self.gid = token, gid(token.key())
+        node.ros.own(self.gid)
+        if self._live is not None:
+            self._live.undeclare()
+            self._announce()
 
     def close(self):
         """Undeclares it and its token (again: nothing)."""
@@ -746,7 +1010,10 @@ class RosPublisher(_Entity):
 
     @property
     def matched(self) -> bool:
-        """A ROS subscriber (or any other) of the key is known."""
+        """A ROS subscriber (or any other) of the key is known. Always True for a transient-local publisher: zenoh-ext's
+        AdvancedPublisher has no matching status, and its samples go into its cache for later subscribers anyway."""
+        if self.qos.durability == TRANSIENT_LOCAL:
+            return True
         return self._declared.matching_status.matching
 
     def put(self, payload):
@@ -761,24 +1028,32 @@ class RosSubscriber(_Entity):
     """A ROS subscription: ``callback(payload: bytes, seq, source_ns, gid)`` for each sample (in Zenoh's thread). A
     sample without ROS's attachment is dropped with a warning, as ROS drops it. Transient local: zenoh-ext's
     AdvancedSubscriber, which asks publishers it detects for their cache. A buffer type (``backends_of``): also the
-    key's ``_buf_cpu``, where Lyrical's publishers send it."""
+    key's ``_buf_cpu``, where Lyrical's publishers send it. ``daemon``: the samples in a daemon thread of its own
+    instead (a subscription the program did not ask for, such as ``Ros``'s of ``/tf_static``: zenoh-python's callback
+    thread is no daemon and would keep a program alive that ends without closing its session)."""
 
-    def __init__(self, node: RosNode, topic: str, type_name: str, callback: Callable, qos: Qos = STREAM_QOS):
+    def __init__(self, node: RosNode, topic: str, type_name: str, callback: Callable, qos: Qos = STREAM_QOS,
+                 daemon: bool = False):
         super().__init__(node, SUBSCRIPTION, topic, type_name, qos)
         self._callback = callback
         self._warned = False
+        handler = None if daemon else self._on_sample  # None: zenoh's channel, read by _Polled
         if qos.durability == TRANSIENT_LOCAL:
             import zenoh.ext as ext
             recovery = ext.RecoveryConfig(periodic_queries=None, heartbeat=True) \
                 if qos.reliability != BEST_EFFORT else None
             self._declared = ext.declare_advanced_subscriber(
-                self._raw, self.key, self._on_sample,
+                self._raw, self.key, handler,
                 history=ext.HistoryConfig(detect_late_publishers=True, max_samples=qos.depth), recovery=recovery,
                 subscriber_detection=True)
         else:
-            self._declared = self._raw.declare_subscriber(self.key, self._on_sample)
-        self._cpu_group = self._raw.declare_subscriber(cpu_group_key(self.key), self._on_sample) \
+            self._declared = self._raw.declare_subscriber(self.key, handler)
+        self._cpu_group = self._raw.declare_subscriber(cpu_group_key(self.key), handler) \
             if self.token.backends == CPU_BACKENDS else None
+        if daemon:
+            self._declared = _Polled(self._declared, self._on_sample, f"ros {topic}")
+            if self._cpu_group is not None:
+                self._cpu_group = _Polled(self._cpu_group, self._on_sample, f"ros {topic} cpu")
         self._announce()
 
     def close(self):

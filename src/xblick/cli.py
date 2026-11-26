@@ -206,23 +206,24 @@ def _test_camera(args) -> int:
     from .video import VideoError, camera_info_for
 
     w, h = args.size
-    # --pose: the frame id names the body frame, the images are in its optical frame
-    frame_id = args.frame_id if args.pose is None else args.frame_id + poses.OPTICAL_SUFFIX
+    # the frame id names the body frame with --pose, the images are in its optical frame; by default the base, / as _
+    body = args.frame_id or base.replace("/", "_")
+    frame_id = body if args.pose is None else body + poses.OPTICAL_SUFFIX
     try:
         info, said = camera_info_for(w, h, frame_id, args.camera_info, args.hfov, args.vfov,
                                      assumed=("vertical", TEST_CAMERA_VFOV))
     except (VideoError, OSError) as error:
         raise SystemExit(f"xblick test-camera: {error}") from None
     camera = base.rpartition('/')[0]
-    with zsession.open_from_args(args, prog=f"xblick {args.command}") as z:
+    with zsession.open_from_args(args, prog=f"xblick {args.command}", camera=camera) as z:
         _say_if_alone(z, "xblick test-camera")
         publisher = CameraPublisher(z, base, encoding="rgb8", frame_id=frame_id, camera_info=info,
                                     source="test", cuda_device=args.cuda_device)
         tf_static = None
         if args.pose is not None:
             tf_static = StaticTransformPublisher(z, camera, poses.fixed_camera_transforms(
-                args.frame_id, poses.pose_from(*args.pose), time.time_ns()))
-            print(f"xblick test-camera: pose on {topics.tf_static(camera)}: {topics.WORLD} -> {args.frame_id} "
+                body, poses.pose_from(*args.pose), time.time_ns()))
+            print(f"xblick test-camera: pose on {topics.tf_static(camera)}: {topics.WORLD} -> {body} "
                   f"({' '.join(f'{v:g}' for v in args.pose)}) -> {frame_id}, the images' frame", flush=True)
         print(f"xblick test-camera: {w}x{h} rgb8 at {args.fps:g} Hz (Ctrl-C to stop); {said}", flush=True)
         print(f"xblick test-camera: {rings_text(uuid, args.cuda_device)}", flush=True)
@@ -258,7 +259,7 @@ def _cam(args, parser) -> int:
     except (ImportError, VideoError, cam.CamError) as error:
         raise SystemExit(f"xblick cam: {error}") from None
     cuda_device_checked(args, "xblick cam")
-    with zsession.open_from_args(args, prog=f"xblick {args.command}") as z:
+    with zsession.open_from_args(args, prog=f"xblick {args.command}", camera=camera) as z:
         _say_if_alone(z, "xblick cam")
         params = Parameters(z, name, namespace)
         try:
@@ -617,7 +618,8 @@ def _param(args) -> int:
         if not args.node:
             raise SystemExit("xblick param: --node <namespace>/<name> (or --nodes)")
         if args.via_ros and z.ros is None:
-            raise SystemExit("xblick param: --via-ros needs --ros (the session's part in ROS 2)")
+            raise SystemExit("xblick param: --via-ros needs the session's part in ROS 2, which --no-ros or "
+                             "XBLICK_ROS=0 turn off")
         client = parameters.ParameterClient(z, args.node, args.timeout, ros=args.via_ros)
         if args.set:
             names = [s.partition(":=")[0] for s in args.set]
@@ -723,7 +725,7 @@ def build_parser(prog: str = "xblick") -> argparse.ArgumentParser:
         else:
             p.add_argument("--seconds", type=float, default=0.0, help="stop after this time (default: never)")
         p.add_argument("--transport", choices=("auto", "compressed", "raw", "shm", "ros"), default="auto",
-                       help="auto: shared memory on the publisher's host, else compressed; ros (with --ros): the "
+                       help="auto: shared memory on the publisher's host, else compressed; ros: the "
                             "stream's ROS 2 image topic /<stream>/image_raw")
         zsession.add_arguments(p)
         p.set_defaults(run=run)
@@ -732,8 +734,8 @@ def build_parser(prog: str = "xblick") -> argparse.ArgumentParser:
     p.add_argument("--namespace", default="test")
     p.add_argument("--camera", default="camera")
     p.add_argument("--stream", default="color")
-    p.add_argument("--frame-id", default="TestCamera", help="the images' frame id; with --pose the body frame's "
-                                                         "(default: %(default)s)")
+    p.add_argument("--frame-id", default=None, help="the images' frame id; with --pose the body frame's "
+                                                         "(default: the stream's name, / as _, e.g. test_camera_color)")
     poses.add_pose_argument(p)
     p.add_argument("--size", type=int, nargs=2, default=(640, 480), metavar=("W", "H"))
     p.add_argument("--camera-info", default=None, metavar="FILE",
@@ -860,7 +862,7 @@ def build_parser(prog: str = "xblick") -> argparse.ArgumentParser:
     p.add_argument("--atomically", action="store_true", help="with --set: all or none")
     p.add_argument("--timeout", type=float, default=2.0)
     p.add_argument("--via-ros", action="store_true",
-                   help="with --ros: the ROS node /<--node>'s parameters through ROS 2's keys, e.g. --node talker; a "
+                   help="the ROS node /<--node>'s parameters through ROS 2's keys, e.g. --node talker; a "
                         "set goes without node and deadline (ROS has neither)")
     zsession.add_arguments(p)
     p.set_defaults(run=_param)
