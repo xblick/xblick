@@ -245,6 +245,15 @@ TEST_CAMERA_VFOV = 60.0  # degrees: the pinhole of xblick test-camera without a 
 
 
 def _test_camera(args) -> int:
+    try:
+        return _run_test_camera(args)
+    except KeyboardInterrupt:
+        # Ctrl-C or SIGTERM (end_on_signals) is its normal end, also while it starts: a signal right after its
+        # first lines came before the loop's handler and ended it by SIGINT
+        return 0
+
+
+def _run_test_camera(args) -> int:
     from .gpu import rings_text
 
     base = topics.stream_base(args.namespace, args.camera, args.stream)
@@ -263,30 +272,28 @@ def _test_camera(args) -> int:
     camera = base.rpartition('/')[0]
     with zsession.open_from_args(args, prog=f"xblick {args.command}", camera=camera) as z:
         _say_if_alone(z, "xblick test-camera")
-        publisher = CameraPublisher(z, base, encoding="rgb8", frame_id=frame_id, camera_info=info,
-                                    source="test", cuda_device=args.cuda_device)
-        tf_static = None
-        if args.pose is not None:
-            tf_static = StaticTransformPublisher(z, camera, poses.fixed_camera_transforms(
-                body, poses.pose_from(*args.pose), time.time_ns()))
-            print(f"xblick test-camera: pose on {topics.tf_static(camera)}: {topics.WORLD} -> {body} "
-                  f"({' '.join(f'{v:g}' for v in args.pose)}) -> {frame_id}, the images' frame", flush=True)
-        print(f"xblick test-camera: {w}x{h} rgb8 at {args.fps:g} Hz (Ctrl-C to stop); {said}", flush=True)
-        print(f"xblick test-camera: {rings_text(uuid, args.cuda_device)}", flush=True)
-        print(f"xblick test-camera: publishing the stream {base}", flush=True)
-        print(f"xblick test-camera: start a node with --camera {camera} (the camera, not the stream)", flush=True)
-        period, start = 1.0 / args.fps, time.monotonic()
+        publisher = tf_static = None
         try:
+            publisher = CameraPublisher(z, base, encoding="rgb8", frame_id=frame_id, camera_info=info,
+                                        source="test", cuda_device=args.cuda_device)
+            if args.pose is not None:
+                tf_static = StaticTransformPublisher(z, camera, poses.fixed_camera_transforms(
+                    body, poses.pose_from(*args.pose), time.time_ns()))
+                print(f"xblick test-camera: pose on {topics.tf_static(camera)}: {topics.WORLD} -> {body} "
+                      f"({' '.join(f'{v:g}' for v in args.pose)}) -> {frame_id}, the images' frame", flush=True)
+            print(f"xblick test-camera: {w}x{h} rgb8 at {args.fps:g} Hz (Ctrl-C to stop); {said}", flush=True)
+            print(f"xblick test-camera: {rings_text(uuid, args.cuda_device)}", flush=True)
+            print(f"xblick test-camera: publishing the stream {base}", flush=True)
+            print(f"xblick test-camera: start a node with --camera {camera} (the camera, not the stream)", flush=True)
+            period, start = 1.0 / args.fps, time.monotonic()
             while True:
                 now = time.monotonic()
                 publisher.publish(test_pattern(w, h, now - start))
                 time.sleep(max(period - (time.monotonic() - now), 0.0))
-        except KeyboardInterrupt:
-            pass
-        publisher.close()
-        if tf_static is not None:
-            tf_static.close()
-    return 0
+        finally:
+            for part in (publisher, tf_static):
+                if part is not None:
+                    part.close()
 
 
 def _cam(args, parser) -> int:
