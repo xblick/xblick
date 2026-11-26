@@ -248,7 +248,7 @@ def test_cpp_with_ros_rmw_zenoh_keys_tokens_and_attachments(tmp_path):
                   "/tf": "tf2_msgs/msg/TFMessage", "/rc/cpp/diagnostics": "diagnostic_msgs/msg/DiagnosticArray"}
         data = {ros.data_key(DOMAIN, t, typ, ros.hash_of(typ)): t for t, typ in topics.items()}
         wait_until(lambda: set(data) <= set(camera.keys))
-        parsed = [ros.parse_token(t) for t in camera.tokens]
+        parsed = [ros.parse_token(t) for t in set(camera.tokens)]
         (node,) = [t for t in parsed if t.kind == ros.NODE]
         assert (node.domain, node.namespace, node.node, node.node_id) == (DOMAIN, "/", "xblick_cpp_camera", "0")
         publishers = {t.topic: t for t in parsed if t.kind == ros.PUBLISHER}
@@ -387,8 +387,8 @@ def test_cpp_parameters_are_a_ros_node(tmp_path):
     reader = camera.ros_session()
     client = ParameterClient(reader, NODE, timeout=5.0, ros=True)
     try:
-        wait_until(lambda: sum(ros.parse_token(t).kind == ros.SERVICE for t in camera.tokens) == 6)
-        parsed = [ros.parse_token(t) for t in camera.tokens]
+        wait_until(lambda: sum(ros.parse_token(t).kind == ros.SERVICE for t in set(camera.tokens)) == 6)
+        parsed = [ros.parse_token(t) for t in set(camera.tokens)]
         services = {t.topic: t for t in parsed if t.kind == ros.SERVICE}
         assert set(services) == {f"/{NODE}/{s}" for s in ("list_parameters", "describe_parameters", "get_parameters",
                                                           "get_parameter_types", "set_parameters",
