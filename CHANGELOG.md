@@ -56,6 +56,7 @@ streams, transforms and parameters, and it reads theirs.
 - A Session in ROS 2 that a program drops without `close()` is released again when it is collected, as without ROS.
 - `xblick play --loop`: a `/tf_static` held twice in a file no longer adds a gap as long as the recording between passes.
 - `xblick test-camera` ends with exit code 0 also when SIGTERM or Ctrl-C comes while it starts (it ended by SIGINT).
+- An `xblick` command takes SIGTERM and SIGINT from before the imports of `xblick.cli` on: one that comes while it starts ends it with exit code 0 before it begins (SIGTERM killed it, and SIGINT did nothing to a background job of a script).
 
 ### Known limit
 

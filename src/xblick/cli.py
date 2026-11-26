@@ -33,9 +33,43 @@ import json
 import os
 import shlex
 import shutil
+import signal
 import sys
 import time
 from pathlib import Path
+
+SCRIPTS = ("xblick",)  # pyproject.toml's console scripts
+INTERFACE_OPTIONS = ("--connect", "--listen", "--zenoh-mode", "--config")  # without a command: the interface's
+
+
+def _relay_command(argv: list[str]) -> bool:
+    """``xblick relay``: its process is replaced by the relay program, which keeps the signals as started."""
+    return bool(argv) and argv[0] == "relay"
+
+
+def _interface_command(argv: list[str]) -> bool:
+    """No command: the terminal interface (tui.py), whose signals are Textual's."""
+    return not argv or argv[0].split("=")[0] in INTERFACE_OPTIONS
+
+
+_held: list[int] = []  # the signals that came while the command started (_hold_signals)
+
+
+def _hold_signals():
+    """SIGTERM and SIGINT that come while a command starts (the imports below, its arguments) are noted, and
+    ``main`` ends the command with exit code 0 before it begins; from there on ``end_on_signals`` takes them. Until
+    then SIGTERM had its default action (the command was killed when its start took long) and SIGINT stayed ignored
+    in a background job of a script. Only when this module starts a command of its program, not on an import."""
+    def hold(signum, frame):
+        _held.append(signum)
+
+    signal.signal(signal.SIGTERM, hold)
+    signal.signal(signal.SIGINT, hold)
+
+
+if ((__name__ == "__main__" or Path(sys.argv[0]).name in SCRIPTS) and not _relay_command(sys.argv[1:])
+        and not _interface_command(sys.argv[1:])):
+    _hold_signals()  # before the imports below
 
 import numpy as np
 
@@ -754,9 +788,6 @@ def _relay(arguments: list[str]) -> int:
     os.execv(program, [program, *arguments])
 
 
-SCRIPTS = ("xblick",)  # pyproject.toml's console scripts
-
-
 def build_parser(prog: str = "xblick") -> argparse.ArgumentParser:
     """The commands' parser (the terminal interface checks its ``xblick rerun`` command line with it)."""
     parser = argparse.ArgumentParser(prog=prog, description=__doc__,
@@ -1085,15 +1116,17 @@ def main(argv=None) -> int:
         argv = sys.argv[1:]
     invoked = Path(sys.argv[0]).name if sys.argv and sys.argv[0] else ""
     prog = invoked if invoked in SCRIPTS else "xblick"
-    if argv and argv[0] == "relay":
+    if _relay_command(argv):
         return _relay(argv[1:])
-    if not argv or argv[0].split("=")[0] in INTERFACE_OPTIONS:
+    if _interface_command(argv):
         from . import tui  # Textual only for the interface: the commands start without importing it
 
         return tui.run(_interface_connection(argv, prog))
     args = parse(argv, prog)
     GIVEN[:] = argv  # as given: xblick cam and xblick view print the command that a list resolved to
     end_on_signals()  # SIGTERM and SIGINT as Ctrl-C, also as a background job of a script
+    if _held:  # a signal while it started (_hold_signals): it ends before it begins
+        return 0
     try:
         return args.run(args)
     except (TimeoutError, zsession.NoAnswer) as error:  # did not answer, or a command sent once: one line
@@ -1112,7 +1145,6 @@ def main(argv=None) -> int:
 
 
 GIVEN: list[str] = []  # main()'s arguments, the command first
-INTERFACE_OPTIONS = ("--connect", "--listen", "--zenoh-mode", "--config")  # without a command: the interface's
 
 
 def _interface_connection(argv: list[str], prog: str):

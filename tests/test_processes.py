@@ -348,6 +348,64 @@ def test_a_background_job_of_a_script_ends_on_sigint_and_sigterm(camera, name, s
     assert time.monotonic() - started < 4 + 5  # ended within some seconds of the signal
 
 
+HELD = """
+import os
+import signal
+import sys
+
+sys.argv = sys.argv[1:]  # as the console script starts it: xblick <command> ...
+import xblick.cli as cli
+
+handler = signal.getsignal(signal.SIGTERM)
+print(handler.__name__ if callable(handler) else handler.name, flush=True)
+if sys.argv[:2] == ["xblick", "test-camera"]:
+    os.kill(os.getpid(), signal.SIGTERM)  # while it starts: before main()
+    sys.exit(cli.main())
+"""
+
+
+@pytest.mark.parametrize("argv, handler", [(["xblick", "test-camera"], "hold"), (["xblick", "relay"], "SIG_DFL"),
+                                           (["xblick"], "SIG_DFL"), (["a-program", "test-camera"], "SIG_DFL")])
+def test_signals_while_a_command_starts_are_held(argv, handler):
+    """xblick.cli takes SIGTERM and SIGINT before its imports when it starts a command of the program, and main()
+    ends the command with exit code 0 before it begins when one came; not for ``xblick relay`` (the relay keeps the
+    signals as started), the terminal interface (Textual's), or an import by another program."""
+    done = subprocess.run([sys.executable, "-c", HELD, *argv], stdin=subprocess.DEVNULL, capture_output=True,
+                          text=True, timeout=60, env=ENV)
+    assert done.returncode == 0 and done.stdout == f"{handler}\n" and not done.stderr, done.stdout + done.stderr
+
+
+def caught(pid: int) -> int:
+    """The signals the process has a handler for (SigCgt in /proc/<pid>/status); 0 once it has ended."""
+    try:
+        with open(f"/proc/{pid}/status") as status:
+            return next(int(line.split()[1], 16) for line in status if line.startswith("SigCgt:"))
+    except (FileNotFoundError, ProcessLookupError):
+        return 0
+
+
+@pytest.mark.skipif(not os.path.exists("/proc/self/status"), reason="needs /proc")
+def test_a_sigterm_as_early_as_the_command_takes_it_ends_it_with_0(router):
+    """SIGTERM at the first moment ``xblick test-camera`` has a handler for it, which xblick.cli installs before its
+    imports (cli._hold_signals): the command ends with exit code 0 and no traceback, as on a later SIGTERM. Before,
+    the handler came after the imports and the parsing, and a SIGTERM before it, under load, killed the command
+    (exit 143)."""
+    process = subprocess.Popen(commands(router)["test-camera"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True, env=ENV)
+    try:
+        deadline = time.monotonic() + 30.0
+        while not caught(process.pid) & (1 << (signal.SIGTERM - 1)):
+            assert process.poll() is None and time.monotonic() < deadline, "no handler for SIGTERM"
+            time.sleep(0.001)
+        process.send_signal(signal.SIGTERM)
+        out, _ = process.communicate(timeout=20)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+    assert process.returncode == 0 and "Traceback" not in out, (process.returncode, out)
+
+
 @pytest.mark.skipif(not CPP_BUILD, reason="XBLICK_CPP_BUILD (the C++ build directory) is not set")
 def test_a_cpp_peer_behind_the_router(router):
     """The C++ session rule is Python's: a peer with --connect only listens on a free loopback port."""
