@@ -22,7 +22,7 @@ We found no project that combines the following properties of Durchblick in one 
 ## ROS 2 Lyrical
 
 ROS 2 Lyrical was released in May 2026. It can pass GPU memory between processes. In C++, every `uint8[]` field of
-a message is a [`rosidl::Buffer`](https://docs.ros.org/en/lyrical/Concepts/Intermediate/About-Buffer-Backends.html),
+a message is a [`rosidl::Buffer`](https://docs.ros.org/en/lyrical/ROS-Framework/interfaces/Working-with-interfaces/Buffer-Backends/About-Buffer-Backends.html),
 for example the pixels of `sensor_msgs/msg/Image`. A buffer backend decides where the memory of such a field lives.
 The CUDA backend [`cuda_buffer_backend`](https://index.ros.org/p/cuda_buffer_backend/) is part of
 [rosidl_buffer_backends](https://github.com/ros2/rosidl_buffer_backends), whose packages name NVIDIA staff as
