@@ -7,9 +7,12 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include "xblick/ros.hpp"
 
 namespace xblick::tools
 {
@@ -143,4 +146,34 @@ namespace xblick::tools
     private:
         std::vector<std::string> args_;
     };
+
+    // --ros, --ros-domain ID, --ros-node NAME, --ros-params-writable of a tool (Options::add_session_options has them
+    // for programs on Options): the same rules (ros::options_from), std::invalid_argument for a wrong one.
+    inline std::optional<ros::Options> ros_options(const Args& args, const std::string& program)
+    {
+        const auto value = [&](const std::string& name) -> std::optional<std::string> {
+            if (not args.flag(name))
+            {
+                return std::nullopt;
+            }
+            const std::vector<std::string> v = args.list(name);
+            if (v.size() != 1)
+            {
+                throw std::invalid_argument("--" + name + " takes one value");
+            }
+            return v.front();
+        };
+        std::optional<std::int64_t> domain;
+        if (const auto d = value("ros-domain"))
+        {
+            std::size_t used = 0;
+            domain = std::stoll(*d, &used);
+            if (used != d->size())
+            {
+                throw std::invalid_argument("--ros-domain " + *d + ": an integer expected");
+            }
+        }
+        return ros::options_from(args.flag("ros"), domain, value("ros-node"), args.flag("ros-params-writable"),
+                                 program);
+    }
 }  // namespace xblick::tools

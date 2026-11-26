@@ -18,11 +18,20 @@ A script takes the connection options from its command line:
 
 ```python
 from xblick import session as db_session
-db_session.add_arguments(parser)                    # --connect, --listen, --zenoh-mode, --config
+db_session.add_arguments(parser)                    # --connect, --listen, --zenoh-mode, --config, --ros, ...
 session = db_session.open_from_args(args)
 ```
 
 [Sessions and routers](../concepts/sessions.md) explains the options.
+
+A session that takes part in ROS 2 (`--ros`) has `session.ros`. Its publishers also send on ROS's keys, and readers
+take ROS topics where you ask for them. [Durchblick and ROS 2](../integrations/ros2.md) lists both.
+
+```python
+session = db_session.open_session(ros_options=db_session.RosOptions(domain=0, node="my_program"))
+images = db.ImageSubscriber(session, "ros/camera", transport="ros")    # /ros/camera/image_raw of a ROS node
+client = ParameterClient(session, "talker", ros=True)                  # the ROS node /talker's parameters
+```
 
 Each session declares its program on the network: its name, version, host, command line, process id and start time
 ([protocol](../concepts/protocol.md#every-program-declares-itself)). The name is the one the program was started by,

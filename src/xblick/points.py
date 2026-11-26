@@ -27,8 +27,8 @@ from dataclasses import dataclass, field
 import numpy as np
 import zenoh
 
-from . import _core, declaration, topics
-from .camera import AUTO, INFO_VERSION, FrameAttachment, ProtocolError, Subscription, cdr_encoding, ring_gpu
+from . import _core, declaration, ros, topics
+from .camera import AUTO, INFO_VERSION, ROS, FrameAttachment, ProtocolError, Subscription, cdr_encoding, ring_gpu
 from .codecs import JPEG, RVL, compress, decompress
 from .gpu import CudaArray, CudaImage, cuda_array, is_cuda_array, write_ring
 from .msg import (POINT_FIELD_DTYPES, CompressedImage, CompressedPointCloud2, CudaPointCloud2, Header, PointCloud2,
@@ -156,7 +156,10 @@ class PointCloudPublisher:
     rays; the stream then offers ``cloud/compressed`` (the module's text), with ranges in steps of ``range_step``
     metres (65.5 m at the default) and colours as ``color_codec`` (``jpeg`` of ``jpeg_quality``, or ``png``, exact
     and slower). ``set_rays()`` changes them (a camera back with another size). Every cloud is checked against its
-    rays: one that does not lie on them raises ValueError."""
+    rays: one that does not lie on them raises ValueError.
+
+    A session with ``--ros`` also offers the clouds to ROS 2 as sensor_msgs/PointCloud2 on ``/<base>/cloud``, the
+    plain cloud whatever forms our readers take, while a ROS subscriber is there."""
 
     def __init__(self, session: zenoh.Session, base: str, *, fields: list, point_step: int, frame_id: str,
                  source: str = "", slots: int = DEFAULT_SLOTS, cuda_device: int | None = None, rays=None,
@@ -204,6 +207,7 @@ class PointCloudPublisher:
             self._compressed = session.declare_publisher(topics.cloud_compressed(self.base),
                                                          encoding=cdr_encoding(CompressedPointCloud2),
                                                          congestion_control=drop)
+        self._ros = ros.mirror(session, topics.cloud(self.base), cdr_encoding(PointCloud2))
 
     def set_rays(self, rays):
         """Other rays for the clouds from now on (only for a publisher made with rays)."""
@@ -237,8 +241,11 @@ class PointCloudPublisher:
 
     @property
     def subscribed(self) -> bool:
-        """True if anybody takes clouds of this stream (any representation): compute them only then."""
-        return any(p.matching_status.matching for p in self._publishers())
+        """True if anybody takes clouds of this stream (any representation, ROS's too): compute them only then."""
+        return any(p.matching_status.matching for p in self._publishers()) or self._ros_wants()
+
+    def _ros_wants(self) -> bool:
+        return self._ros is not None and self._ros.matched
 
     def publish(self, points, stamp_ns: int | None = None, is_dense: bool = False, stream=None) -> list[str]:
         """Publish one cloud captured at ``stamp_ns`` (nanoseconds since the epoch; default: now). ``points``: a
@@ -281,7 +288,8 @@ class PointCloudPublisher:
                 self._cuda.put(message.serialize(), attachment=attachment.now())
                 sent.append(str(self._cuda.key_expr))
         compressed = self._compressed is not None and want[self._compressed]
-        if want[self._raw] or want[self._shm] or compressed:
+        ros_raw = self._ros_wants()
+        if want[self._raw] or ros_raw or want[self._shm] or compressed:
             host = array
             if gpu:  # one download for both host representations
                 host = np.empty(nbytes, np.uint8)
@@ -294,12 +302,16 @@ class PointCloudPublisher:
                 message = ShmPointCloud2(**fields, segment=self._host_ring.name, slot=slot, seq=seq)
                 self._shm.put(message.serialize(), attachment=attachment.now())
                 sent.append(str(self._shm.key_expr))
-            if want[self._raw]:
-                message = PointCloud2(header=header, height=height, width=width, fields=self.fields,
+            if want[self._raw] or ros_raw:
+                payload = PointCloud2(header=header, height=height, width=width, fields=self.fields,
                                       point_step=self.point_step, row_step=width * self.point_step, data=host,
-                                      is_dense=is_dense)
-                self._raw.put(message.serialize(), attachment=attachment.now())
-                sent.append(str(self._raw.key_expr))
+                                      is_dense=is_dense).serialize()
+                if want[self._raw]:
+                    self._raw.put(payload, attachment=attachment.now())
+                    sent.append(str(self._raw.key_expr))
+                if ros_raw:
+                    self._ros.put(payload)
+                    sent.append(self._ros.key)
             if compressed:
                 ranges, colors = compress_cloud(host.view(self.dtype).reshape(height, width), self.rays,
                                                 self.range_step, self.color_codec, self.jpeg_quality)
@@ -315,6 +327,8 @@ class PointCloudPublisher:
     def close(self):
         for publisher in self._publishers():
             publisher.undeclare()
+        if self._ros is not None:
+            self._ros.close()
         self._alive.undeclare()
         self._info_queryable.undeclare()
         if self._rays_queryable is not None:
@@ -373,12 +387,15 @@ class PointCloudSubscriber(Subscription):
     on the publisher's host, else ``remote``), or ``"raw"`` (sensor_msgs/PointCloud2), ``"compressed"`` (ranges on
     fixed rays, the module's text), ``"shm"`` or ``"cuda"``. ``remote``: ``"auto"`` (``"compressed"`` where every
     publisher offers it, that is where it has rays, else ``"raw"``), ``"compressed"`` or ``"raw"``.
-    ``copy=False``: shm and cuda clouds are views into the ring (check ``PointCloudFrame.is_valid()``)."""
+    ``copy=False``: shm and cuda clouds are views into the ring (check ``PointCloudFrame.is_valid()``). ``"ros"``: the
+    ROS 2 topic ``/<base>/cloud`` (sensor_msgs/PointCloud2) of a ROS publisher, for a session with ``--ros``."""
 
     KIND = "points"
     TRANSPORTS = {"raw": topics.cloud, "shm": topics.cloud_shm, "cuda": topics.cloud_cuda,
-                  "compressed": topics.cloud_compressed}
-    TYPES = {"raw": PointCloud2, "shm": ShmPointCloud2, "cuda": CudaPointCloud2, "compressed": CompressedPointCloud2}
+                  "compressed": topics.cloud_compressed, ROS: topics.cloud}
+    TYPES = {"raw": PointCloud2, "shm": ShmPointCloud2, "cuda": CudaPointCloud2, "compressed": CompressedPointCloud2,
+             ROS: PointCloud2}
+    ROS_TOPICS = {"points": (topics.cloud, PointCloud2)}
     REMOTE = ("raw", "compressed")
     RAYS_TIMEOUT_S = 5.0
 
@@ -439,7 +456,7 @@ class PointCloudSubscriber(Subscription):
         dtype = points_dtype(message.fields, message.point_step)
         row = message.width * message.point_step
         valid = None
-        if transport == "raw":
+        if transport in ("raw", ROS):
             if message.row_step < row or len(message.data) < message.row_step * message.height:
                 raise RuntimeError(f"{self.base}: the cloud's data does not fit its size and row_step")
             data = np.frombuffer(message.data, np.uint8, message.row_step * message.height)

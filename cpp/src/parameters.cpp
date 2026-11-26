@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <charconv>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -675,6 +676,27 @@ namespace xblick
             return s;
         }
 
+        // the ROS 2 service type of each (rcl_interfaces), for its rmw_zenoh key and token (Python's ROS_SERVICES)
+        std::string ros_service_type(const std::string& service)
+        {
+            static const std::map<std::string, std::string> types = {
+                {std::string(p::kListParameters), "rcl_interfaces/srv/ListParameters"},
+                {std::string(p::kDescribeParameters), "rcl_interfaces/srv/DescribeParameters"},
+                {std::string(p::kGetParameters), "rcl_interfaces/srv/GetParameters"},
+                {std::string(p::kGetParameterTypes), "rcl_interfaces/srv/GetParameterTypes"},
+                {std::string(p::kSetParameters), "rcl_interfaces/srv/SetParameters"},
+                {std::string(p::kSetParametersAtomically), "rcl_interfaces/srv/SetParametersAtomically"}};
+            return types.at(service);
+        }
+
+        // The smallest CDR size of an rcl_interfaces/Parameter: name (4 + 1), type, bool, int64, double, string (4 + 1)
+        // and five sequence lengths (4 each), padding aside
+        constexpr std::size_t kParameterMinBytes = 48;
+
+        // A ROS client's set while sets through ROS are off (Python's ROS_SETS_OFF)
+        constexpr const char* kRosSetsOff = "sets through ROS 2 are off on this node: its ROS parameter services answer "
+                                            "reads only (start it with --ros-params-writable to allow them)";
+
         bool under(const std::string& name, const std::vector<std::string>& prefixes, std::uint64_t depth)
         {
             const auto dots = [](const std::string& s) {
@@ -731,32 +753,128 @@ namespace xblick
         }
     }  // namespace
 
+    // Each call from Zenoh's threads enters it; ~Parameters (and a constructor that throws) closes it and waits until
+    // the calls that run have left: none runs on a dying object, whether or not undeclaring waits for running
+    // callbacks. A call that comes later returns at once, its query dropped without a reply. A writer that destroys
+    // its own Parameters from within a call would wait for itself (not done anywhere).
+    struct Parameters::CallGuard
+    {
+        std::mutex mutex;
+        std::condition_variable left;
+        int running = 0;
+        bool closed = false;
+
+        class Call
+        {
+        public:
+            explicit Call(CallGuard& guard) : guard_(guard)
+            {
+                std::lock_guard lock(guard_.mutex);
+                entered_ = not guard_.closed;
+                guard_.running += entered_ ? 1 : 0;
+            }
+            ~Call()
+            {
+                if (entered_)
+                {
+                    std::lock_guard lock(guard_.mutex);
+                    if (--guard_.running == 0)
+                    {
+                        guard_.left.notify_all();
+                    }
+                }
+            }
+            Call(const Call&) = delete;
+            Call& operator=(const Call&) = delete;
+            explicit operator bool() const { return entered_; }
+
+        private:
+            CallGuard& guard_;
+            bool entered_ = false;
+        };
+
+        void close()
+        {
+            std::unique_lock lock(mutex);
+            closed = true;
+            left.wait(lock, [this] { return running == 0; });
+        }
+    };
+
     Parameters::Parameters(zenoh::Session* session, const std::string& name, const std::string& ns,
                            bool read_only_access)
-        : key_(node_key(ns, name)), name_("/" + key_), read_only_access_(read_only_access)
+        : key_(node_key(ns, name)), name_("/" + key_), read_only_access_(read_only_access),
+          calls_(std::make_shared<CallGuard>())
     {
         if (session == nullptr)
         {
             return;
         }
-        zid_ = session->get_zid().to_string();
+        try
+        {
+            declare_services(*session);
+        }
+        catch (...)
+        {
+            calls_->close();  // the members go: no call may still run on them
+            throw;
+        }
+    }
+
+    void Parameters::declare_services(zenoh::Session& session)
+    {
+        zid_ = session.get_zid().to_string();
         zenoh::Session::PublisherOptions options;
         options.encoding = zenoh::Encoding(p::kParameterEventType.encoding());
-        events_.emplace(session->declare_publisher(zenoh::KeyExpr(std::string(p::kParameterEvents)),
-                                                   std::move(options)));
+        events_.emplace(session.declare_publisher(zenoh::KeyExpr(std::string(p::kParameterEvents)),
+                                                  std::move(options)));
         for (const std::string_view service : services())
         {
             const std::string s(service);
-            queryables_.push_back(session->declare_queryable(
-                zenoh::KeyExpr(key_ + "/" + s), [this, s](const zenoh::Query& query) { answer(s, query); },
+            queryables_.push_back(session.declare_queryable(
+                zenoh::KeyExpr(key_ + "/" + s),
+                [this, s, calls = calls_](const zenoh::Query& query) {
+                    const CallGuard::Call call(*calls);
+                    if (call)
+                    {
+                        answer(s, query);
+                    }
+                },
                 zenoh::closures::none));
         }
-        token_.emplace(
-            session->liveliness_declare_token(zenoh::KeyExpr(key_ + "/" + std::string(p::kParametersToken))));
+        token_.emplace(session.liveliness_declare_token(zenoh::KeyExpr(key_ + "/" + std::string(p::kParametersToken))));
+        if (const std::shared_ptr<ros::Ros> part = ros::of(session))
+        {
+            // the ROS node of this name (Python's Parameters with session.ros): its six services on ROS's keys, its
+            // events on ROS's /parameter_events; a name ROS does not take stops it here (RosError)
+            const auto [node_ns, node_name] = ros::split_node(name_);
+            ros_params_writable_ = part->params_writable();
+            ros_node_ = std::make_unique<ros::RosNode>(session, part, node_name, node_ns);
+            for (const std::string_view service : services())
+            {
+                const std::string s(service);
+                ros_services_.push_back(std::make_unique<ros::Service>(
+                    session, *part, ros_node_->name(), name_ + "/" + s, ros_service_type(s),
+                    [this, s, calls = calls_](const zenoh::Query& query, const ros::Service& server) {
+                        const CallGuard::Call call(*calls);
+                        if (call)
+                        {
+                            answer_ros(s, server, query);
+                        }
+                    }));
+            }
+            ros_events_ = std::make_unique<ros::Publisher>(session, *part, ros_node_->name(), "/parameter_events",
+                                                           std::string(p::kParameterEventType.name),
+                                                           ros::kParametersQos);
+        }
     }
 
     Parameters::~Parameters()
     {
+        calls_->close();  // first: no call runs on the members below while they go
+        ros_services_.clear();
+        ros_events_.reset();
+        ros_node_.reset();
         token_.reset();
         queryables_.clear();
         events_.reset();
@@ -1137,7 +1255,12 @@ namespace xblick
         e.node = name_;
         e.new_parameters = added;
         e.changed_parameters = changed;
-        events_->put(zenoh::Bytes(e.serialize()));
+        std::vector<std::uint8_t> payload = e.serialize();
+        if (ros_events_ and ros_events_->matched())
+        {
+            ros_events_->put(payload);
+        }
+        events_->put(zenoh::Bytes(std::move(payload)));
     }
 
     ListParametersResponse Parameters::list(const ListParametersRequest& request) const
@@ -1292,6 +1415,127 @@ namespace xblick
         catch (...)
         {
             query.reply_err(zenoh::Bytes(name_ + "/" + service + ": an unknown error"));
+        }
+    }
+
+    void Parameters::answer_ros(const std::string& service, const ros::Service& server, const zenoh::Query& query)
+    {
+        // A ROS client's call on ROS's key (Python's Parameters._answer_ros), in Zenoh's thread, whatever it holds:
+        // nothing it holds escapes into Zenoh's thread, and the query is dropped when this returns (replied to or
+        // not). It carries ROS's attachment (sequence number, client gid), no node and no deadline:
+        // - without ROS's attachment (or with one that cannot be read): an error reply, nothing done;
+        // - a set while sets through ROS are off (the default, no --ros-params-writable): refused before its
+        //   parameters are decoded (only their count is read, bounded by kParameterMinBytes), every parameter with
+        //   kRosSetsOff, nothing changed;
+        // - describe while sets through ROS are off: every parameter read_only, as every ROS set is refused;
+        // - a set with --ros-params-writable: executed without a node check and without a deadline (no gate) and
+        //   uncounted (every node of the name gets it from a ROS client and executes it); read-only access
+        //   (--params-read-only), read-only parameters, types, ranges and choices apply as always (set_all, not
+        //   local); a writer that blocks holds the parameters' lock, for our own calls too, as any set does;
+        // - a request that does not decode, or a failure while answering: an error reply with the reason;
+        // - a reply that cannot go out (the session closing): one line on stderr.
+        // The reply carries the request's sequence number and client gid with the reply's own time, as rmw_zenoh's.
+        try
+        {
+            ros::Attachment request_id;
+            try
+            {
+                request_id = ros::Service::request_of(query);
+            }
+            catch (const std::exception& error)  // not a ROS client's (or unreadable): refused, nothing done
+            {
+                query.reply_err(zenoh::Bytes(name_ + "/" + service + ": " + error.what()));
+                return;
+            }
+            std::vector<std::uint8_t> response;
+            try
+            {
+                // as Python: a query without a payload asks with the default request; a payload, also an empty one,
+                // is decoded (an empty one does not decode: an error reply)
+                std::optional<std::vector<std::uint8_t>> request;
+                if (const auto payload = query.get_payload())
+                {
+                    request = payload->get().as_vector();
+                }
+                const auto names = [&] { return request ? NamesRequest::deserialize(*request) : NamesRequest{}; };
+                const auto parameters = [&] {
+                    return request ? ParametersRequest::deserialize(*request) : ParametersRequest{};
+                };
+                const bool is_set = service == p::kSetParameters or service == p::kSetParametersAtomically;
+                if (service == p::kListParameters)
+                {
+                    response =
+                        list(request ? ListParametersRequest::deserialize(*request) : ListParametersRequest{}).serialize();
+                }
+                else if (service == p::kDescribeParameters)
+                {
+                    DescribeParametersResponse described = describe(names());
+                    if (not ros_params_writable_)  // a ROS tool shows no field editable that refuses every set
+                    {
+                        for (ParameterDescriptor& d : described.descriptors)
+                        {
+                            d.read_only = true;
+                        }
+                    }
+                    response = described.serialize();
+                }
+                else if (service == p::kGetParameters)
+                {
+                    response = get_parameters(names()).serialize();
+                }
+                else if (service == p::kGetParameterTypes)
+                {
+                    response = types(names()).serialize();
+                }
+                else if (is_set and not ros_params_writable_)
+                {
+                    // refused before the parameters are decoded: only their count is read (one refusal each), bounded
+                    // by the smallest wire size of a Parameter (48 bytes), so a forged count allocates nothing large
+                    const SetParametersResult off{false, kRosSetsOff};
+                    if (service == p::kSetParameters)
+                    {
+                        std::size_t n = 0;
+                        if (request)
+                        {
+                            ros2_cdr::CdrReader r(*request);
+                            n = r.count(kParameterMinBytes);
+                        }
+                        response = SetParametersResponse{std::vector<SetParametersResult>(n, off)}.serialize();
+                    }
+                    else
+                    {
+                        response = SetParametersAtomicallyResponse{off}.serialize();
+                    }
+                }
+                else if (service == p::kSetParameters)
+                {
+                    response = SetParametersResponse{set_all(parameters().parameters, false, false)}.serialize();
+                }
+                else if (service == p::kSetParametersAtomically)
+                {
+                    response =
+                        SetParametersAtomicallyResponse{set_all(parameters().parameters, true, false).front()}.serialize();
+                }
+                else
+                {
+                    throw std::logic_error("no service " + service);
+                }
+            }
+            catch (const std::exception& e)  // the asker gets the reason
+            {
+                query.reply_err(zenoh::Bytes(name_ + "/" + service + ": " + e.what()));
+                return;
+            }
+            server.reply(query, std::move(response), request_id);
+        }
+        catch (const std::exception& e)  // a reply that cannot go out: said, not raised
+        {
+            std::fprintf(stderr, "xblick: %s/%s: a ROS call not answered: %s\n", name_.c_str(), service.c_str(), e.what());
+        }
+        catch (...)
+        {
+            std::fprintf(stderr, "xblick: %s/%s: a ROS call not answered: an unknown error\n", name_.c_str(),
+                         service.c_str());
         }
     }
 

@@ -24,6 +24,7 @@
 #include "xblick/cuda_ring.hpp"
 #include "xblick/protocol.hpp"
 #include "xblick/ring.hpp"
+#include "xblick/ros.hpp"
 
 namespace xblick::detail
 {
@@ -130,6 +131,13 @@ namespace xblick::detail
         void leave_old_locked();  // with `mutex` held
     };
 
+    // A ROS subscription (transport Ros, a session with --ros) to the ROS topic of our key `key`: each sample into
+    // `latest` (route `route`) as one of ours of `type` (its encoding), without our attachment (no seq, source or
+    // publish time). std::invalid_argument for a session without --ros.
+    std::unique_ptr<ros::Subscriber> ros_subscriber(zenoh::Session& session, const std::string& key,
+                                                    const protocol::MessageType& type, std::shared_ptr<Latest> latest,
+                                                    int route);
+
     // The header stamp of a stream's sample, not decoded (every representation starts with std_msgs/Header).
     std::int64_t stamp_of(const Item& item);
 
@@ -210,6 +218,7 @@ namespace xblick::detail
         std::condition_variable chosen_cv_;
         std::optional<Transport> transport_;
         std::optional<zenoh::Subscriber<void>> subscriber_;
+        std::unique_ptr<ros::Subscriber> ros_subscriber_;  // transport Ros
         std::optional<zenoh::Subscriber<void>> alive_;  // the publishers' liveliness tokens
         std::optional<zenoh::LivelinessToken> want_;  // asks this host's relay for the stream (chooser's thread)
         std::optional<std::pair<Transport, std::string>> using_;  // transport and GPU of the subscriber in use

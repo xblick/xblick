@@ -11,6 +11,42 @@ Each version below is a heading with its release notes: one summary sentence, th
 (and Known limit), one line on compatibility. `tools/release_notes.sh <version>` prints a version's notes for its
 GitHub release. The rule is in [Development](docs/project/development.md#release-notes).
 
+## Branch ros2 (not released)
+
+With `--ros`, a program also takes part in ROS 2 Jazzy or Lyrical on `rmw_zenoh`: ROS nodes see its streams, transforms and
+parameters, and it reads theirs.
+
+### Added
+
+- `--ros`, `--ros-domain` and `--ros-node` in every command and in every node that opens its session with `open_from_args`, and as read-only node parameters.
+- With `--ros`: images, camera_info, JPEG and PNG compressed images, point clouds, detections, diagnostics and robot state on ROS's keys, while a ROS subscriber is there.
+- With `--ros`: transforms on ROS's global `/tf` and `/tf_static`, the static ones also for ROS subscribers that start later; a frame with two parents in one program is one error line.
+- With `--ros`: each node's parameters as a ROS node's services, read only unless `--ros-params-writable`, so that `ros2 param` works; `xblick param --via-ros` and `ParameterClient(ros=True)` for a ROS node's parameters.
+- `CountedPublisher.ros_matched`: a ROS subscriber of the key's mirror (`matched` stays our key's).
+- Readers of ROS topics: transport `ros` for images and clouds (`xblick hz`, `xblick snapshot`), `DetectionSubscriber(ros_type=...)`, `TransformBuffer(ros=True)`.
+- ROS 2 Lyrical (`rmw_zenoh_cpp` 0.10.6 or newer): readers of images, compressed images and clouds also take them from Lyrical publishers, which send these types on keys of their own (Python and C++).
+- The C++ API and programs (`xblick-cpp-camera`, `xblick-cpp-probe`, `xblick-points`) take part the same way: the options in `Options::add_session_options`, `SessionOptions::ros`, `Transport::Ros`.
+- `_core.ros_gid`: the gid of a ROS entity as `rmw_zenoh` makes it (XXH3-128 of its token), used by both sides.
+- The guide [Durchblick and ROS 2](docs/integrations/ros2.md) and the protocol's section on `rmw_zenoh`.
+
+### Changed
+
+- C++: a ROS-only subscriber now counts in `CameraPublisher::subscribed()`, `needs_pixels()` and `ImuPublisher::subscribed()`, so frames render for it; a ROS reader of camera_info alone counts in `subscribed()`, not in `needs_pixels()`.
+
+### Fixed
+
+- C++: a request with a forged list length no longer allocates far more than the request holds.
+- C++: the option structs (`SessionOptions`, `PublisherOptions`, `SubscriberOptions`, the cloud options) give every field a default, so designated initializers that leave fields out compile without `-Wmissing-field-initializers`.
+
+### Known limit
+
+- With `--ros-params-writable` a ROS client's set is unchecked and uncounted: no node check, no deadline, and every node of the name executes it.
+- Keys with a part `command` never go to ROS.
+- A Jazzy subscriber gets no images, compressed images or clouds from a Lyrical publisher, between ROS nodes as well.
+- C++: a ROS subscriber that starts late may get a `/tf_static` message twice (zenoh-c's standalone build has no advanced publisher).
+
+Compatible with 0.5.14: without `--ros` no byte on the wire changes.
+
 ## 0.5.14
 
 `xblick play` gives each of any number of videos its own camera, calibration and pose, so that two videos make a

@@ -616,16 +616,20 @@ def _param(args) -> int:
             return 0
         if not args.node:
             raise SystemExit("xblick param: --node <namespace>/<name> (or --nodes)")
-        client = parameters.ParameterClient(z, args.node, args.timeout)
+        if args.via_ros and z.ros is None:
+            raise SystemExit("xblick param: --via-ros needs --ros (the session's part in ROS 2)")
+        client = parameters.ParameterClient(z, args.node, args.timeout, ros=args.via_ros)
         if args.set:
             names = [s.partition(":=")[0] for s in args.set]
             if any(":=" not in s for s in args.set):
                 raise SystemExit("xblick param: --set NAME:=VALUE")
-            descriptors = dict(zip(names, client.describe(names)))
+            described = client.describe(names)
+            descriptors = dict(zip(names, described))
             values = {}
             for item in args.set:
                 name, _, given = item.partition(":=")
-                if descriptors[name].type == ParameterType.NOT_SET:
+                if name not in descriptors or len(described) != len(names) \
+                        or descriptors[name].type == ParameterType.NOT_SET:
                     raise SystemExit(f"xblick param: {args.node} has no parameter {name}")
                 values[name] = parameters.from_text(descriptors[name], given)
             results = ([client.set_atomically(values)] if args.atomically else client.set(values))
@@ -718,8 +722,9 @@ def build_parser(prog: str = "xblick") -> argparse.ArgumentParser:
             p.add_argument("--timeout", type=float, default=5.0)
         else:
             p.add_argument("--seconds", type=float, default=0.0, help="stop after this time (default: never)")
-        p.add_argument("--transport", choices=("auto", "compressed", "raw", "shm"), default="auto",
-                       help="auto: shared memory on the publisher's host, else compressed")
+        p.add_argument("--transport", choices=("auto", "compressed", "raw", "shm", "ros"), default="auto",
+                       help="auto: shared memory on the publisher's host, else compressed; ros (with --ros): the "
+                            "stream's ROS 2 image topic /<stream>/image_raw")
         zsession.add_arguments(p)
         p.set_defaults(run=run)
 
@@ -854,6 +859,9 @@ def build_parser(prog: str = "xblick") -> argparse.ArgumentParser:
     what.add_argument("--dump", default=None, metavar="FILE", help="write them as a ROS params file")
     p.add_argument("--atomically", action="store_true", help="with --set: all or none")
     p.add_argument("--timeout", type=float, default=2.0)
+    p.add_argument("--via-ros", action="store_true",
+                   help="with --ros: the ROS node /<--node>'s parameters through ROS 2's keys, e.g. --node talker; a "
+                        "set goes without node and deadline (ROS has neither)")
     zsession.add_arguments(p)
     p.set_defaults(run=_param)
 

@@ -38,8 +38,8 @@ from dataclasses import dataclass, field, replace
 import numpy as np
 import zenoh
 
-from . import _core, declaration, topics
-from .codecs import JPEG, check_codec, compress, decompress
+from . import _core, declaration, ros, topics
+from .codecs import JPEG, PNG, check_codec, compress, decompress
 from .encodings import check_array, image_to_numpy, info, numpy_to_image
 from .gpu import (CudaArray, CudaImage, check_cuda_array, cuda_array, device_ordinal, device_uuid, is_cuda_array,
                   write_ring)
@@ -152,10 +152,14 @@ class SentCount:
 class CountedPublisher:
     """The samples of one key, each with the attachment and a seq that grows by one. ``blocking``: blocking congestion
     control and the count on ``<key>/sent`` (SentCount), for recordings that must have every sample (the default
-    drops: nothing is held up unless its publisher asks for it). Not thread-safe (call put from one thread)."""
+    drops: nothing is held up unless its publisher asks for it). Not thread-safe (call put from one thread).
+
+    A session with ``--ros`` also offers the samples to ROS 2 (ros.mirror), on the key's topic (``/<key>``), or on
+    ROS's global ``/tf`` with ``ros_tf`` (a camera's, a robot's, a world's transforms); while a ROS subscriber is
+    there."""
 
     def __init__(self, session: zenoh.Session, key: str, encoding: zenoh.Encoding, blocking: bool = False,
-                 source: str = ""):
+                 source: str = "", ros_tf: bool = False):
         self.key = topics.check_name(key)
         self.blocking = blocking
         self.source = source
@@ -163,22 +167,32 @@ class CountedPublisher:
         self._publisher = session.declare_publisher(self.key, encoding=encoding,
                                                     congestion_control=congestion(blocking))
         self._sent = SentCount(session, self._publisher) if blocking else None
+        self._ros = ros.mirror_tf(session, key=self.key) if ros_tf else ros.mirror(session, self.key, encoding)
 
     @property
     def matched(self) -> bool:
-        """True if a subscriber of the key is known (Zenoh's matching status)."""
+        """True if a subscriber of our key is known (Zenoh's matching status); ROS's subscribers: ``ros_matched``."""
         return self._publisher.matching_status.matching
+
+    @property
+    def ros_matched(self) -> bool:
+        """True if a subscriber of the ROS topic this key is mirrored to is known (``--ros``); False without one."""
+        return self._ros is not None and self._ros.matched
 
     def put(self, payload: bytes):
         self.seq += 1
         self._publisher.put(payload, attachment=_attachment(self.seq, self.source))
         if self._sent is not None:
             self._sent.count(self.seq)
+        if self.ros_matched:
+            self._ros.put(payload)
 
     def close(self):
         if self._sent is not None:
             self._sent.close()
         self._publisher.undeclare()
+        if self._ros is not None:
+            self._ros.close()
 
 
 class CameraPublisher:
@@ -194,7 +208,12 @@ class CameraPublisher:
     info record says so, and ``xblick rerun`` draws them over the camera's images. ``blocking``: ``image_raw``,
     ``image_raw/compressed`` and ``camera_info`` with blocking congestion control (a slow subscriber, a recorder, holds
     ``publish`` up instead of losing frames), and their counts on ``<key>/sent`` (SentCount); the rings drop as
-    always. The default drops."""
+    always. The default drops.
+
+    A session with ``--ros`` (``session.ros``) also offers the stream to ROS 2 under ``/<base>/image_raw`` and
+    ``/<base>/camera_info`` (each frame's camera_info with the image's header, as image_transport has it), and under
+    ``/<base>/image_raw/compressed`` with codec jpeg or png (image_transport's compressed format); RVL has no ROS
+    topic. Each only while a ROS subscriber is there; the rings and our keys stay as they are."""
 
     def __init__(self, session: zenoh.Session, base: str, *, encoding: str, frame_id: str,
                  camera_info: CameraInfo | None = None, source: str = "", codec: str | None = JPEG,
@@ -241,6 +260,14 @@ class CameraPublisher:
         # key -> its count (blocking only)
         self._sent = ({str(p.key_expr): SentCount(session, p) for p in (self._raw, self._compressed, self._info)
                        if p is not None} if blocking else {})
+        self._ros_raw = self._ros_compressed = self._ros_info = None
+        taking_part = getattr(session, "ros", None)
+        if taking_part is not None:
+            node = taking_part.node
+            self._ros_raw = node.publisher(ros.topic_of(topics.image_raw(self.base)), Image.TYPE)
+            if codec in (JPEG, PNG):  # image_transport's compressed plugin; RVL is no ROS format there
+                self._ros_compressed = node.publisher(ros.topic_of(topics.compressed(self.base)), CompressedImage.TYPE)
+            self._ros_info = node.publisher(ros.topic_of(topics.camera_info(self.base)), CameraInfo.TYPE)
 
     def _ring_uuid(self) -> str | None:
         """The CUDA ring's GPU, also before a reader made the ring exist (local auto compares it with its own)."""
@@ -261,10 +288,15 @@ class CameraPublisher:
     def _image_publishers(self):
         return [p for p in (self._raw, self._compressed, self._shm, self._cuda) if p is not None]
 
+    def _ros_wants(self) -> tuple[bool, bool]:
+        """(raw, compressed): a ROS subscriber takes the stream's image_raw, its image_raw/compressed."""
+        return (self._ros_raw is not None and self._ros_raw.matched,
+                self._ros_compressed is not None and self._ros_compressed.matched)
+
     @property
     def subscribed(self) -> bool:
-        """True if anybody takes images of this stream (any representation)."""
-        return any(p.matching_status.matching for p in self._image_publishers())
+        """True if anybody takes images of this stream (any representation, ROS's too)."""
+        return any(p.matching_status.matching for p in self._image_publishers()) or any(self._ros_wants())
 
     def publish(self, image, stamp_ns: int | None = None, stream=None) -> list[str]:
         """Publish one frame captured at ``stamp_ns`` (nanoseconds since the epoch; default: now). ``image`` is a NumPy
@@ -285,7 +317,7 @@ class CameraPublisher:
         header = Header(stamp=Time.from_ns(time.time_ns() if stamp_ns is None else stamp_ns), frame_id=self.frame_id)
         self.seq += 1
         attachment = FrameAttachment(self.seq, self.source)
-        want = {p: p.matching_status.matching for p in self._image_publishers()}
+        want = self._wants()
         sent = []
         self._send(array if gpu else image, gpu, header, attachment, want, sent, encode=True)
         self._send_info(header, attachment, sent)
@@ -302,11 +334,16 @@ class CameraPublisher:
             check_array(image, self.encoding)
         self.seq += 1
         attachment = FrameAttachment(self.seq, self.source)
-        want = {p: p.matching_status.matching for p in self._image_publishers()}
+        want = self._wants()
         sent = []
-        if want[self._compressed]:
-            self._put(self._compressed, message.serialize(), attachment, sent)
-        if want[self._raw] or want[self._shm] or (self._cuda is not None and want[self._cuda]):
+        if want[self._compressed] or want["ros_compressed"]:
+            payload = message.serialize()
+            if want[self._compressed]:
+                self._put(self._compressed, payload, attachment, sent)
+            if want["ros_compressed"]:
+                self._put_ros(self._ros_compressed, payload, sent)
+        if (want[self._raw] or want["ros_raw"] or want[self._shm]
+                or (self._cuda is not None and want[self._cuda])):
             if image is None:
                 image, encoding = decompress(message)
                 if encoding != self.encoding:
@@ -316,10 +353,18 @@ class CameraPublisher:
         self._send_info(message.header, attachment, sent)
         return sent
 
+    def _wants(self) -> dict:
+        """Which of the image publishers have subscribers now: each publisher, and ``ros_raw``,
+        ``ros_compressed``."""
+        want = {p: p.matching_status.matching for p in self._image_publishers()}
+        want["ros_raw"], want["ros_compressed"] = self._ros_wants()
+        return want
+
     def _send(self, image, gpu: bool, header: Header, attachment: FrameAttachment, want: dict, sent: list,
               encode: bool):
         """The frame (host array, or the device array if ``gpu``) to the image publishers that have subscribers
-        (``want``); ``encode``: compressed ones too."""
+        (``want``, ``_wants``); ``encode``: compressed ones too. The raw and compressed bytes are made once for ours
+        and ROS's."""
         cuda_slot = None
         if gpu or (self._cuda is not None and want[self._cuda]):
             cuda_slot = self._write_cuda(image)
@@ -328,7 +373,9 @@ class CameraPublisher:
                                attachment=attachment.now())
                 sent.append(str(self._cuda.key_expr))
         compressed = encode and self._compressed is not None and want[self._compressed]
-        if want[self._raw] or compressed or want[self._shm]:
+        ros_compressed = encode and want["ros_compressed"]
+        raw = want[self._raw] or want["ros_raw"]
+        if raw or compressed or ros_compressed or want[self._shm]:
             host = image
             if gpu:  # one download for all CPU representations
                 host = np.empty(image.shape, image.dtype)
@@ -338,16 +385,34 @@ class CameraPublisher:
                 self._shm.put(self._descriptor(ShmImage, header, host, written).serialize(),
                               attachment=attachment.now())
                 sent.append(str(self._shm.key_expr))
-            if want[self._raw]:
-                self._put(self._raw, numpy_to_image(host, self.encoding, header).serialize(), attachment, sent)
-            if compressed:
-                message = compress(host, self.encoding, self.codec, self.jpeg_quality, header)
-                self._put(self._compressed, message.serialize(), attachment, sent)
+            if raw:
+                payload = numpy_to_image(host, self.encoding, header).serialize()
+                if want[self._raw]:
+                    self._put(self._raw, payload, attachment, sent)
+                if want["ros_raw"]:
+                    self._put_ros(self._ros_raw, payload, sent)
+            if compressed or ros_compressed:
+                payload = compress(host, self.encoding, self.codec, self.jpeg_quality, header).serialize()
+                if compressed:
+                    self._put(self._compressed, payload, attachment, sent)
+                if ros_compressed:
+                    self._put_ros(self._ros_compressed, payload, sent)
 
     def _send_info(self, header: Header, attachment: FrameAttachment, sent: list):
-        if self.camera_info is not None and self._info.matching_status.matching:
-            info_message = replace(self.camera_info, header=header)
-            self._put(self._info, info_message.serialize(), attachment, sent)
+        if self.camera_info is None:
+            return
+        ours, theirs = self._info.matching_status.matching, self._ros_info is not None and self._ros_info.matched
+        if ours or theirs:
+            payload = replace(self.camera_info, header=header).serialize()
+            if ours:
+                self._put(self._info, payload, attachment, sent)
+            if theirs:
+                self._put_ros(self._ros_info, payload, sent)
+
+    @staticmethod
+    def _put_ros(publisher: ros.RosPublisher, payload, sent: list):
+        publisher.put(payload)
+        sent.append(publisher.key)
 
     def _put(self, publisher: zenoh.Publisher, payload, attachment: FrameAttachment, sent: list):
         """A sample of the current frame (seq) on one of the network keys, its payload made (encoded) already: its
@@ -390,6 +455,9 @@ class CameraPublisher:
             count.close()
         for publisher in self._image_publishers() + [self._info]:
             publisher.undeclare()
+        for publisher in (self._ros_raw, self._ros_compressed, self._ros_info):
+            if publisher is not None:
+                publisher.close()
         self._alive.undeclare()
         self._info_queryable.undeclare()
         self._host_ring = None  # unlinks the shared memory; readers keep their mapping until they let go
@@ -549,8 +617,10 @@ class _Latest:
             return self._sample
 
 
-TRANSPORTS = {"compressed": topics.compressed, "raw": topics.image_raw, "shm": topics.shm, "cuda": topics.cuda}
-_TYPES = {"compressed": CompressedImage, "raw": Image, "shm": ShmImage, "cuda": CudaImageMsg}
+ROS = "ros"  # a transport: the stream's ROS 2 topic (/<base>/image_raw, /<base>/cloud), for a session with --ros
+TRANSPORTS = {"compressed": topics.compressed, "raw": topics.image_raw, "shm": topics.shm, "cuda": topics.cuda,
+              ROS: topics.image_raw}
+_TYPES = {"compressed": CompressedImage, "raw": Image, "shm": ShmImage, "cuda": CudaImageMsg, ROS: Image}
 AUTO = "auto"
 # how long a subscription that changes its transport keeps the old one for the new one's first frame; after that, as
 # long again the new route's samples are compared with the newest frame kept (_Latest), and a stamp at most as far
@@ -561,7 +631,7 @@ WAIT_HINT_S = 5.0  # a subscription that has no publisher this long says once wh
 SETTLE_ROUNDS = 3  # info queries after a publisher came or went (its queryable can be known later than its token)
 # what a subscriber reads, for its start line: where the frames are (host or GPU memory) or how they come
 READS = {"shm": "the host ring", "cuda": "the CUDA ring", "compressed": "compressed frames over Zenoh",
-         "raw": "raw frames over Zenoh"}
+         "raw": "raw frames over Zenoh", ROS: "the ROS 2 topic"}
 LOCAL = ("auto", "shm", "cuda")
 REMOTE = ("compressed", "raw")
 
@@ -653,7 +723,9 @@ def find_streams(session: zenoh.Session, prefix: str = "", timeout: float = 2.0)
 
 class StaticTransformPublisher:
     """A camera's fixed transforms between its streams' frames on ``<camera>/tf_static``: published once and answered
-    on request until :meth:`close`, as ROS's latched ``/tf_static``."""
+    on request until :meth:`close`, as ROS's latched ``/tf_static``. A session with ``--ros`` also publishes them once
+    on ROS 2's global ``/tf_static``, transient local with a cache of one message (as tf2's static broadcaster), so
+    that a ROS subscriber that starts later gets them until :meth:`close`."""
 
     def __init__(self, session: zenoh.Session, camera: str, transforms: list[TransformStamped]):
         self.key = topics.tf_static(camera)
@@ -661,29 +733,49 @@ class StaticTransformPublisher:
         # the queryable first: a subscriber that starts after the put asks for it
         self._queryable = session.declare_queryable(self.key, self._answer)
         session.put(self.key, self._payload, encoding=cdr_encoding(TFMessage))
+        self._ros = ros.mirror_tf(session, static=True)
+        if self._ros is not None:
+            self._ros.put(self._payload)  # kept in its cache for later ROS subscribers
 
     def _answer(self, query: zenoh.Query):
         query.reply(self.key, self._payload, encoding=cdr_encoding(TFMessage))
 
     def close(self):
         self._queryable.undeclare()
+        if self._ros is not None:
+            self._ros.close()
 
 
 class StaticTransformSubscriber:
     """Calls ``callback(TFMessage)`` with a camera's fixed transforms: those its publisher answers when asked (at the
     start, in a thread of its own, asked again until an answer comes or ``timeout`` ends: right after a session
     connects, a query can end at once without answers) and every later publication. Errors (another protocol version)
-    are kept and raised by :meth:`check`."""
+    are kept and raised by :meth:`check`.
 
-    def __init__(self, session: zenoh.Session, camera: str, callback, timeout: float = 10.0):
-        self.key = topics.tf_static(camera)
+    ``ros`` (a session with ``--ros``): ROS 2's global ``/tf_static`` instead, every publisher's (transient local:
+    the messages of publishers that were there before come from their caches), ``camera`` unused."""
+
+    def __init__(self, session: zenoh.Session, camera: str, callback, timeout: float = 10.0, ros: bool = False):
+        self.key = "/tf_static" if ros else topics.tf_static(camera)
         self._callback = callback
         self._error: BaseException | None = None
         self._closed = False
+        self._query = None
+        if ros:
+            self._subscriber = _ros_tf_subscriber(session, True, self._deliver_ros)
+            return
         self._subscriber = session.declare_subscriber(self.key, lambda s: self._deliver(s.key_expr, s.encoding,
                                                                                         s.payload))
         self._query = threading.Thread(target=self._ask, args=(session, timeout), daemon=True)
         self._query.start()
+
+    def _deliver_ros(self, payload: bytes, *_):
+        if self._error is not None:
+            return
+        try:
+            self._callback(TFMessage.deserialize(payload))
+        except BaseException as error:  # noqa: BLE001 - raised in the caller's thread by check()
+            self._error = error
 
     def _ask(self, session: zenoh.Session, timeout: float):
         deadline = time.monotonic() + timeout
@@ -712,8 +804,9 @@ class StaticTransformSubscriber:
 
     def close(self):
         self._closed = True
-        self._subscriber.undeclare()
-        self._query.join()
+        _undeclare(self._subscriber)
+        if self._query is not None:
+            self._query.join()
 
 
 class TransformPublisher:
@@ -723,7 +816,7 @@ class TransformPublisher:
 
     def __init__(self, session: zenoh.Session, camera: str, blocking: bool = False):
         self.key = topics.tf(camera)
-        self._publisher = CountedPublisher(session, self.key, cdr_encoding(TFMessage), blocking=blocking)
+        self._publisher = CountedPublisher(session, self.key, cdr_encoding(TFMessage), blocking=blocking, ros_tf=True)
 
     def publish(self, transforms: list[TransformStamped]):
         self._publisher.put(bytes(TFMessage(transforms=list(transforms)).serialize()))
@@ -732,15 +825,36 @@ class TransformPublisher:
         self._publisher.close()
 
 
+def _ros_tf_subscriber(session, static: bool, callback):
+    """A subscription to ROS 2's global ``/tf`` or ``/tf_static`` (as tf2's listener: depth 100, the static one
+    transient local) for a session with ``--ros``."""
+    if getattr(session, "ros", None) is None:
+        raise ValueError(f"reading ROS 2's /tf{'_static' if static else ''} needs a session with --ros")
+    return session.ros.node.subscriber("/tf_static" if static else "/tf", TFMessage.TYPE, callback,
+                                       ros.TF_STATIC_READ_QOS if static else ros.TF_QOS)
+
+
 class TransformSubscriber:
     """Calls ``callback(TFMessage)`` with every message on a camera's ``<camera>/tf``, in Zenoh's thread. Errors
-    (another protocol version) stop the deliveries; :meth:`check` raises them."""
+    (another protocol version) stop the deliveries; :meth:`check` raises them. ``ros`` (a session with ``--ros``):
+    ROS 2's global ``/tf`` instead, ``camera`` unused."""
 
-    def __init__(self, session: zenoh.Session, camera: str, callback):
-        self.key = topics.tf(camera)
+    def __init__(self, session: zenoh.Session, camera: str, callback, ros: bool = False):
+        self.key = "/tf" if ros else topics.tf(camera)
         self._callback = callback
         self._error: BaseException | None = None
-        self._subscriber = session.declare_subscriber(self.key, self._on_sample)
+        if ros:
+            self._subscriber = _ros_tf_subscriber(session, False, lambda payload, *_: self._take(payload))
+        else:
+            self._subscriber = session.declare_subscriber(self.key, self._on_sample)
+
+    def _take(self, payload: bytes):
+        if self._error is not None:
+            return
+        try:
+            self._callback(TFMessage.deserialize(payload))
+        except BaseException as error:  # noqa: BLE001 - raised in the caller's thread by check()
+            self._error = error
 
     def _on_sample(self, sample: zenoh.Sample):
         if self._error is not None:
@@ -756,7 +870,7 @@ class TransformSubscriber:
             raise self._error
 
     def close(self):
-        self._subscriber.undeclare()
+        _undeclare(self._subscriber)
 
 
 class MaxRate:
@@ -788,6 +902,14 @@ def _stamp_of(payload: bytes) -> int:
     return sec * 1_000_000_000 + nanosec
 
 
+def _undeclare(subscriber):
+    """A Zenoh subscriber undeclared, a ROS one (ros.RosSubscriber) closed."""
+    if isinstance(subscriber, ros.RosSubscriber):
+        subscriber.close()
+    else:
+        subscriber.undeclare()
+
+
 def check_local(subscriber, local: str):
     """Raises when ``local="cuda"`` was asked for and the publisher, on this host, offers no CUDA ring: ``auto`` reads
     its shared memory instead, unseen (a node told to keep frames on the GPU calls this once a frame came)."""
@@ -813,16 +935,19 @@ class Subscription:
     TRANSPORTS: dict = {}  # transport -> topic function
     TYPES: dict = {}  # transport -> message type
     REMOTE: tuple = ()
+    ROS_TOPICS: dict = {}  # kind -> (topic function, message type) of transport ros
 
     def __init__(self, session: zenoh.Session, base: str, transport: str, local: str, remote: str, copy: bool,
                  max_hz: float | None = None, device=None):
         if transport not in self.TRANSPORTS and transport != AUTO:
             raise ValueError(f"transport {transport!r}: auto or one of {', '.join(self.TRANSPORTS)}")
+        if transport == ROS and getattr(session, "ros", None) is None:
+            raise ValueError("transport ros reads the stream's ROS 2 topic: it needs a session with --ros")
         if local not in LOCAL:
             raise ValueError(f"local {local!r}: one of {', '.join(LOCAL)}")
         if remote not in self.REMOTE:
             raise ValueError(f"remote {remote!r}: one of {', '.join(self.REMOTE)}")
-        if not copy and transport in self.REMOTE:
+        if not copy and (transport in self.REMOTE or transport == ROS):
             raise ValueError("copy=False is for the shm and cuda transports (and auto)")
         self.base = topics.check_name(base)
         self.requested = transport
@@ -916,8 +1041,11 @@ class Subscription:
             route = self._route
             old = self._subscriber
             latest.move(route)
-            self._subscriber = self._session.declare_subscriber(
-                self._key(transport, gpu), lambda sample: latest.put(sample, transport, route))
+            if transport == ROS:
+                self._subscriber = self._ros_subscriber(latest, route)
+            else:
+                self._subscriber = self._session.declare_subscriber(
+                    self._key(transport, gpu), lambda sample: latest.put(sample, transport, route))
             self.transport, self._using = transport, (transport, gpu)
             self._chosen.set()
         if old is None:
@@ -927,7 +1055,17 @@ class Subscription:
             pass
         # before the undeclare: Zenoh can still hand over a sample of the old subscriber while it is undeclared
         latest.leave_old()
-        old.undeclare()
+        _undeclare(old)
+
+    def _ros_subscriber(self, latest: _Latest, route: int):
+        """The ROS 2 subscription of transport ``ros`` (``ROS_TOPICS``): its samples as ours of TYPES["ros"],
+        without our attachment (no seq, source or publish time)."""
+        topic_of_key, message_type = self.ROS_TOPICS[self.KIND]
+        topic = ros.topic_of(topic_of_key(self.base))
+        return self._session.ros.node.subscriber(
+            topic, message_type.TYPE,
+            lambda payload, seq, stamp, publisher: latest.offer((payload, None, topic, time.time_ns(),
+                                                                 message_type.ENCODING, ROS), route))
 
     def _choice(self, records: list[dict]) -> tuple[str, str, str, bool]:
         """(transport, gpu, why, local) for the publishers that answered ``<base>/info``."""
@@ -1156,7 +1294,7 @@ class Subscription:
             self._alive.undeclare()
         with self._lock:
             if self._subscriber is not None:
-                self._subscriber.undeclare()
+                _undeclare(self._subscriber)
                 self._subscriber = None
         self._rings = {}
 
@@ -1173,6 +1311,8 @@ class ImageSubscriber(Subscription):
       (``transport`` says which, None until then) and again when the publisher shows up on another host.
     * ``"compressed"`` (JPEG, PNG or RVL), ``"raw"`` (sensor_msgs/Image), ``"shm"`` (host ring, same host only) or ``"cuda"``
       (CUDA ring, same host only; frames are gpu.CudaImage) to choose it yourself.
+    * ``"ros"``: the ROS 2 topic ``/<base>/image_raw`` (sensor_msgs/Image) of a ROS publisher, for a session with
+      ``--ros``; with ``camera_info`` its ``/<base>/camera_info``. Its frames carry no seq, source or publish time.
 
     With ``copy=False`` the shm and cuda transports hand out views into the ring instead of copies: check
     ``Frame.is_valid()`` after using one. With ``camera_info=True`` the stream's CameraInfo is received as well
@@ -1182,14 +1322,21 @@ class ImageSubscriber(Subscription):
     TRANSPORTS = TRANSPORTS
     TYPES = _TYPES
     REMOTE = REMOTE
+    ROS_TOPICS = {"image": (topics.image_raw, Image)}
 
     def __init__(self, session: zenoh.Session, base: str, transport: str = "compressed", camera_info: bool = False,
                  copy: bool = True, remote: str = "compressed", local: str = "auto", max_hz: float | None = None,
                  device=None):
         super().__init__(session, base, transport, local, remote, copy, max_hz, device)
         self._info_latest = _Latest() if camera_info else None
-        self._info_subscriber = (session.declare_subscriber(topics.camera_info(self.base), self._info_latest.put)
-                                 if camera_info else None)
+        self._info_subscriber = None
+        if camera_info and transport == ROS:
+            topic = ros.topic_of(topics.camera_info(self.base))
+            self._info_subscriber = session.ros.node.subscriber(
+                topic, CameraInfo.TYPE, lambda payload, *_: self._info_latest.offer(
+                    (payload, None, topic, time.time_ns(), CameraInfo.ENCODING, ROS)))
+        elif camera_info:
+            self._info_subscriber = session.declare_subscriber(topics.camera_info(self.base), self._info_latest.put)
 
     def latest(self, consume: bool = True, timeout: float | None = None) -> Frame | None:
         """The newest frame; with ``consume`` each frame is returned once (None until the next arrives). With a
@@ -1210,7 +1357,7 @@ class ImageSubscriber(Subscription):
         if transport == "compressed":
             message = CompressedImage.deserialize(payload)
             image, encoding = decompress(message)
-        elif transport == "raw":
+        elif transport in ("raw", ROS):
             message = Image.deserialize(payload)
             image, encoding = image_to_numpy(message), message.encoding
         else:
@@ -1251,4 +1398,5 @@ class ImageSubscriber(Subscription):
     def close(self):
         super().close()
         if self._info_subscriber is not None:
-            self._info_subscriber.undeclare()
+            self._info_subscriber.close() if isinstance(self._info_subscriber, ros.RosSubscriber) \
+                else self._info_subscriber.undeclare()

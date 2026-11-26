@@ -28,6 +28,15 @@ cmake -S . -B build/cpp -G Ninja -DCMAKE_PREFIX_PATH=/opt/zenoh \
       -DXBLICK_CUDA_INCLUDE_DIR=$(uv run python -c "import nvidia, os; print(os.path.join(list(nvidia.__path__)[0], 'cu13', 'include'))")
 cmake --build build/cpp && ctest --test-dir build/cpp
 XBLICK_CPP_BUILD=build/cpp uv run pytest tests/test_cpp_interop.py        # C++ against Python
+XBLICK_CPP_BUILD=build/cpp uv run pytest tests/test_cpp_ros.py            # --ros: C++ against Python and ROS 2
+XBLICK_ROS_LYRICAL_IMAGE=<image> uv run pytest tests/test_ros_lyrical.py  # --ros against ROS 2 Lyrical in docker
+```
+
+`tests/test_ros_lyrical.py` runs only when `XBLICK_ROS_LYRICAL_IMAGE` names a docker image with ROS 2 Lyrical,
+`rmw_zenoh_cpp`, `image_tools` and `ros2cli`. `tests/ros/lyrical.Dockerfile` builds such an image:
+
+```bash
+docker build -t xblick-test-lyrical -f tests/ros/lyrical.Dockerfile tests/ros
 ```
 
 ## Build the point cloud node

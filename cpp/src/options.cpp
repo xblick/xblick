@@ -179,7 +179,36 @@ namespace xblick
         {
             options_[by_name_.at(name)].internal = true;
         }
+        // as Python's session.add_arguments; parameters as there (read-only: they apply at the start)
+        add_flag("ros", {.help = "take part in ROS 2 as well (rmw_zenoh, ROS 2 Jazzy): streams, transforms and parameters "
+                                 "also on ROS's keys, as a ROS node (docs/integrations/ros2.md); our keys stay as they are"});
+        add_optional("ros-domain", parameter_type::kInteger,
+                     {.help = "with --ros: the ROS domain id (default: ROS_DOMAIN_ID, else 0)", .metavar = "ID"});
+        add_optional("ros-node", parameter_type::kString,
+                     {.help = "with --ros: the program's ROS node name (default: the program's name, every character "
+                              "other than a letter, digit or _ written as _, e.g. xblick_cam)",
+                      .metavar = "NAME"});
+        add_flag("ros-params-writable",
+                 {.help = "with --ros: ROS clients may set this program's parameters (default: they read them, sets "
+                          "are refused). A ROS set is unchecked and uncounted: no node check, no deadline, and two "
+                          "nodes of one name both execute it while the ROS client shows one success"});
+        session_options_ = true;
         return *this;
+    }
+
+    std::optional<ros::Options> Options::ros_options() const
+    {
+        if (not session_options_)
+        {
+            throw std::logic_error(program_ + ": ros_options needs add_session_options");
+        }
+        const Option& domain = find("ros-domain");
+        const Option& node = find("ros-node");
+        return ros::options_from(
+            flag("ros"),
+            domain.value.type == T::kNotSet ? std::nullopt : std::optional<std::int64_t>(domain.value.integer_value),
+            node.value.type == T::kNotSet ? std::nullopt : std::optional<std::string>(node.value.string_value),
+            flag("ros-params-writable"), program_);
     }
 
     Options& Options::add_parameter_options()
@@ -370,6 +399,17 @@ namespace xblick
                 throw OptionsError("--" + o.name + " is required");
             }
         }
+        if (session_options_)
+        {
+            try
+            {
+                ros_options();  // --ros-domain without --ros, a domain or node name ROS does not take: now
+            }
+            catch (const ros::RosError& error)
+            {
+                throw OptionsError(error.what());
+            }
+        }
     }
 
     // ------------------------------------------------------------------------------------------- the parameters
@@ -480,6 +520,7 @@ namespace xblick
         s.config_file = text("zenoh-config");
         s.program = program_;
         s.version = version_;
+        s.ros = ros_options();
         return s;
     }
 

@@ -121,6 +121,25 @@ int main()
     expect(refused({"x", "--stream", "a", "--prefer-raw=yes"}, "takes no value"), "a value for a flag");
     expect(refused({"x", "--stream", "a", "--slots"}, "needs a value"), "no value");
     expect(refused({"x", "stray", "--stream", "a"}, "unexpected argument"), "a stray argument");
+    // the ROS options (Python's session.ros_options_from_args)
+    expect(refused({"x", "--stream", "a", "--ros-domain", "3"}, "need --ros"), "--ros-domain without --ros");
+    expect(refused({"x", "--stream", "a", "--ros-node", "n"}, "need --ros"), "--ros-node without --ros");
+    expect(refused({"x", "--stream", "a", "--ros-params-writable"}, "need --ros"), "--ros-params-writable alone");
+    expect(refused({"x", "--stream", "a", "--ros", "--ros-domain", "-2"}, "a ROS domain id is an integer from 0"),
+           "a negative domain");
+    expect(refused({"x", "--stream", "a", "--ros", "--ros-node", "bad-name"}, "ROS node name"), "a node name with -");
+    {
+        auto o = relay_like();
+        const std::vector<const char*> none{"x", "--stream", "a"};
+        o.parse_or_throw(static_cast<int>(none.size()), none.data());
+        expect(not o.session_options().ros, "no --ros: the session takes no part in ROS");
+        auto r = relay_like();
+        const std::vector<const char*> argv{"x", "--stream", "a", "--ros", "--ros-domain", "7", "--ros-params-writable"};
+        r.parse_or_throw(static_cast<int>(argv.size()), argv.data());
+        const auto ros = r.session_options().ros;
+        expect(ros and ros->domain == 7 and ros->node == "xblick_test" and ros->params_writable,
+               "--ros: domain given, node name of the program, parameters writable");
+    }
     {
         auto o = relay_like();
         const std::vector<const char*> argv{"x", "--stream", "a", "--gain", "-0.5"};

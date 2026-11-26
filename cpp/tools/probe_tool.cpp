@@ -1,10 +1,11 @@
 // xblick-cpp-probe: a C++ subscriber that prints one JSON line per frame (encoding, size, sequence number,
 // checksum of the pixels), for checking C++ against Python and as an example of the C++ API.
 //
-//   xblick-cpp-probe --connect host:7447 --base test/camera/color --transport auto|raw|compressed|shm|cuda
+//   xblick-cpp-probe --connect host:7447 --base test/camera/color --transport auto|raw|compressed|shm|cuda|ros
 //                        [--view] [--frames 10] [--timeout 10] [--camera-info] [--points [--local cuda]]
 //                        [--max-hz 5]
 //   xblick-cpp-probe --connect host:7447 --params <namespace>/<name> [--set NAME:=VALUE]
+//   xblick-cpp-probe --connect host:7447 --tf-static <camera> [--ros] [--timeout 10]
 //
 // --params: a node's parameters (parameters.hpp, ParameterClient): with --set that change first (a line with its
 // result and "checked": its node checked node and deadline), then a line per parameter (name, type, value, read_only,
@@ -14,6 +15,7 @@
 #include <chrono>
 #include <csignal>
 #include <map>
+#include <thread>
 
 #include "xblick/camera.hpp"
 #include "xblick/version.hpp"
@@ -95,6 +97,181 @@ namespace
         return out + "\"";
     }
 
+    // --ros-wire: what ros.hpp makes of each line of stdin (a case, its fields separated by tabs), one line per case
+    // ("ERROR" for a RosError), for tests/test_cpp_ros.py's comparison with Python's xblick.ros. No session.
+    int ros_wire()
+    {
+        namespace ros = xblick::ros;
+        const auto hex = [](const std::vector<std::uint8_t>& bytes) {
+            static const char* digits = "0123456789abcdef";
+            std::string out;
+            for (const std::uint8_t b : bytes)
+            {
+                out += digits[b >> 4];
+                out += digits[b & 15];
+            }
+            return out;
+        };
+        const auto unhex = [](const std::string& h) {
+            std::vector<std::uint8_t> out;
+            for (std::size_t i = 0; i + 1 < h.size(); i += 2)
+            {
+                out.push_back(static_cast<std::uint8_t>(std::stoi(h.substr(i, 2), nullptr, 16)));
+            }
+            return out;
+        };
+        std::string line;
+        while (std::getline(std::cin, line))
+        {
+            std::vector<std::string> f;
+            std::size_t start = 0;
+            while (true)
+            {
+                const std::size_t tab = line.find('\t', start);
+                f.push_back(line.substr(start, tab == std::string::npos ? std::string::npos : tab - start));
+                if (tab == std::string::npos)
+                {
+                    break;
+                }
+                start = tab + 1;
+            }
+            std::string out;
+            try
+            {
+                const std::string& op = f.at(0);
+                if (op == "topic_of")
+                {
+                    out = ros::topic_of(f.at(1));
+                }
+                else if (op == "node_name_of")
+                {
+                    out = ros::node_name_of(f.at(1));
+                }
+                else if (op == "check_node_name")
+                {
+                    out = ros::check_node_name(f.at(1));
+                }
+                else if (op == "split_node")
+                {
+                    const auto [ns, name] = ros::split_node(f.at(1));
+                    out = ns + "\t" + name;
+                }
+                else if (op == "dds_type")
+                {
+                    out = ros::dds_type(f.at(1));
+                }
+                else if (op == "data_key")
+                {
+                    out = ros::data_key(std::stoi(f.at(1)), f.at(2), f.at(3), ros::hash_of(f.at(3)));
+                }
+                else if (op == "hashes")
+                {
+                    for (const auto& [type, hash] : ros::type_hashes())
+                    {
+                        out += (out.empty() ? "" : ";") + type + "=" + hash;
+                    }
+                }
+                else if (op == "buffer_fields")
+                {
+                    for (const auto& [type, buffer] : ros::buffer_fields())
+                    {
+                        out += (out.empty() ? "" : ";") + type + "=" + (buffer ? "1" : "0");
+                    }
+                }
+                else if (op == "attachment")
+                {
+                    ros::Gid gid{};
+                    const std::vector<std::uint8_t> g = unhex(f.at(3));
+                    std::copy(g.begin(), g.end(), gid.begin());
+                    out = hex(ros::encode_attachment(std::stoll(f.at(1)), std::stoll(f.at(2)), gid));
+                }
+                else if (op == "decode_attachment")
+                {
+                    const ros::Attachment a = ros::decode_attachment(unhex(f.at(1)));
+                    out = std::to_string(a.seq) + "\t" + std::to_string(a.source_ns) + "\t" +
+                          hex(std::vector<std::uint8_t>(a.gid.begin(), a.gid.end()));
+                }
+                else if (op == "gid")
+                {
+                    const ros::Gid gid = ros::gid(f.at(1));
+                    out = hex(std::vector<std::uint8_t>(gid.begin(), gid.end()));
+                }
+                else if (op == "token")
+                {
+                    out = ros::Token::parse(f.at(1)).key();
+                }
+                else if (op == "node_token")  // domain zid id ns node
+                {
+                    ros::Token t;
+                    t.domain = std::stoi(f.at(1));
+                    t.zid = f.at(2);
+                    t.node_id = t.entity_id = f.at(3);
+                    t.kind = std::string(ros::kNode);
+                    t.enclave = "/";
+                    t.ns = f.at(4);
+                    t.node = ros::check_node_name(f.at(5));
+                    out = t.key();
+                }
+                else if (op == "entity")  // domain zid node_id entity_id kind ns node name type reliability durability
+                {                         // history depth: its token key and its data key
+                    const ros::Options options{std::stoi(f.at(1)), "unused", false};
+                    ros::Ros part(f.at(2), options);
+                    const ros::NodeName node{f.at(7), f.at(6), f.at(3)};
+                    const ros::Qos qos{.reliability = std::stoi(f.at(10)), .durability = std::stoi(f.at(11)),
+                                       .history = std::stoi(f.at(12)), .depth = std::stoi(f.at(13))};
+                    const ros::Entity e(part, node, f.at(5), f.at(8), f.at(9), qos, f.at(4));
+                    out = e.token_key + "\t" + e.key;
+                }
+                else if (op == "qos")
+                {
+                    out = ros::Qos::parse(f.at(1)).key();
+                }
+                else if (op == "commanding")
+                {
+                    out = ros::commanding(f.at(1)) ? "1" : "0";
+                }
+                else if (op == "domain")  // the option's value, or empty: ROS_DOMAIN_ID
+                {
+                    out = std::to_string(ros::domain_from(
+                        f.at(1).empty() ? std::nullopt : std::optional<std::int64_t>(std::stoll(f.at(1)))));
+                }
+                else
+                {
+                    throw std::invalid_argument("--ros-wire: no case " + op);
+                }
+            }
+            catch (const ros::RosError&)
+            {
+                out = "ERROR";
+            }
+            std::cout << out << "\n";
+        }
+        std::cout << std::flush;
+        return 0;
+    }
+
+    // --tf-static CAMERA: the camera's fixed transforms (with --ros: ROS's /tf_static, CAMERA unused), one line per
+    // transform once they came, within --timeout
+    int probe_tf_static(zenoh::Session& session, const xblick::tools::Args& args)
+    {
+        using namespace xblick;
+        const auto timeout = std::chrono::duration<double>(std::stod(args.get("timeout", "10")));
+        StaticTransformSubscriber fixed(session, args.get("tf-static", ""),
+                                        std::chrono::duration_cast<std::chrono::milliseconds>(timeout), args.flag("ros"));
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline and fixed.received() == 0)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        const auto got = fixed.latest();
+        for (const TransformStamped& t : got ? got->transforms : std::vector<TransformStamped>{})
+        {
+            std::cout << "{\"parent\":" << quoted(t.header.frame_id) << ",\"child\":" << quoted(t.child_frame_id)
+                      << ",\"x\":" << t.transform.translation.x << "}" << std::endl;
+        }
+        return got ? 0 : 2;
+    }
+
     int probe_parameters(zenoh::Session& session, const xblick::tools::Args& args)
     {
         using namespace xblick;
@@ -136,13 +313,19 @@ int main(int argc, char** argv)
     tools::Args args(argc, argv);
     try
     {
+        if (args.flag("ros-wire"))
+        {
+            return ros_wire();
+        }
         zenoh::Session session = open_session({.connect = args.list("connect"), .listen = args.list("listen"),
                                                    .mode = args.get("zenoh-mode", "peer"), .program = "xblick-cpp-probe",
-                                                   .version = XBLICK_VERSION});
+                                                   .version = XBLICK_VERSION,
+                                                   .ros = tools::ros_options(args, "xblick-cpp-probe")});
         const std::string name = args.get("transport", "auto");
         const std::map<std::string, Transport> transports = {{"auto", Transport::Auto}, {"raw", Transport::Raw},
                                                              {"compressed", Transport::Compressed},
-                                                             {"shm", Transport::Shm}, {"cuda", Transport::Cuda}};
+                                                             {"shm", Transport::Shm}, {"cuda", Transport::Cuda},
+                                                             {"ros", Transport::Ros}};
         if (not transports.count(name))
         {
             throw std::invalid_argument("--transport " + name);
@@ -154,6 +337,10 @@ int main(int argc, char** argv)
         if (args.flag("params"))
         {
             return probe_parameters(session, args);
+        }
+        if (args.flag("tf-static"))
+        {
+            return probe_tf_static(session, args);
         }
         SubscriberOptions options;
         options.transport = transports.at(name);

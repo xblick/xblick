@@ -9,6 +9,10 @@
 // stream (the info record's relayed_from); with --origin-seq every frame goes out with Origin seq N, N+1, ... and source
 // "origin", frame_id "OriginCamera" (a relay's pass-through of the source's header and attachment).
 //
+// --tf: the fixed pose world -> TestCamera on <camera>/tf_static (translation 1 2 3) and TestCamera ->
+// TestCamera_moving (0 0 0.5) on <camera>/tf with every frame.
+// --ros, --ros-domain ID, --ros-node NAME, --ros-params-writable: take part in ROS 2 as well (ros.hpp).
+//
 // --diagnostics: also a DiagnosticArray (status "cpp_camera") on <camera>/diagnostics once a second, <camera> the base
 // without its last part.
 //
@@ -50,7 +54,8 @@ int main(int argc, char** argv)
     {
         zenoh::Session session = open_session({.connect = args.list("connect"), .listen = args.list("listen"),
                                                    .mode = args.get("zenoh-mode", "peer"), .program = "xblick-cpp-camera",
-                                                   .version = XBLICK_VERSION});
+                                                   .version = XBLICK_VERSION,
+                                                   .ros = tools::ros_options(args, "xblick-cpp-camera")});
         const std::string encoding = args.get("encoding", "rgb8");
         const auto size = args.list("size");
         const std::uint32_t width = size.size() == 2 ? std::stoul(size[0]) : 640;
@@ -182,6 +187,20 @@ int main(int argc, char** argv)
         {
             diagnostics.emplace(session, base.substr(0, base.rfind('/')));
         }
+        // --tf: the camera's fixed pose world -> TestCamera on <camera>/tf_static, and TestCamera -> TestCamera_moving
+        // on <camera>/tf with every frame (with --ros on ROS's /tf_static and /tf)
+        std::optional<StaticTransformPublisher> fixed;
+        std::optional<TransformPublisher> moving;
+        if (args.flag("tf"))
+        {
+            const std::string camera_key = base.substr(0, base.rfind('/'));
+            TransformStamped pose;
+            pose.header.frame_id = "world";
+            pose.child_frame_id = options.frame_id;
+            pose.transform.translation = Vector3{1.0, 2.0, 3.0};
+            fixed.emplace(session, camera_key, TFMessage{{pose}});
+            moving.emplace(session, camera_key);
+        }
         auto reported = std::chrono::steady_clock::now() - std::chrono::seconds(1);
         std::shared_ptr<DeviceBuffer> device;
         if (device_frames)
@@ -207,6 +226,17 @@ int main(int argc, char** argv)
                                     std::chrono::system_clock::now().time_since_epoch()).count();
                 diagnostics->publish({Header{Time::from_ns(ns), ""},
                                       {DiagnosticStatus{DiagnosticStatus::kOk, "cpp_camera", "publishing", "", {}}}});
+            }
+            if (moving)
+            {
+                TransformStamped t;
+                t.header = Header{Time::from_ns(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                    std::chrono::system_clock::now().time_since_epoch())
+                                                    .count()),
+                                  options.frame_id};
+                t.child_frame_id = options.frame_id + "_moving";
+                t.transform.translation = Vector3{0.0, 0.0, 0.5};
+                moving->publish(TFMessage{{t}});
             }
             if (camera.subscribed())
             {

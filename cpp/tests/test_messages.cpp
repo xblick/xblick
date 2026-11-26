@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <sys/resource.h>
 #include <string>
 #include <vector>
 
@@ -65,6 +66,58 @@ namespace
     const char* kTorqueStep = "000100000b0000006c6566745f656c626f770000000000000000f83f000000000000d03f";
     const char* kCreateController = "000100000500000061726d73000000000a000000496d706564616e63650000000b0000007b2261223a20312e357d00";
     const char* kConfigResponse = "0001000000000000080000006e6f2066696c65000100000000";
+    // The peak memory of this process in MB (getrusage).
+    long peak_mb()
+    {
+        rusage usage{};
+        ::getrusage(RUSAGE_SELF, &usage);
+        return usage.ru_maxrss / 1024;
+    }
+
+    // A list whose claimed count is forged: decoding refuses it (CdrError) and allocates no more than the payload
+    // holds (it was about 220 bytes per payload byte for a list of Parameters), for every list type a node decodes
+    // from the network: Parameters, strings, point fields, controllers.
+    void forged_counts()
+    {
+        using namespace xblick;
+        const auto refused = [](auto decode, const std::vector<std::uint8_t>& payload) {
+            try
+            {
+                decode(payload);
+                return false;
+            }
+            catch (const std::exception&)
+            {
+                return true;
+            }
+        };
+        const auto forged = [](std::uint32_t count, std::size_t zeros, std::vector<std::uint8_t> prefix = {}) {
+            std::vector<std::uint8_t> p = {0, 1, 0, 0};  // CDR, little endian
+            p.insert(p.end(), prefix.begin(), prefix.end());
+            for (int i = 0; i < 4; ++i)
+            {
+                p.push_back(static_cast<std::uint8_t>(count >> (8 * i)));
+            }
+            p.resize(p.size() + zeros, 0);
+            return p;
+        };
+        const long before = peak_mb();
+        constexpr std::size_t kZeros = 10 * 1000 * 1000;  // a 10 MB query
+        expect(refused([](const auto& b) { return ParametersRequest::deserialize(b); }, forged(kZeros, kZeros)),
+               "a set request claiming 10^7 parameters is refused");
+        expect(refused([](const auto& b) { return NamesRequest::deserialize(b); }, forged((kZeros - 8) / 4, kZeros)),
+               "a request claiming 2.5 * 10^6 names, with bytes left over, is refused");
+        expect(refused([](const auto& b) { return ListParametersRequest::deserialize(b); }, forged(kZeros / 4, kZeros)),
+               "a list request claiming 2.5 * 10^6 prefixes is refused");
+        // a PointCloud2 (header: stamp, frame_id "a"; height, width) claiming 2^32 - 1 fields
+        const std::vector<std::uint8_t> cloud_head = {0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 'a', 0, 0, 0,
+                                                      1, 0, 0, 0, 1, 0, 0, 0};
+        expect(refused([](const auto& b) { return PointCloud2::deserialize(b); }, forged(0xFFFFFFFFU, 64, cloud_head)),
+               "a cloud claiming 2^32 - 1 fields is refused");
+        const long grown = peak_mb() - before;
+        std::fprintf(stderr, "forged counts: peak memory grew by %ld MB\n", grown);
+        expect(grown < 300, "forged counts allocate about what the payload holds, not hundreds of times more");
+    }
 }  // namespace
 
 int main()
@@ -72,6 +125,7 @@ int main()
     using namespace xblick;
     try
     {
+        forged_counts();
         // ------------------------------------------------------------------ the same bytes as Python
         const std::uint8_t pixels[] = {1, 2, 3, 4, 5, 6};
         Image image;

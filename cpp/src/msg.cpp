@@ -252,9 +252,11 @@ namespace xblick
 
         std::vector<PointField> read_fields(CdrReader& r)
         {
-            std::vector<PointField> fields(r.u32());
-            for (PointField& f : fields)
+            // appended, not pre-sized: a forged count allocates only the fields the payload holds
+            std::vector<PointField> fields;
+            for (std::uint32_t i = 0, n = r.u32(); i < n; ++i)
             {
+                PointField& f = fields.emplace_back();
                 f.name = r.string();
                 f.offset = r.u32();
                 f.datatype = r.u8();
@@ -661,10 +663,10 @@ namespace xblick
 
         std::vector<std::string> read_strings(CdrReader& r)
         {
-            std::vector<std::string> v(r.count(4));
-            for (std::string& s : v)
+            std::vector<std::string> v;  // appended, not pre-sized (a forged count)
+            for (std::uint32_t i = 0, n = r.count(4); i < n; ++i)
             {
-                s = r.string();
+                v.push_back(r.string());
             }
             return v;
         }
@@ -720,9 +722,9 @@ namespace xblick
     {
         CdrReader r(payload);
         ListControllersResponse m;
-        m.controller.resize(r.count(1));
-        for (ControllerState& s : m.controller)
+        for (std::uint32_t i = 0, n = r.count(1); i < n; ++i)  // appended, not pre-sized (a forged count)
         {
+            ControllerState& s = m.controller.emplace_back();
             s.name = r.string();
             s.state = r.string();
             s.type = r.string();
@@ -735,9 +737,9 @@ namespace xblick
             s.is_chained = r.u8() != 0;
             s.exported_state_interfaces = read_strings(r);
             s.reference_interfaces = read_strings(r);
-            s.chain_connections.resize(r.count(1));
-            for (ChainConnection& c : s.chain_connections)
+            for (std::uint32_t j = 0, k = r.count(1); j < k; ++j)  // appended, not pre-sized
             {
+                ChainConnection& c = s.chain_connections.emplace_back();
                 c.name = r.string();
                 c.reference_interfaces = read_strings(r);
             }

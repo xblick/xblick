@@ -83,7 +83,7 @@ from pathlib import Path
 
 import zenoh
 
-from . import _core, declaration, topics
+from . import _core, declaration, ros, topics
 from .camera import (FIND_PERIOD, SENT_VERSION, CameraPublisher, ProtocolError, _attachment, _check_encoding,
                      congestion, find_streams, parse_attachment)
 from .codecs import parse_format
@@ -1372,6 +1372,7 @@ class Player(Paced):
         self._file = ""
         self._start_ns, self._end_ns = self._span()
         self._publishers: dict[str, zenoh.Publisher] = {}
+        self._ros: dict[str, ros.RosPublisher] = {}  # with --ros: the ROS publisher of a key (ros.mirror, /tf)
         self._cameras: dict[str, CameraPublisher] = {}  # recorded stream base -> its publisher
         self._queryables: list = []
         self._encodings: dict[str, str] = {}  # key -> its Zenoh encoding
@@ -1545,6 +1546,9 @@ class Player(Paced):
             if not key.endswith("/" + topics.CAMERA_INFO):  # those go with their stream's frames
                 self._publishers[key] = self.session.declare_publisher(out, encoding=zenoh.Encoding(encoding),
                                                                        congestion_control=self._congestion)
+                mirrored = self._ros_publisher(out, encoding)
+                if mirrored is not None:
+                    self._ros[key] = mirrored
             if info is None:
                 continue
             record = dict(json.loads(info), host=self._host, cuda_device_uuid=None)
@@ -1572,6 +1576,21 @@ class Player(Paced):
             if key[: -len(topics.CAMERA_INFO) - 1] not in self._cameras:  # camera_info of a stream not played
                 self._publishers[key] = self.session.declare_publisher(
                     self._out(key), encoding=zenoh.Encoding(self._encodings[key]), congestion_control=self._congestion)
+
+    def _ros_publisher(self, out: str, encoding: str):
+        """With --ros: ROS's publisher of a played key: a camera's, robot's or world's tf on /tf, a camera's tf_static
+        on /tf_static, every other key on its own topic (ros.mirror). A command key (ros.commanding, e.g. a simulated
+        robot's command/joints and command/tf) is never offered: None."""
+        if getattr(self.session, "ros", None) is None:
+            return None
+        if ros.commanding(out):
+            return ros.mirror(self.session, out, encoding)  # says it is not offered; None
+        parts = out.split("/")
+        if parts[-1] == topics.TF_STATIC:
+            return ros.mirror_tf(self.session, static=True, key=out)
+        if parts[-1] == topics.TF:
+            return ros.mirror_tf(self.session, key=out)
+        return ros.mirror(self.session, out, encoding)
 
     def _answer_static(self, key: str, query: zenoh.Query):
         if key in self._static:
@@ -1607,6 +1626,9 @@ class Player(Paced):
             payload = moved
         seq = self._seq[key] = self._seq.get(key, 0) + 1
         self._publishers[key].put(payload, attachment=_attachment(seq, "play"))
+        mirrored = self._ros.get(key)
+        if mirrored is not None and (mirrored.matched or key.endswith(topics.TF_STATIC)):  # tf_static: for its cache
+            mirrored.put(payload)
         if key.endswith(topics.TF_STATIC):
             self._static[key] = payload
 
@@ -1680,5 +1702,7 @@ class Player(Paced):
             closable.undeclare()
         for publisher in self._publishers.values():
             publisher.undeclare()
+        for publisher in self._ros.values():
+            publisher.close()
         for camera in self._cameras.values():
             camera.close()

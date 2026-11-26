@@ -20,7 +20,13 @@ Keys (protocol.hpp), the node's key ``<namespace>/<name>`` (its fully qualified 
   ``node`` the node's fully qualified name), after each change and at each declaration;
 * the liveliness token ``<node>/parameters`` while it offers them (``find_nodes``).
 
-A ROS mode maps these keys to rmw_zenoh's; the data are ROS 2's and stay as they are.
+With a session that takes part in ROS 2 (``--ros``, ros.py) the node is a ROS node as well, ``/<namespace>/<name>``:
+the same six services on rmw_zenoh's keys (``/<namespace>/<name>/get_parameters``, ...) and its events on ROS's
+``/parameter_events``, so that ``ros2 param`` works on it. By default its ROS services answer reads only and refuse
+sets. With ``--ros-params-writable`` a ROS client may set them: such a set is unchecked and uncounted (no node check,
+no deadline; two nodes of one name both execute it, and the ROS client shows one success; docs/integrations/ros2.md).
+Our own callers keep using our keys with the check. ``ParameterClient(..., ros=True)`` reads and sets a ROS node's
+parameters through ROS's keys.
 """
 
 from __future__ import annotations
@@ -37,7 +43,7 @@ from pathlib import Path
 
 import zenoh
 
-from . import _core, topics
+from . import _core, ros, topics
 from .camera import cdr_encoding
 from .msg import (DescribeParametersRequest, DescribeParametersResponse, FloatingPointRange, GetParametersRequest,
                   GetParametersResponse, GetParameterTypesRequest, GetParameterTypesResponse, IntegerRange,
@@ -45,7 +51,8 @@ from .msg import (DescribeParametersRequest, DescribeParametersResponse, Floatin
                   ParameterType, ParameterValue, SetParametersAtomicallyRequest, SetParametersAtomicallyResponse,
                   SetParametersRequest, SetParametersResponse, SetParametersResult, Time)
 from .paths import expand_path
-from .session import (ASK_PERIOD, CommandQuery, CommandRefused, answer_attachment, ask, checked, command, log,
+from .ros import check_ros_name
+from .session import (ASK_PERIOD, CommandQuery, CommandRefused, answer_attachment, ask, checked, command, count, log,
                       node_id, one_node, refuse, replies, timed_out)
 
 P = _core.protocol
@@ -55,9 +62,22 @@ SERVICES = {P.LIST_PARAMETERS: (ListParametersRequest, ListParametersResponse),
             P.GET_PARAMETER_TYPES: (GetParameterTypesRequest, GetParameterTypesResponse),
             P.SET_PARAMETERS: (SetParametersRequest, SetParametersResponse),
             P.SET_PARAMETERS_ATOMICALLY: (SetParametersAtomicallyRequest, SetParametersAtomicallyResponse)}
+# the ROS 2 service type of each (rcl_interfaces), for its rmw_zenoh key and token
+ROS_SERVICES = {P.LIST_PARAMETERS: "rcl_interfaces/srv/ListParameters",
+                P.DESCRIBE_PARAMETERS: "rcl_interfaces/srv/DescribeParameters",
+                P.GET_PARAMETERS: "rcl_interfaces/srv/GetParameters",
+                P.GET_PARAMETER_TYPES: "rcl_interfaces/srv/GetParameterTypes",
+                P.SET_PARAMETERS: "rcl_interfaces/srv/SetParameters",
+                P.SET_PARAMETERS_ATOMICALLY: "rcl_interfaces/srv/SetParametersAtomically"}
+SETS = (P.SET_PARAMETERS, P.SET_PARAMETERS_ATOMICALLY)  # the services that change something: commands
 READ_ONLY_ACCESS = "parameters are read only on this node (--params-read-only)"
 RESTART = "read-only: applies at the next start"
 SERVE_PERIOD_S = 0.01  # how often the services look for queries: a parameter call waits at most this much longer
+# ROS calls answered per ROS service and round (_serve): a ROS client that floods a node does not hold up our own
+# (checked) calls, which are all answered every round
+ROS_CALLS_PER_ROUND = 4
+ROS_SETS_OFF = ("sets through ROS 2 are off on this node: its ROS parameter services answer reads only (start it with "
+                "--ros-params-writable to allow them)")
 _CLOSED = object()  # Parameters._next: a queryable's channel closed with its session
 # options declare_options leaves out: argparse's, the parameters' own, the Zenoh connection's (session.add_arguments)
 OWN_OPTIONS = {"help", "param", "params_file", "dump_params", "params_read_only", "connect", "listen", "zenoh_mode",
@@ -164,7 +184,8 @@ class _Declared:
 
 class Parameters:
     """The parameters of one node ``<namespace>/<name>`` (module docstring), answering ROS 2's parameter services.
-    ``session`` None: no services (a node's own use, tests)."""
+    ``session`` None: no services (a node's own use, tests). A session with ``--ros``: the services on ROS's keys too,
+    as the ROS node ``/<namespace>/<name>`` (module docstring)."""
 
     def __init__(self, session: zenoh.Session | None, name: str, namespace: str = "", read_only_access: bool = False):
         self.key = node_key(namespace, name)
@@ -175,6 +196,8 @@ class Parameters:
         self._dump: Path | None = None
         self._lock = threading.RLock()
         self._events = self._queryables = self._token = self._server = None
+        self._ros_node = self._ros_events = None
+        self._ros_services: list[tuple[str, ros.RosService]] = []
         self._stop = threading.Event()
         self._zid = node_id(session) if session is not None else ""  # names this node in its replies (commands)
         if session is not None:
@@ -183,6 +206,15 @@ class Parameters:
             # own thread, which is no daemon, and a node that ends with an exception before close() (an interrupt
             # while its model loads) would then wait for it for good
             self._queryables = [(service, session.declare_queryable(f"{self.key}/{service}")) for service in SERVICES]
+            taking_part = getattr(session, "ros", None)
+            if taking_part is not None:  # the ROS node of this name: its services, its events on /parameter_events
+                namespace, name_part = ros.split_node(self.name)
+                self._ros_node = taking_part.add_node(name_part, namespace)
+                self._ros_services = [
+                    (service, self._ros_node.service(f"{self.name}/{service}", ROS_SERVICES[service]))
+                    for service in SERVICES]
+                self._ros_events = self._ros_node.publisher("/parameter_events", ParameterEvent.TYPE,
+                                                            ros.PARAMETERS_QOS)
             self._server = threading.Thread(target=self._serve, name=f"parameters {self.key}", daemon=True)
             self._server.start()
             self._token = session.liveliness().declare_token(f"{self.key}/{P.PARAMETERS_TOKEN}")
@@ -463,8 +495,11 @@ class Parameters:
 
     def _publish_event(self, new=(), changed=()):
         if self._events is not None:
-            self._events.put(bytes(ParameterEvent(Time.from_ns(time.time_ns()), self.name, list(new),
-                                                  list(changed)).serialize()))
+            event = ParameterEvent(Time.from_ns(time.time_ns()), self.name, list(new), list(changed))
+            payload = bytes(event.serialize())
+            self._events.put(payload)
+            if self._ros_events is not None and self._ros_events.matched:
+                self._ros_events.put(payload)
 
     # ---------------------------------------------------------------------------------------------- the services
 
@@ -477,7 +512,27 @@ class Parameters:
                     if query is _CLOSED:
                         return
                     self._answer(service, query)
+            for service, server in self._ros_services:
+                for _ in range(ROS_CALLS_PER_ROUND):  # at most so many: our own calls come first each round
+                    query = self._next_ros(server)
+                    if query is None:
+                        break
+                    self._answer_ros(service, server, query)
             self._stop.wait(period)
+
+    @staticmethod
+    def _next_ros(server: ros.RosService):
+        """A ROS service's next query; None when there is none now, also when the service or its channel closed (its
+        ROS node closed before the session: Session.close does so; Zenoh then says "Undeclared queryable" or
+        "closed"). Our own services go on; the session's end ends them."""
+        if server.closed:
+            return None
+        try:
+            return server.try_recv()
+        except (zenoh.ZError, AttributeError) as error:  # AttributeError: closed between the check and the call
+            if isinstance(error, AttributeError) or "closed" in str(error) or "Undeclared" in str(error):
+                return None
+            raise
 
     @staticmethod
     def _next(queryable):
@@ -514,6 +569,46 @@ class Parameters:
             return
         query.reply(query.key_expr, bytes(response.serialize()), encoding=cdr_encoding(type(response)),
                     attachment=answer_attachment(self._zid, received.checked if received is not None else ()))
+
+    def _answer_ros(self, service: str, server: ros.RosService, query: zenoh.Query):
+        """A ROS client's call on ROS's key, whatever it holds (no input ends the server thread). It carries ROS's
+        attachment (sequence number, client gid), no node and no deadline. A set is refused, every parameter with
+        ROS_SETS_OFF, unless the session was started with ``--ros-params-writable``. Then it is executed without a
+        node check and without a deadline (``gate`` None), and uncounted: every node of the name gets it from a ROS
+        client and executes it. Read-only access and each parameter's checks apply as always. A set whose writer
+        blocks holds the parameters' lock, for our own calls too, as any set does. The reply carries the request's
+        sequence number and client gid, as rmw_zenoh's. Replied to and dropped at once (``query`` goes out of scope
+        here)."""
+        request_type, _ = SERVICES[service]
+        try:
+            try:
+                request_id = server.request_of(query)
+            except ros.RosError as error:  # not a ROS client's: refused, nothing done
+                query.reply_err(f"{self.name}/{service}: {error}")
+                return
+            try:
+                payload = query.payload
+                request = request_type.deserialize(payload.to_bytes()) if payload is not None else request_type()
+                if service in SETS and not self._ros_node.ros.params_writable:
+                    response = self._ros_sets_off(service, request)
+                else:
+                    response = self._respond(service, request)
+                if service == P.DESCRIBE_PARAMETERS and not self._ros_node.ros.params_writable:
+                    for descriptor in response.descriptors:  # a ROS tool shows no field editable that refuses every set
+                        descriptor.read_only = True
+            except Exception as error:  # noqa: BLE001 - the asker gets the reason
+                query.reply_err(f"{self.name}/{service}: {type(error).__name__}: {error}")
+                return
+            server.reply(query, response.serialize(), request_id)
+        except Exception as error:  # noqa: BLE001 - a reply that cannot go out (the session closing): said, not raised
+            log.warning(f"{self.name}/{service}: a ROS call not answered: {type(error).__name__}: {error}")
+
+    @staticmethod
+    def _ros_sets_off(service: str, request):
+        """The answer to a ROS client's set while sets through ROS are off: refused, nothing changed."""
+        if service == P.SET_PARAMETERS:
+            return SetParametersResponse([SetParametersResult(False, ROS_SETS_OFF) for _ in request.parameters])
+        return SetParametersAtomicallyResponse(SetParametersResult(False, ROS_SETS_OFF))
 
     def respond(self, service: str, request):
         """What the service answers to the request (the queryables' work)."""
@@ -554,6 +649,9 @@ class Parameters:
             for _, q in self._queryables:
                 q.undeclare()
             self._events.undeclare()
+            if self._ros_node is not None:
+                self._ros_node.close()  # its services, its events publisher and its token
+                self._ros_node = None
             self._token = None
 
 
@@ -589,15 +687,28 @@ class ParameterClient:
     when that node takes part (its answer names it, session.one_node): NotReached (a TimeoutError, nothing sent),
     Expired (refused by the node, past its deadline: not applied), NoAnswer (no TimeoutError: sent once, no answer;
     not sent again). ``last_checked``: the node of the last set said that it checked node and deadline before
-    applying it (session.checked)."""
+    applying it (session.checked).
 
-    def __init__(self, session: zenoh.Session, key: str, timeout: float = 2.0):
+    ``ros`` (a session with ``--ros``): the ROS node ``/<key>``'s parameters through ROS 2's keys (any ROS node's, or
+    a Durchblick node's with ``--ros``). Reads as above. A set: not sent unless exactly one node answered a
+    list_parameters read first, then sent once, without node or deadline (ROS has neither: the receiver cannot
+    refuse a late set, ``last_checked`` stays False); NotReached, NoAnswer, PartlyAnswered and SeveralExecuted as
+    above. ``on_event``: ROS's ``/parameter_events``."""
+
+    def __init__(self, session: zenoh.Session, key: str, timeout: float = 2.0, ros: bool = False):
         self.key = topics.check_name(key.strip("/"))
         self.name = fully_qualified(self.key)
         self.timeout = timeout
         self.last_checked = False
         self._session = session
         self._subscribers = []
+        self._ros_clients: dict[str, ros.RosClient] | None = None
+        if ros:
+            if getattr(session, "ros", None) is None:
+                raise ValueError(f"{self.name}: a ROS node's parameters need a session with --ros")
+            check_ros_name(self.name, "node")
+            self._ros_clients = {service: session.ros.node.client(f"{self.name}/{service}", ROS_SERVICES[service])
+                                 for service in SERVICES}
 
     def _call(self, service: str, request):
         """One service call: a read (list, describe, get, types) asked again while nothing answers (session.ask);
@@ -607,6 +718,8 @@ class ParameterClient:
         NotReached, Expired, NoAnswer, PartlyAnswered: as session.command. Ordinary reads keep the one answer that came
         and ignore a "Timeout" reply, which says that another node had not finished the read: a read changes
         nothing."""
+        if self._ros_clients is not None:
+            return self._call_ros(service, request)
         _, response_type = SERVICES[service]
         key = f"{self.key}/{service}"
         if service in (P.SET_PARAMETERS, P.SET_PARAMETERS_ATOMICALLY):
@@ -631,6 +744,49 @@ class ParameterClient:
             raise TimeoutError(f"no answer from {key} within {self.timeout:g} s")
         if len(ok) > 1:
             raise RuntimeError(f"{len(ok)} nodes answer {key}: one name, one node")
+        return response_type.deserialize(ok[0].payload.to_bytes())
+
+    def _read_ros(self, service: str, request) -> list:
+        """A read of a ROS node's service: one request (its own sequence number) after the other until a reply came
+        or the timeout passed (as session.ask)."""
+        client = self._ros_clients[service]
+        end = time.monotonic() + self.timeout
+        while True:
+            answers = replies(self._session, client.key, max(end - time.monotonic(), 0.01),
+                              **client.request_options(request.serialize()))
+            if answers or time.monotonic() >= end:
+                return answers
+            time.sleep(min(ASK_PERIOD, max(0.0, end - time.monotonic())))
+
+    def _call_ros(self, service: str, request):
+        """``_call`` on ROS's keys. A set (a command) only after a list_parameters read had exactly one answer and no
+        "Timeout" reply (session.count, best effort), then sent once (session.command without a target: ROS's
+        services take no node or deadline). Replies of a ROS service carry no answer attachment of ours, so nothing is
+        checked. session.command waits for the key's queryable with Zenoh's default target, while the set goes with
+        ALL_COMPLETE: a non-complete queryable on the key (a storage on ``**``) can then make it a NoAnswer although
+        no ROS service got it (on the safe side: "may have run")."""
+        _, response_type = SERVICES[service]
+        client = self._ros_clients[service]
+        if service in SETS:
+            self.last_checked = False
+            lister = self._ros_clients[P.LIST_PARAMETERS]
+            try:
+                count(self._read_ros(P.LIST_PARAMETERS, ListParametersRequest([], 0)), lister.topic)
+            except RuntimeError as error:
+                raise RuntimeError(f"{error} (the set to {client.topic})") from None
+            except TimeoutError as error:
+                raise TimeoutError(f"{error} (the set to {client.topic})") from None
+            ok = command(self._session, client.key, self.timeout, None, **client.request_options(request.serialize()))
+            return response_type.deserialize(ok[0].payload.to_bytes())
+        answers = self._read_ros(service, request)
+        errors = [reply.err.payload.to_string() for reply in answers if reply.err is not None and not timed_out(reply)]
+        if errors:
+            raise RuntimeError(errors[0])
+        ok = [reply.ok for reply in answers if reply.ok is not None]
+        if not ok:
+            raise TimeoutError(f"no answer from {client.topic} within {self.timeout:g} s")
+        if len(ok) > 1:
+            raise RuntimeError(f"{len(ok)} nodes answer {client.topic}: one name, one node")
         return response_type.deserialize(ok[0].payload.to_bytes())
 
     def list(self, prefixes=(), depth: int = 0) -> list[str]:
@@ -660,16 +816,26 @@ class ParameterClient:
     def on_event(self, callback: Callable[[ParameterEvent], None]):
         """``callback(event)`` for each of its ParameterEvents (of this node only), in Zenoh's thread."""
         def receive(sample: zenoh.Sample):
-            event = ParameterEvent.deserialize(sample.payload.to_bytes())
+            take(sample.payload.to_bytes())
+
+        def take(payload: bytes, *_):
+            event = ParameterEvent.deserialize(payload)
             if event.node == self.name:
                 callback(event)
 
-        self._subscribers.append(self._session.declare_subscriber(P.PARAMETER_EVENTS, receive))
+        if self._ros_clients is not None:
+            self._subscribers.append(self._session.ros.node.subscriber("/parameter_events", ParameterEvent.TYPE, take,
+                                                                       ros.PARAMETERS_QOS))
+        else:
+            self._subscribers.append(self._session.declare_subscriber(P.PARAMETER_EVENTS, receive))
 
     def close(self):
         for s in self._subscribers:
-            s.undeclare()
+            s.close() if isinstance(s, ros.RosSubscriber) else s.undeclare()
         self._subscribers = []
+        for client in (self._ros_clients or {}).values():
+            client.close()
+        self._ros_clients = None if self._ros_clients is None else {}
 
 
 def _parameters(values: dict) -> list[Parameter]:

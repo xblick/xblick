@@ -33,6 +33,7 @@
 
 #include "xblick/camera.hpp"
 #include "xblick/parameters.hpp"
+#include "xblick/ros.hpp"
 
 namespace xblick
 {
@@ -62,7 +63,10 @@ namespace xblick
         // An option without a default (integer, double or string): not set until given.
         Options& add_optional(const std::string& name, std::uint8_t type, OptionSpec spec = {});
         // --connect ENDPOINT..., --listen ENDPOINT..., --zenoh-mode peer|client, --zenoh-config FILE: the Zenoh
-        // session's (session_options); not parameters.
+        // session's (session_options); not parameters. And --ros, --ros-domain ID, --ros-node NAME,
+        // --ros-params-writable: the session's part in ROS 2 (ros.hpp, SessionOptions::ros), read-only parameters as
+        // in Python; parse refuses --ros-domain, --ros-node or --ros-params-writable without --ros, a domain that is no
+        // integer from 0 and a node name ROS does not take.
         Options& add_session_options();
         // --param NAME:=VALUE (repeated), --params-file FILE (repeated), --dump-params FILE, --params-read-only
         // (parameter_startup); not parameters.
@@ -98,6 +102,8 @@ namespace xblick
         ParameterValue value(const std::string& name) const;
 
         SessionOptions session_options() const;
+        // --ros and the others (add_session_options): none without --ros; the node name defaults to the program's
+        std::optional<ros::Options> ros_options() const;
         ParameterStartup parameter_startup() const;
         std::string help() const;
         std::string usage() const;
@@ -132,6 +138,7 @@ namespace xblick
         std::string program_, summary_, version_;
         std::vector<Option> options_;
         std::map<std::string, std::size_t> by_name_;  // names and aliases -> index
+        bool session_options_ = false;  // add_session_options was called
     };
 
     class OptionsError : public std::runtime_error

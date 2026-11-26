@@ -64,7 +64,8 @@ int main(int argc, char** argv)
         }
         zenoh::Session session = open_session({.connect = args.list("connect"), .listen = args.list("listen"),
                                                    .mode = args.get("zenoh-mode", "peer"), .program = "xblick-points",
-                                                   .version = XBLICK_VERSION});
+                                                   .version = XBLICK_VERSION,
+                                                   .ros = tools::ros_options(args, "xblick-points")});
         PointCloudNode node(session, options);
         std::cerr << "xblick-points: " << options.depth << (options.color.empty() ? "" : " + " + options.color)
                   << " -> " << node.output() << " on CUDA device " << options.cuda_device << ", "

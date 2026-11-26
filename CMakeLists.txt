@@ -63,13 +63,14 @@ find_package(Threads REQUIRED)
 # ------------------------------------------------------------------------------------------------ core
 
 add_library(xblick_core cpp/src/ring.cpp cpp/src/cuda_ring.cpp cpp/src/rvl.cpp cpp/src/ray_cloud.cpp
-            cpp/src/rectify.cpp cpp/src/pairing.cpp cpp/src/paths.cpp cpp/src/command.cpp)
+            cpp/src/rectify.cpp cpp/src/pairing.cpp cpp/src/paths.cpp cpp/src/command.cpp
+            cpp/src/ros_gid.cpp)
 add_library(xblick::core ALIAS xblick_core)
 set_target_properties(xblick_core PROPERTIES EXPORT_NAME core)
 target_include_directories(xblick_core
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/cpp/include>
          $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include> $<INSTALL_INTERFACE:include>
-  PRIVATE ${XBLICK_CUDA_INCLUDE_DIR})
+  PRIVATE ${XBLICK_CUDA_INCLUDE_DIR} cpp/third_party/xxhash)
 target_link_libraries(xblick_core PUBLIC ${CMAKE_DL_LIBS} Threads::Threads rt)
 target_compile_options(xblick_core PRIVATE -Wall -Wextra)
 
@@ -82,7 +83,7 @@ if(XBLICK_CAMERA)
   find_package(PNG REQUIRED)
   add_library(xblick_camera cpp/src/msg.cpp cpp/src/camera_info_file.cpp cpp/src/image.cpp cpp/src/stream.cpp
               cpp/src/camera.cpp cpp/src/declaration.cpp cpp/src/points.cpp cpp/src/parameters.cpp
-              cpp/src/options.cpp)
+              cpp/src/options.cpp cpp/src/ros.cpp)
   add_library(xblick::xblick ALIAS xblick_camera)
   set_target_properties(xblick_camera PROPERTIES EXPORT_NAME xblick OUTPUT_NAME xblick)
   target_link_libraries(xblick_camera PUBLIC xblick_core zenohcxx::zenohc PRIVATE JPEG::JPEG PNG::PNG)
@@ -145,6 +146,9 @@ if(BUILD_TESTING)
   add_executable(test_paths cpp/tests/test_paths.cpp)
   target_link_libraries(test_paths PRIVATE xblick_core)
   add_test(NAME paths COMMAND test_paths)
+  add_executable(test_ros_gid cpp/tests/test_ros_gid.cpp)
+  target_link_libraries(test_ros_gid PRIVATE xblick_core)
+  add_test(NAME ros_gid COMMAND test_ros_gid)
   add_test(NAME cuda_ring COMMAND test_rings cuda)
   set_tests_properties(cuda_ring PROPERTIES SKIP_RETURN_CODE 77)  # no GPU: skipped, not failed
   if(XBLICK_CAMERA)
@@ -167,6 +171,9 @@ if(BUILD_TESTING)
     target_link_libraries(test_latest PRIVATE xblick_camera)
     target_include_directories(test_latest PRIVATE cpp/src)  # detail::Latest, an internal of the library
     add_test(NAME latest COMMAND test_latest)
+    add_executable(test_ros cpp/tests/test_ros.cpp)
+    target_link_libraries(test_ros PRIVATE xblick_camera)
+    add_test(NAME ros COMMAND test_ros)
   endif()
 endif()
 
