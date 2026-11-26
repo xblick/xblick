@@ -612,6 +612,7 @@ class _Polled:
 # ------------------------------------------------------------------------------------ ROS cameras as ROS names them
 
 COMPRESSED = "compressed"  # image_transport's compressed transport: the topic <image topic>/compressed
+COMPRESSED_DEPTH = "compressedDepth"  # image_transport's compressedDepth transport: <image topic>/compressedDepth
 CAMERA_INFO = "camera_info"  # image_transport's camera_info: the topic camera_info beside the image topic
 IMAGE_TYPE, COMPRESSED_TYPE = "sensor_msgs/msg/Image", "sensor_msgs/msg/CompressedImage"
 CLOUD_TYPE, CAMERA_INFO_TYPE = "sensor_msgs/msg/PointCloud2", "sensor_msgs/msg/CameraInfo"
@@ -627,6 +628,11 @@ def is_topic(name: str) -> bool:
 def compressed_topic(image_topic: str) -> str:
     """image_transport's compressed topic of an image topic: ``/cam/image_raw`` -> ``/cam/image_raw/compressed``."""
     return f"{image_topic}/{COMPRESSED}"
+
+
+def compressed_depth_topic(image_topic: str) -> str:
+    """image_transport's compressedDepth topic of an image topic: ``/cam/depth`` -> ``/cam/depth/compressedDepth``."""
+    return f"{image_topic}/{COMPRESSED_DEPTH}"
 
 
 def camera_info_topic(image_topic: str) -> str:
@@ -659,32 +665,77 @@ def publishers(session, timeout: float = 1.0, topic: str | None = None) -> list[
 class Graph:
     """The publishers in ROS's graph on a session's domain, as a liveliness subscriber with history keeps their tokens
     (made at its first use, ``Ros.graph``, closed with the session's part in ROS). ``listen(callback)``: called in its
-    thread when a publisher came or went. ``by_xblick(zid)``: whether a publisher's session is a program of ours (its
-    declaration, declaration.py), asked once per session: the ROS topics such a program publishes are the copies of
-    its own keys."""
+    thread when a publisher came or went, or a program of ours appeared. ``by_xblick(zid)``: whether a publisher's
+    session is a program of ours: the ROS topics such a program publishes are the copies of its own keys.
+
+    Which sessions are ours comes from a second liveliness subscriber with history, of every program's declaration
+    token (declaration.py), not from a query per session: such a query, ended by its timeout under load, said "not
+    ours" of a program of ours for good. A program declares itself before it takes part in ROS (session.open_session),
+    and its tokens reach this session one after the other on the same way, so its declaration arrives before its ROS
+    tokens. One thread reads both subscribers: each round it takes the publishers' samples first and the declarations'
+    after, and applies the declarations first, so that a publisher it looks at has its program's declaration known.
+    A zid once declared stays ours (a session's zid is its own for its life): the tokens of a program that ends go in
+    no fixed order. A declaration that arrives tells the listeners as a publisher does, so that a choice made before
+    it (a program whose ROS tokens came another way first) is made again."""
 
     def __init__(self, ros_: Ros):
+        from . import declaration
         self._ros = ros_
         self._lock = threading.Lock()
         self._tokens: dict[str, Token] = {}
         self._listeners: list[Callable] = []
-        self._xblick: dict[str, bool] = {}
-        self._subscriber = _Polled(_raw(ros_.session).liveliness().declare_subscriber(
-            publisher_pattern(ros_.domain), history=True), self._seen, f"ros graph {ros_.domain}")
+        self._xblick: set[str] = set()  # the zids that declared a program of ours
+        raw = _raw(ros_.session)
+        self._declarations = raw.liveliness().declare_subscriber(declaration.ALL, history=True)
+        self._publishers = raw.liveliness().declare_subscriber(publisher_pattern(ros_.domain), history=True)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name=f"ros graph {ros_.domain}", daemon=True)
+        self._thread.start()
 
-    def _seen(self, sample):
-        key = str(sample.key_expr)
-        with self._lock:
-            if sample.kind == zenoh.SampleKind.PUT:
-                try:
-                    self._tokens[key] = parse_token(key)
-                except RosError:
-                    return
-            elif self._tokens.pop(key, None) is None:
+    @staticmethod
+    def _drain(subscriber) -> list:
+        samples = []
+        while (sample := subscriber.try_recv()) is not None:
+            samples.append(sample)
+        return samples
+
+    def _run(self):
+        """The thread (polled as _Polled's): the publishers' samples taken, then the declarations'; the declarations
+        applied first."""
+        from . import declaration
+        while not self._stop.is_set():
+            try:
+                tokens = self._drain(self._publishers)
+                declared = self._drain(self._declarations)
+            except zenoh.ZError:  # closed with its session
                 return
-            listeners = list(self._listeners)
-        for callback in listeners:
-            callback()
+            changed = False
+            with self._lock:
+                for sample in declared:
+                    zid = declaration.zid_of(str(sample.key_expr))
+                    if sample.kind == zenoh.SampleKind.PUT and zid is not None and zid not in self._xblick:
+                        self._xblick.add(zid)
+                        changed = True
+                for sample in tokens:
+                    changed = self._seen(sample) or changed
+                listeners = list(self._listeners) if changed else []
+            for callback in listeners:
+                try:
+                    callback()
+                except Exception:  # a listener's error must not end the graph
+                    log.exception("a listener of ROS's graph failed")
+            self._stop.wait(POLL_PERIOD_S)
+
+    def _seen(self, sample) -> bool:
+        """A publisher's token came or went (called with the lock); True when that changed what is known."""
+        key = str(sample.key_expr)
+        if sample.kind == zenoh.SampleKind.PUT:
+            try:
+                self._tokens[key] = parse_token(key)
+            except RosError:
+                return False
+            return True
+        return self._tokens.pop(key, None) is not None
 
     def listen(self, callback: Callable):
         with self._lock:
@@ -701,25 +752,58 @@ class Graph:
             return [t for t in self._tokens.values() if (topic is None or t.topic == topic) and t.zid != self._ros.zid]
 
     def by_xblick(self, zid: str) -> bool:
-        """True when the session ``zid`` declares a program of ours (its declaration's token; a liveliness query, kept
-        per session). A program declares itself before it takes part in ROS (session.open_session), so its declaration
-        is known wherever its ROS tokens are."""
+        """True when the session ``zid`` declared a program of ours (its declaration's token came; the class's
+        docstring says why that is known before its ROS tokens are)."""
         with self._lock:
-            known = self._xblick.get(zid)
-        if known is not None:
-            return known
-        from . import declaration
-        from .session import replies
-        found = any(r.ok is not None for r in replies(_raw(self._ros.session), declaration.key(zid), 1.0,
-                                                       liveliness=True))
-        with self._lock:
-            self._xblick[zid] = found
-        return found
+            return zid in self._xblick
 
     def close(self):
-        self._subscriber.undeclare()
+        self._stop.set()
+        if self._thread is not threading.current_thread():
+            self._thread.join(timeout=2.0)
+        self._publishers.undeclare()
+        self._declarations.undeclare()
         with self._lock:
             self._listeners = []
+
+
+def _below(topic: str, prefix: str) -> bool:
+    """``topic`` is ``/<prefix>`` or below it (every topic for an empty prefix)."""
+    below = "/" + prefix.strip("/") if prefix.strip("/") else ""
+    return not below or topic == below or topic.startswith(below + "/")
+
+
+def camera_topics(graph: Graph, prefix: str = "") -> list[tuple[str, str, list[str]]]:
+    """(topic, its types' names, its publishers' nodes) of the ROS topics of image, compressed image, point cloud and
+    camera info types (CAMERA_TYPES) below ``prefix``, sorted, as ``graph`` knows them now. Only ROS's own publishers:
+    the ROS copies of the streams our programs publish (Graph.by_xblick) are the streams of ours."""
+    found: dict[str, tuple[set, set]] = {}
+    for token in graph.publishers():
+        if token.type_name not in CAMERA_TYPES or graph.by_xblick(token.zid) or not _below(token.topic, prefix):
+            continue
+        kinds, nodes = found.setdefault(token.topic, (set(), set()))
+        kinds.add(token.type_name.rpartition("/")[2])
+        nodes.add(token.fully_qualified_node)
+    return [(t, ",".join(sorted(k)), sorted(n)) for t, (k, n) in sorted(found.items())]
+
+
+def camera_streams(graph: Graph, prefix: str = "") -> dict[str, list[str]]:
+    """The cameras that exist only as ROS topics (``camera_topics``), named as their subscribers take them:
+    ``images``, the image topics (an Image topic ``T``; ``T`` too where only image_transport's ``T/compressed`` or
+    ``T/compressedDepth`` is published, which ``auto`` then reads), and ``clouds``, the PointCloud2 topics; each sorted.
+    A CompressedImage topic of another name is none of them (no subscriber of ours reads it)."""
+    images, clouds = set(), set()
+    for topic, kinds, _ in camera_topics(graph, prefix):
+        kinds = kinds.split(",")
+        if IMAGE_TYPE.rpartition("/")[2] in kinds:
+            images.add(topic)
+        if CLOUD_TYPE.rpartition("/")[2] in kinds:
+            clouds.add(topic)
+        if COMPRESSED_TYPE.rpartition("/")[2] in kinds:
+            base, _, last = topic.rpartition("/")
+            if last in (COMPRESSED, COMPRESSED_DEPTH) and base:
+                images.add(base)
+    return {"images": sorted(images), "clouds": sorted(clouds)}
 
 
 CLOCK_TOPIC = "/clock"  # ROS's global clock, which a node with use_sim_time reads

@@ -642,11 +642,14 @@ ROS = "ros"  # a transport: a ROS 2 topic (a ROS name, or ours: /<base>/image_ra
 # the transport of image_transport's compressed topic (<image topic>/compressed) of a ROS name, or the one auto takes
 # when a ROS publisher offers only that
 ROS_COMPRESSED = "ros_compressed"
-ROS_FORMS = (ROS, ROS_COMPRESSED)
+# the transport of image_transport's compressedDepth topic (<image topic>/compressedDepth, ROS's compressedDepth plugin:
+# 16-bit or 32FC1 depth, codecs.compressed_depth), the one auto takes when a ROS publisher offers only that
+ROS_COMPRESSED_DEPTH = "ros_compressed_depth"
+ROS_FORMS = (ROS, ROS_COMPRESSED, ROS_COMPRESSED_DEPTH)
 TRANSPORTS = {"compressed": topics.compressed, "raw": topics.image_raw, "shm": topics.shm, "cuda": topics.cuda,
               ROS: topics.image_raw}
 _TYPES = {"compressed": CompressedImage, "raw": Image, "shm": ShmImage, "cuda": CudaImageMsg, ROS: Image,
-          ROS_COMPRESSED: CompressedImage}
+          ROS_COMPRESSED: CompressedImage, ROS_COMPRESSED_DEPTH: CompressedImage}
 AUTO = "auto"
 # how long a subscription that changes its transport keeps the old one for the new one's first frame; after that, as
 # long again the new route's samples are compared with the newest frame kept (_Latest), and a stamp at most as far
@@ -658,7 +661,8 @@ ROS_RECHECK_S = 1.0  # auto on a ROS name looks at ROS's graph this often beside
 SETTLE_ROUNDS = 3  # info queries after a publisher came or went (its queryable can be known later than its token)
 # what a subscriber reads, for its start line: where the frames are (host or GPU memory) or how they come
 READS = {"shm": "the host ring", "cuda": "the CUDA ring", "compressed": "compressed frames over Zenoh",
-         "raw": "raw frames over Zenoh", ROS: "the ROS 2 topic", ROS_COMPRESSED: "the ROS 2 compressed topic"}
+         "raw": "raw frames over Zenoh", ROS: "the ROS 2 topic", ROS_COMPRESSED: "the ROS 2 compressed topic",
+         ROS_COMPRESSED_DEPTH: "the ROS 2 compressedDepth topic"}
 LOCAL = ("auto", "shm", "cuda")
 REMOTE = ("compressed", "raw")
 
@@ -975,7 +979,8 @@ class Subscription:
     from their ring and counted in ``skipped_max_hz``; None: every frame.
 
     In a session in ROS 2, ``auto`` reads a stream of ours that no publisher of ours answers from its ROS form
-    (``ros_forms``: ``/<base>/image_raw``, else ``/<base>/image_raw/compressed``; a cloud's ``/<base>/cloud``) when a
+    (``ros_forms``: ``/<base>/image_raw``, else ``/<base>/image_raw/compressed``, else
+    ``/<base>/image_raw/compressedDepth``; a cloud's ``/<base>/cloud``) when a
     ROS publisher of another program offers it. The ROS copies that our programs publish are never read in place of a
     stream's own forms, and once a publisher of ours answers, the subscription moves to it.
 
@@ -1192,6 +1197,9 @@ class Subscription:
                 if other == [ros.COMPRESSED_TYPE] and topic.endswith("/" + ros.COMPRESSED):
                     hint = (f": image_transport's compressed topic of {topic.rpartition('/')[0]}, which transport "
                             "compressed reads")
+                elif other == [ros.COMPRESSED_TYPE] and topic.endswith("/" + ros.COMPRESSED_DEPTH):
+                    hint = (f": image_transport's compressedDepth topic of {topic.rpartition('/')[0]}, which auto "
+                            "reads where it is the only form")
                 self._error = ProtocolError(f"{topic}: its ROS publishers send {', '.join(other)}, this subscriber "
                                             f"reads {message_type.TYPE}{hint}")
                 raise self._error
@@ -1490,8 +1498,9 @@ class ImageSubscriber(Subscription):
       with ``camera_info`` its ``/<base>/camera_info``. Its frames carry no seq, source or publish time.
 
     A ``base`` with a leading ``/`` is a ROS 2 image topic of any name, as ROS publishes it (``/image_raw``,
-    ``/resize/image``; Subscription): ``auto`` reads the topic, or image_transport's compressed topic
-    ``<topic>/compressed`` where a publisher offers only that; ``ros`` or ``raw`` the topic, ``compressed`` the
+    ``/resize/image``; Subscription): ``auto`` reads the topic, else image_transport's compressed topic
+    ``<topic>/compressed``, else its compressedDepth topic ``<topic>/compressedDepth`` (16-bit or 32FC1 depth,
+    codecs.compressed_depth), the first a publisher offers; ``ros`` or ``raw`` the topic, ``compressed`` the
     compressed one. Its camera_info is ROS's convention, ``camera_info`` beside the image topic (``/resize/image`` ->
     ``/resize/camera_info``), or the topic ``camera_info`` names.
 
@@ -1525,7 +1534,8 @@ class ImageSubscriber(Subscription):
 
     def _forms(self) -> dict:
         image = self.base if self.ros_topic else ros.topic_of(topics.image_raw(self.base))
-        return {ROS: (image, Image), ROS_COMPRESSED: (ros.compressed_topic(image), CompressedImage)}
+        return {ROS: (image, Image), ROS_COMPRESSED: (ros.compressed_topic(image), CompressedImage),
+                ROS_COMPRESSED_DEPTH: (ros.compressed_depth_topic(image), CompressedImage)}
 
     def info_topic(self) -> str | None:
         """The ROS topic of the camera_info read with a ROS form: the one named, else image_transport's beside the
@@ -1564,7 +1574,7 @@ class ImageSubscriber(Subscription):
 
     def _frame(self, payload, meta, key, receive_ns, transport) -> Frame | None:
         valid = None
-        if transport in ("compressed", ROS_COMPRESSED):
+        if transport in ("compressed", ROS_COMPRESSED, ROS_COMPRESSED_DEPTH):
             message = CompressedImage.deserialize(payload)
             image, encoding = decompress(message)
         elif transport in ("raw", ROS):

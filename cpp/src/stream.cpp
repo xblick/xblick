@@ -288,7 +288,7 @@ namespace xblick::detail
 
     bool is_ros_form(Transport t)
     {
-        return t == Transport::Ros or t == Transport::RosCompressed;
+        return t == Transport::Ros or t == Transport::RosCompressed or t == Transport::RosCompressedDepth;
     }
 
     RosSetup ros_setup(zenoh::Session& session, const std::string& base, Transport transport, bool copy,
@@ -334,6 +334,11 @@ namespace xblick::detail
                 throw std::invalid_argument("transport ros_compressed is not asked for: transport compressed of a ROS "
                                             "name (a leading /) reads image_transport's compressed topic");
             }
+            if (transport == Transport::RosCompressedDepth)
+            {
+                throw std::invalid_argument("transport ros_compressed_depth is not asked for: auto reads "
+                                            "image_transport's compressedDepth topic where it is the only form");
+            }
             s.base = check_name(base);
         }
         if (not copy and (s.transport == Transport::Compressed or s.transport == Transport::Raw or
@@ -351,6 +356,8 @@ namespace xblick::detail
                 if (compressed_type != nullptr)
                 {
                     s.forms.push_back({Transport::RosCompressed, ros::compressed_topic(topic), compressed_type});
+                    s.forms.push_back(
+                        {Transport::RosCompressedDepth, ros::compressed_depth_topic(topic), compressed_type});
                 }
             }
             catch (const ros::RosError& e)
@@ -671,13 +678,21 @@ namespace xblick::detail
             if (not other.empty())
             {
                 std::string hint;
-                const std::string suffix = "/" + std::string(ros::kCompressedTopic);
-                if (other == std::set<std::string>{"sensor_msgs/msg/CompressedImage"} and
-                    form.topic.size() > suffix.size() and
-                    form.topic.compare(form.topic.size() - suffix.size(), suffix.size(), suffix) == 0)
+                const auto ends_with = [&](std::string_view last) {
+                    const std::string suffix = "/" + std::string(last);
+                    return form.topic.size() > suffix.size() and
+                           form.topic.compare(form.topic.size() - suffix.size(), suffix.size(), suffix) == 0;
+                };
+                const bool compressed_only = other == std::set<std::string>{"sensor_msgs/msg/CompressedImage"};
+                if (compressed_only and ends_with(ros::kCompressedTopic))
                 {
                     hint = ": image_transport's compressed topic of " + form.topic.substr(0, form.topic.rfind('/')) +
                            ", which transport compressed reads";
+                }
+                else if (compressed_only and ends_with(ros::kCompressedDepthTopic))
+                {
+                    hint = ": image_transport's compressedDepth topic of " +
+                           form.topic.substr(0, form.topic.rfind('/')) + ", which auto reads where it is the only form";
                 }
                 const ProtocolError error(form.topic + ": its ROS publishers send " + join(other) +
                                           ", this subscriber reads " + reads + hint);

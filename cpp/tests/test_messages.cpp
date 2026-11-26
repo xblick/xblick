@@ -526,7 +526,44 @@ int main()
         refused_rvl(colour, "RVL of another encoding than 16-bit grey is refused");
         CompressedImage ros_png = rvl;
         ros_png.format = "16UC1; compressedDepth png";
-        refused_rvl(ros_png, "ROS's compressedDepth png is refused");
+        refused_rvl(ros_png, "ROS's compressedDepth png of bytes that are no PNG is refused");
+        CompressedImage unknown = rvl;
+        unknown.format = "16UC1; compressedDepth jpeg";
+        refused_rvl(unknown, "ROS's compressedDepth with an unknown codec is refused");
+
+        // ROS's compressedDepth plugin: its 12-byte ConfigHeader, then a 16-bit PNG (or RVL); 32FC1 as inverse depth
+        const CompressedImage png16 = compress(HostImage{depth.data(), 48, 64, 0}, "16UC1", kPng, 85, {});
+        const auto ros_depth = [&](const std::string& format, float a, float b) {
+            CompressedImage m;
+            m.format = format;
+            m.data.resize(12, 0);
+            std::memcpy(m.data.data() + 4, &a, 4);
+            std::memcpy(m.data.data() + 8, &b, 4);
+            m.data.insert(m.data.end(), png16.data.begin(), png16.data.end());
+            return m;
+        };
+        for (const char* format : {"16UC1; compressedDepth png", "16UC1; compressedDepth"})
+        {
+            const DecodedImage back = decompress(ros_depth(format, 0, 0));
+            expect(back.encoding == "16UC1" and back.width == 64 and back.height == 48 and
+                       std::memcmp(back.pixels.data(), depth.data(), depth.size() * 2) == 0,
+                   "ROS's compressedDepth png of a 16-bit image is read as it is");
+        }
+        const float a = 100.0f * 101.0f, b = 1.0f - a / 10.0f;
+        const DecodedImage inverse = decompress(ros_depth("32FC1; compressedDepth png", a, b));
+        bool depth_ok = inverse.encoding == "32FC1" and inverse.step == 64 * 4 and inverse.pixels.size() == 48 * 64 * 4;
+        for (std::size_t i = 0; depth_ok and i < depth.size(); ++i)
+        {
+            float z = 0;
+            std::memcpy(&z, inverse.pixels.data() + 4 * i, 4);
+            depth_ok = depth[i] == 0 ? std::isnan(z) : z == a / (static_cast<float>(depth[i]) - b);
+        }
+        expect(depth_ok, "ROS's compressedDepth of 32FC1 is depthParam[0] / (q - depthParam[1]), NaN for q 0");
+        CompressedImage inverse_rvl = rvl;
+        inverse_rvl.format = "32FC1; compressedDepth rvl";
+        std::memcpy(inverse_rvl.data.data() + 4, &a, 4);
+        std::memcpy(inverse_rvl.data.data() + 8, &b, 4);
+        expect(decompress(inverse_rvl).encoding == "32FC1", "ROS's compressedDepth rvl of 32FC1 is read");
         try
         {
             const std::uint8_t pixel[3] = {1, 2, 3};

@@ -3,8 +3,11 @@
 #include <csetjmp>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <map>
+#include <optional>
 #include <regex>
+#include <sstream>
 
 #include <jpeglib.h>
 #include <png.h>
@@ -463,8 +466,120 @@ namespace xblick
         return out;
     }
 
+    std::optional<std::pair<std::string, std::string>> compressed_depth(const std::string& format)
+    {
+        const auto semicolon = format.find(';');
+        if (semicolon == std::string::npos)
+        {
+            return std::nullopt;
+        }
+        std::vector<std::string> words;
+        {
+            std::istringstream rest(format.substr(semicolon + 1));
+            for (std::string word; rest >> word;)
+            {
+                words.push_back(word);
+            }
+        }
+        if (words.empty() or lower(words[0]) != lower(kCompressedDepth))
+        {
+            return std::nullopt;
+        }
+        std::string codec = kPng;  // no codec word: PNG, as older versions of the plugin write it
+        if (words.size() == 2 and (lower(words[1]) == kPng or lower(words[1]) == kRvl))
+        {
+            codec = lower(words[1]);
+        }
+        else if (words.size() != 1)
+        {
+            std::string named;
+            for (std::size_t i = 1; i < words.size(); ++i)
+            {
+                named += (i > 1 ? " " : "") + words[i];
+            }
+            throw EncodingError("compressed format '" + format + "': ROS's compressedDepth with codec '" + named +
+                                "', not png or rvl");
+        }
+        const std::string original = trim(format.substr(0, semicolon));
+        if (not grey16(original) and original != "32FC1")
+        {
+            throw EncodingError("compressed format '" + format +
+                                "': ROS's compressedDepth carries mono16, 16UC1, 32FC1 images, not '" + original + "'");
+        }
+        return std::make_pair(original, codec);
+    }
+
+    namespace
+    {
+        // A message of ROS's compressedDepth plugin (image.hpp): its 16-bit image, or its 32FC1 depth from the
+        // quantised inverse depth q, depthParam[0] / (q - depthParam[1]), NaN where q is 0.
+        DecodedImage decompress_depth(const CompressedImage& message, const std::string& original,
+                                      const std::string& codec)
+        {
+            constexpr std::size_t kConfigHeader = 12;  // int32 format, float32 depthParam[2]
+            DecodedImage out;
+            if (codec == kRvl)  // its header holds ROS's ConfigHeader (rvl.hpp), its decoder checks every length
+            {
+                try
+                {
+                    const auto [height, width] = rvl::shape(message.data);
+                    out.height = height;
+                    out.width = width;
+                    out.step = width * 2;
+                    out.pixels.resize(static_cast<std::size_t>(height) * width * 2);
+                    rvl::decode(message.data, out.pixels.data());
+                }
+                catch (const rvl::Error& error)
+                {
+                    throw EncodingError(error.what());
+                }
+            }
+            else
+            {
+                if (message.data.size() <= kConfigHeader)
+                {
+                    throw EncodingError("compressed format '" + message.format + "': " +
+                                        std::to_string(message.data.size()) + " bytes, no more than ROS's " +
+                                        std::to_string(kConfigHeader) + "-byte header");
+                }
+                const std::vector<std::uint8_t> png(message.data.begin() + kConfigHeader, message.data.end());
+                out = decode_png(png, "16UC1");
+                if (out.encoding != "16UC1")
+                {
+                    throw EncodingError("compressed format '" + message.format + "': a PNG of " + out.encoding +
+                                        ", not 16-bit grey");
+                }
+            }
+            if (original != "32FC1")
+            {
+                out.encoding = original;
+                return out;
+            }
+            float a = 0, b = 0;
+            std::memcpy(&a, message.data.data() + 4, 4);  // the RVL and the PNG branch checked the size
+            std::memcpy(&b, message.data.data() + 8, 4);
+            const std::size_t count = static_cast<std::size_t>(out.height) * out.width;
+            std::vector<std::uint8_t> depth(count * 4);
+            for (std::size_t i = 0; i < count; ++i)
+            {
+                std::uint16_t q = 0;
+                std::memcpy(&q, out.pixels.data() + 2 * i, 2);
+                const float z = q != 0 ? a / (static_cast<float>(q) - b) : std::numeric_limits<float>::quiet_NaN();
+                std::memcpy(depth.data() + 4 * i, &z, 4);
+            }
+            out.pixels = std::move(depth);
+            out.step = out.width * 4;
+            out.encoding = original;
+            return out;
+        }
+    }  // namespace
+
     DecodedImage decompress(const CompressedImage& message)
     {
+        if (const auto depth = compressed_depth(message.format))
+        {
+            return decompress_depth(message, depth->first, depth->second);
+        }
         std::string original;
         std::string codec;
         const auto semicolon = message.format.find(';');
@@ -500,7 +615,8 @@ namespace xblick
             if (lower(trim(message.format.substr(semicolon + 1))) != "compresseddepth rvl" or not grey16(original))
             {
                 throw EncodingError("compressed format '" + message.format
-                                    + "': of ROS's compressedDepth only rvl of a 16-bit image is read");
+                                    + "': of ROS's compressedDepth only rvl of a 16-bit image is a stream's "
+                                      "compressed form (decompress reads the others)");
             }
             try
             {

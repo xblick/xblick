@@ -5,9 +5,11 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "xblick/msg.hpp"
@@ -62,5 +64,16 @@ namespace xblick
     // are, the format of a JPEG of `encoding` (8-bit colour or grey). Checks the JPEG's start marker only.
     CompressedImage jpeg_message(std::span<const std::uint8_t> jpeg, const std::string& encoding,
                                  const Header& header);
+    // ROS's compressedDepth plugin (image_transport's <topic>/compressedDepth): the format "<encoding>; compressedDepth
+    // <png|rvl>" ("<encoding>; compressedDepth" alone: PNG, as older versions write it), the data ROS's 12-byte
+    // ConfigHeader (int32 format, float32 depthParam[2]) and a 16-bit PNG or the RVL bytes (rvl.hpp). A 16-bit image
+    // (16UC1, mono16) is in it as it is, a 32FC1 one as quantised inverse depth q: depth depthParam[0] / (q -
+    // depthParam[1]) metres, NaN where q is 0.
+    inline constexpr const char* kCompressedDepth = "compressedDepth";
+    // (original encoding, png or rvl) of a format of that plugin; nullopt for another format. EncodingError for a
+    // compressedDepth format with an unknown codec or an encoding the plugin does not carry.
+    std::optional<std::pair<std::string, std::string>> compressed_depth(const std::string& format);
+    // The pixels of a CompressedImage: of our compressed forms (JPEG, PNG, RVL), of image_transport's compressed
+    // plugin, and of ROS's compressedDepth plugin (16-bit, or 32FC1 depth as float32).
     DecodedImage decompress(const CompressedImage& message);
 }  // namespace xblick
