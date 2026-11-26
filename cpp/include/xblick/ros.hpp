@@ -53,6 +53,7 @@
 #include <zenoh.hxx>
 
 #include "xblick/protocol.hpp"
+#include "xblick/ros_cuda.hpp"
 #include "xblick/ros_gid.hpp"
 
 namespace xblick::ros
@@ -358,7 +359,13 @@ namespace xblick::ros
         // A ROS subscriber (or any other) of the key is known.
         bool matched() const;
         void put(std::span<const std::uint8_t> payload);
+        // The attachment of the next message, its sequence number counted: for a message that goes on keys of its
+        // own (GpuLink: the buffer keys of Lyrical's readers), each with this one.
+        std::vector<std::uint8_t> attachment();
         const std::string& key() const { return entity_.key; }
+        const std::string& topic() const { return *entity_.token.topic; }
+        const std::string& type_name() const { return *entity_.token.type_name; }
+        const Qos& qos() const { return *entity_.token.qos; }
         const Entity& entity() const { return entity_; }
         // Called with each payload before it goes out (mirror_tf: the frames' parents).
         std::function<void(std::span<const std::uint8_t>)> check;
@@ -378,6 +385,84 @@ namespace xblick::ros
         std::optional<zenoh::Queryable<void>> cache_queryable_;
         std::optional<zenoh::LivelinessToken> cache_token_;
         std::optional<zenoh::LivelinessToken> token_;     // last: undeclared first
+    };
+
+    // ------------------------------------------------------------------------- ROS cameras as ROS names them
+
+    inline constexpr std::string_view kCompressedTopic = "compressed";   // image_transport's <image topic>/compressed
+    inline constexpr std::string_view kCameraInfoTopic = "camera_info";  // image_transport's, beside the image topic
+    // What reading a ROS topic needs (Python's ros.NEEDS_ROS).
+    inline constexpr const char* kNeedsRos =
+        "a session that takes part in ROS 2 (the default of open_session and every program; not one opened with "
+        "--no-ros, XBLICK_ROS=0 or SessionOptions::ros = std::nullopt)";
+    // True for a ROS topic as ROS's tools write it (/image_raw, /resize/image): a name with a leading '/'. A name
+    // without one is one of our stream bases (test/camera/color).
+    bool is_topic(const std::string& name);
+    // /cam/image_raw -> /cam/image_raw/compressed
+    std::string compressed_topic(const std::string& image_topic);
+    // camera_info in the image topic's namespace: /cam/image_raw -> /cam/camera_info, /image_raw -> /camera_info.
+    std::string camera_info_topic(const std::string& image_topic);
+
+    // The publishers in ROS's graph on a domain, as a liveliness subscriber with history keeps their tokens (Python's
+    // ros.Graph; here one per subscription that reads or looks for a ROS form). `changed` is called in Zenoh's thread
+    // when a publisher came or went. by_xblick(zid): whether a publisher's session declares a program of ours (its
+    // declaration's token, a liveliness query kept per session): the ROS topics such a program publishes are copies
+    // of its own keys.
+    class Graph
+    {
+    public:
+        Graph(zenoh::Session& session, int domain, std::function<void()> changed = {});
+        ~Graph();
+        Graph(const Graph&) = delete;
+        Graph& operator=(const Graph&) = delete;
+        // The publishers known now, of `topic` or of all, this session's own left out.
+        std::vector<Token> publishers(const std::optional<std::string>& topic = std::nullopt) const;
+        bool by_xblick(const std::string& zid);
+
+    private:
+        struct State;
+        zenoh::Session& session_;
+        std::shared_ptr<State> state_;
+        std::optional<zenoh::Subscriber<void>> subscriber_;
+    };
+
+    // The GPU link of one ROS publisher of images (sensor_msgs/msg/Image), as Python's ros_cuda.GpuLink: a ROS
+    // subscription of its topic that accepts ROS 2's CUDA buffer backend (its token says backends:...cuda:) gets the
+    // frames that are in a CUDA ring as CUDA buffers instead of their bytes (ros_cuda.hpp has the rules, the pool and
+    // the protocol). plan() before each frame (none: everything as before, on the key); send_gpu and send_cpu with
+    // that plan. Not thread-safe apart from the tokens (one publisher). The settings: ros_cuda::kEnableEnv,
+    // kSocketsEnv, kShmEnv.
+    class GpuLink
+    {
+    public:
+        // RosError for another type than sensor_msgs/msg/Image or a sockets or shm directory that is none.
+        GpuLink(zenoh::Session& session, Publisher& publisher, int device,
+                std::optional<std::string> socket_dir = std::nullopt, std::optional<std::string> shm_dir = std::nullopt);
+        ~GpuLink();
+        GpuLink(const GpuLink&) = delete;
+        GpuLink& operator=(const GpuLink&) = delete;
+
+        std::optional<ros_cuda::Plan> plan();
+        // The frame in slot `slot` of `ring` to the GPU readers of `plan`, with `attachment` (Publisher::attachment);
+        // the keys it went to (none when every block is held).
+        std::vector<std::string> send_gpu(const ros_cuda::Plan& plan, CudaRingWriter& ring, std::uint32_t slot,
+                                          std::uint64_t nbytes, const ros_cuda::ImageHeader& header,
+                                          const std::vector<std::uint8_t>& attachment);
+        // The CPU form (the message's CDR) to the readers of `plan` that take it.
+        std::vector<std::string> send_cpu(const ros_cuda::Plan& plan, std::span<const std::uint8_t> payload,
+                                          const std::vector<std::uint8_t>& attachment);
+        ros_cuda::LinkStats stats() const;
+
+    private:
+        struct State;
+        std::shared_ptr<zenoh::Publisher> out(const std::string& key);
+        std::string buf_key(const std::array<std::uint8_t, 16>& gid) const;
+        void say_notes();
+
+        zenoh::Session& session_;
+        Publisher& publisher_;
+        std::shared_ptr<State> state_;  // the link and the buffer keys' publishers, shared with the token callback
+        std::optional<zenoh::Subscriber<void>> tokens_;
     };
 
     // A ROS subscription: callback(payload, attachment) for each sample, in Zenoh's thread. A sample without ROS's

@@ -8,9 +8,11 @@ Needs the C++ build: XBLICK_CPP_BUILD (as tests/test_cpp_interop.py; skipped wit
 xblick-points in it (a build with XBLICK_POINTS) and a GPU."""
 
 import json
+import mmap
 import os
 import re
 import subprocess
+import threading
 import time
 
 import numpy as np
@@ -21,14 +23,15 @@ from xblick import _core, ros
 from xblick.camera import (CameraPublisher, ImageSubscriber, StaticTransformPublisher, StaticTransformSubscriber,
                            TransformSubscriber)
 from xblick.encodings import numpy_to_image
-from xblick.msg import (CameraInfo, Header, Parameter, ParameterValue, SetParametersRequest, Time, Transform,
-                        TransformStamped, Vector3)
+from xblick.msg import (CameraInfo, Header, Image, Parameter, ParameterValue, PointCloud2, SetParametersRequest,
+                        Time, Transform, TransformStamped, Vector3)
 from xblick.parameters import READ_ONLY_ACCESS, ROS_SETS_OFF, ParameterClient
 from xblick.points import PointCloudSubscriber
 from xblick.session import RosOptions, open_session, replies
 
 from test_cpp_interop import BUILD, H, W, checksum, cloud_pattern, first_frame, free_port, pattern, tool
 from test_ros_parameters import ros_set
+from test_ros_readers import DOMAIN as READERS_DOMAIN, RosCamera
 import test_ros_live as live
 
 pytestmark = pytest.mark.skipif(not BUILD, reason="XBLICK_CPP_BUILD (the C++ build directory) is not set")
@@ -318,7 +321,7 @@ def test_cpp_probe_reads_a_ros_topic(tmp_path):
     for line in lines:
         assert line["seq"] == -1 and line["transport"] == "ros" and line["encoding"] == "rgb8"
         assert 1 <= _seq_of(line) <= seq  # the pixels of one of the frames published
-    assert any(line["camera_info"] == {"width": W, "fx": 400.0} for line in lines)
+    assert any((line["camera_info"] or {}).items() >= {"width": W, "fx": 400.0}.items() for line in lines)
 
 
 def test_cpp_reads_ros_tf_static_late():
@@ -488,6 +491,251 @@ def test_cpp_malformed_ros_requests_are_refused_and_it_goes_on(tmp_path):
         client.close()
         reader.close()
         camera.close()
+
+
+# ------------------------------------------- C++ readers of ROS cameras as ROS names them (tests/test_ros_readers.py)
+
+
+@pytest.fixture
+def ros_hub():
+    """The port of a session in ROS 2 that listens: RosCamera stand-ins and xblick-cpp-probe connect to it."""
+    port = free_port()
+    hub = open_session(listen=[f"tcp/127.0.0.1:{port}"], ros_options=RosOptions(READERS_DOMAIN, "xblick_hub"))
+    yield port
+    hub.close()
+
+
+def probe_ros(port: int, base: str, *extra, frames: int = 3, timeout: float = 15) -> tuple[int, list[dict], str]:
+    """xblick-cpp-probe on a ROS name or a stream of ours, on the stand-ins' domain: (exit code, lines, stderr)."""
+    done = subprocess.run([tool("xblick-cpp-probe"), "--connect", f"127.0.0.1:{port}", "--base", base, "--frames",
+                           str(frames), "--timeout", str(timeout),
+                           *([] if "--no-ros" in extra else ["--ros-domain", str(READERS_DOMAIN)]), *extra],
+                          capture_output=True, text=True, timeout=timeout + 60)
+    return done.returncode, [json.loads(line) for line in done.stdout.splitlines()], done.stderr
+
+
+def models(lines: list[dict]) -> set:
+    return {line["camera_info"]["model"] for line in lines if line["camera_info"]}
+
+
+def test_cpp_reads_an_image_topic_of_any_name_and_its_camera_info(ros_hub):
+    """ImageSubscriber with a ROS name: a root /image_raw and an Isaac-style /resize/image, each with camera_info
+    beside it (ROS's convention), and a camera_info topic named (SubscriberOptions::camera_info_topic)."""
+    camera = RosCamera(f"tcp/127.0.0.1:{ros_hub}", root=("/image_raw", Image.TYPE),
+                       root_info=("/camera_info", CameraInfo.TYPE), resize=("/resize/image", Image.TYPE),
+                       resize_info=("/resize/camera_info", CameraInfo.TYPE),
+                       named=("/lab/eye/calibration", CameraInfo.TYPE))
+    try:
+        for base, extra, model in (("/image_raw", ("--transport", "auto", "--camera-info"), "root_info"),
+                                   ("/resize/image", ("--transport", "ros", "--camera-info"), "resize_info"),
+                                   ("/resize/image", ("--transport", "raw", "--camera-info-topic",
+                                                      "/lab/eye/calibration"), "named")):
+            code, lines, err = probe_ros(ros_hub, base, *extra, frames=10)
+            assert code == 0, err
+            assert {(line["transport"], line["seq"], line["height"], line["width"]) for line in lines} == {
+                ("ros", -1, 4, 6)}
+            assert models(lines) == {model}, (base, lines[-1])
+    finally:
+        camera.close()
+
+
+def test_cpp_reads_image_transports_compressed_topic(ros_hub):
+    """compressed of a ROS name reads <topic>/compressed; auto takes it where a publisher offers only that."""
+    camera = RosCamera(f"tcp/127.0.0.1:{ros_hub}", compressed=("/bag/cam/image_raw/compressed", ros.COMPRESSED_TYPE))
+    try:
+        for transport in ("compressed", "auto"):
+            code, lines, err = probe_ros(ros_hub, "/bag/cam/image_raw", "--transport", transport)
+            assert code == 0, err
+            assert {line["transport"] for line in lines} == {"ros_compressed"}
+    finally:
+        camera.close()
+
+
+def test_cpp_reads_a_point_cloud_topic_of_any_name(ros_hub):
+    camera = RosCamera(f"tcp/127.0.0.1:{ros_hub}", cloud=("/velodyne_points", PointCloud2.TYPE))
+    try:
+        code, lines, err = probe_ros(ros_hub, "/velodyne_points", "--points")
+        assert code == 0 and {line["transport"] for line in lines} == {"ros"}, err
+        code, _, err = probe_ros(ros_hub, "/velodyne_points", "--points", "--transport", "compressed")
+        assert code == 1 and "transport auto, ros, raw, not compressed" in err, err
+    finally:
+        camera.close()
+
+
+def test_cpp_ros_names_without_a_publisher_say_what_is_there(ros_hub):
+    """No guessing (after kWaitHint, 5 s): a namespace with image topics below it names them; image_transport's
+    compressed topic read as an image says which topic and transport fit."""
+    camera = RosCamera(f"tcp/127.0.0.1:{ros_hub}", color=("/rs/color/image_raw", Image.TYPE),
+                       depth=("/rs/depth/image_rect_raw", Image.TYPE),
+                       compressed=("/cam/image_raw/compressed", ros.COMPRESSED_TYPE))
+    try:
+        code, lines, err = probe_ros(ros_hub, "/rs", timeout=10)
+        assert code == 1 and lines == [], err
+        assert "/rs: no ROS topic of this name, and these are below it: /rs/color/image_raw, " \
+               "/rs/depth/image_rect_raw; name one of them" in err
+        code, lines, err = probe_ros(ros_hub, "/cam/image_raw/compressed", "--transport", "ros", timeout=10)
+        assert code == 1 and "image_transport's compressed topic of /cam/image_raw, which transport compressed" \
+            in err, err
+    finally:
+        camera.close()
+
+
+def test_cpp_ros_names_refused():
+    port = free_port()
+    with open_session(listen=[f"tcp/127.0.0.1:{port}"], ros_options=False):
+        code, _, err = probe_ros(port, "/image_raw", "--no-ros", timeout=2)
+        assert code == 1 and "a ROS 2 topic (a leading /)" in err, err
+        code, _, err = probe_ros(port, "/image_raw", "--transport", "shm", timeout=2)
+        assert code == 1 and "transport auto, ros, raw or compressed, not shm" in err, err
+        code, _, err = probe_ros(port, "/cam-1/image_raw", timeout=2)
+        assert code == 1 and "no ROS name" in err, err
+        code, _, err = probe_ros(port, "test/camera/color", "--transport", "raw", "--camera-info-topic", "/lab/info",
+                                 timeout=2)
+        assert code == 1 and "a ROS topic, for a ROS form" in err, err
+
+
+def next_line(proc, timeout: float = 0.05) -> dict | None:
+    """The probe's next line if one is there within ``timeout``."""
+    import select
+    ready, _, _ = select.select([proc.stdout], [], [], timeout)
+    line = proc.stdout.readline() if ready else ""
+    return json.loads(line) if line else None
+
+
+def test_cpp_auto_reads_a_stream_only_a_ros_publisher_offers_and_moves_to_ours(ros_hub):
+    """Auto on a stream of ours with only a ROS publisher (a ROS camera on /<base>/image_raw): its ROS form with its
+    camera_info; a publisher of ours that starts later takes over."""
+    camera = RosCamera(f"tcp/127.0.0.1:{ros_hub}", image=("/roscam/color/image_raw", Image.TYPE),
+                       info=("/roscam/color/camera_info", CameraInfo.TYPE))
+    proc = subprocess.Popen([tool("xblick-cpp-probe"), "--connect", f"127.0.0.1:{ros_hub}", "--base", "roscam/color",
+                             "--camera-info", "--frames", "100000", "--timeout", "40", "--ros-domain",
+                             str(READERS_DOMAIN)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            bufsize=1)
+    ours = None
+    try:
+        lines = []
+        end = time.monotonic() + 20
+        while len([line for line in lines if line["camera_info"]]) < 3 and time.monotonic() < end:
+            line = next_line(proc, 0.5)
+            lines += [line] if line else []
+        assert lines and {line["transport"] for line in lines} == {"ros"}, proc.stderr.read() if proc.poll() else ""
+        assert "only a ROS publisher" in lines[-1]["reason"] and models(lines) == {"info"}
+        xblick = open_session(connect=[f"tcp/127.0.0.1:{ros_hub}"], ros_options=False)
+        ours = (xblick, CameraPublisher(xblick, "roscam/color", encoding="mono8", frame_id="roscam"))
+        end = time.monotonic() + 15
+        moved = False
+        while not moved and time.monotonic() < end:
+            ours[1].publish(np.zeros((4, 6), np.uint8))
+            line = next_line(proc, 0.03)
+            moved = line is not None and line["transport"] == "shm"
+        assert moved
+    finally:
+        proc.terminate()
+        proc.communicate(timeout=10)
+        if ours is not None:
+            ours[1].close()
+            ours[0].close()
+        camera.close()
+
+
+def test_cpp_auto_never_reads_the_ros_copy_of_a_stream_of_ours(ros_hub):
+    """A program of ours (it declares itself) whose stream is on ROS's keys only: Auto does not take that copy."""
+    xblick = open_session(connect=[f"tcp/127.0.0.1:{ros_hub}"], ros_options=RosOptions(READERS_DOMAIN, "xbcam"))
+    copy = xblick.ros.node.publisher("/copy/color/image_raw", Image.TYPE)
+    stop = threading.Event()
+
+    def put():
+        while not stop.wait(0.05):
+            copy.put(bytes(numpy_to_image(np.zeros((4, 6), np.uint8), "mono8",
+                                          Header(Time.from_ns(time.time_ns()))).serialize()))
+
+    putter = threading.Thread(target=put, daemon=True)
+    putter.start()
+    try:
+        code, lines, err = probe_ros(ros_hub, "copy/color", frames=1, timeout=6)
+        assert code == 2 and lines == [], err
+    finally:
+        stop.set()
+        putter.join()
+        copy.close()
+        xblick.close()
+
+
+# ------------------------------------------------- the C++ CameraPublisher's GPU link (tests/test_ros_cuda.py)
+
+
+@pytest.mark.skipif(_core.cuda_device_count() == 0, reason="no CUDA device")
+def test_cpp_camera_routes_gpu_frames_to_a_cuda_reader(tmp_path):
+    """The C++ CameraPublisher with cuda_device, as the Python one: a stand-in for a Lyrical reader that accepts CUDA
+    buffers (its token, its registry entry with this test's process as its pid, which maps the registry and has this
+    GPU open) gets descriptors, a Lyrical CPU reader the CPU form on _buf_cpu, nothing goes on the key; with a Jazzy
+    reader everything goes on the key in CPU form. Its counters at the end, its files gone."""
+    from test_ros_cuda import write_registry
+
+    port = free_port()
+    topic = "/gpulink/cpp/color/image_raw"
+    key = ros.data_key(DOMAIN, topic, Image.TYPE, ros.hash_of(Image.TYPE))
+    registry = tmp_path / _core.ros_cuda_registry_name()
+    write_registry(registry, [])
+    env = {**os.environ, "XBLICK_ROS_CUDA_SOCKETS": str(tmp_path), "XBLICK_ROS_CUDA_SHM": str(tmp_path)}
+    proc = subprocess.Popen([tool("xblick-cpp-camera"), "--listen", f"127.0.0.1:{port}", "--base", "gpulink/cpp/color",
+                             "--encoding", "rgb8", "--size", str(W), str(H), "--fps", "30", "--seconds", "60",
+                             "--cuda-device", "0", "--device-frames", "--ros-domain", str(DOMAIN)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    gpu = _core.make_device_buffer(0, 1024)  # this process has the GPU open, as a reader would
+    err = ""
+    try:
+        assert proc.stdout.readline().strip() == "ready"
+        with open_session(connect=[f"tcp/127.0.0.1:{port}"], ros_options=RosOptions(DOMAIN, "py_lyrical")) as s:
+            zid = str(s.info.zid())
+
+            def token(entity, node, backends):
+                parts = ["@ros2_lv", str(DOMAIN), zid, "90", str(entity), "MS", "%", "%", node, ros.mangle(topic),
+                         "sensor_msgs::msg::dds_::Image_", ros.hash_of(Image.TYPE), "::,10:,:,:,,"]
+                return "/".join(parts + ([backends] if backends else []))
+
+            cuda_token, cpu_token, jazzy_token = (token(91, "gpu", "backends:cuda:"), token(92, "cpu", "backends:cpu:"),
+                                                  token(93, "old", None))
+            cuda_gid = ros.gid(cuda_token)
+            write_registry(registry, [((os.getpid() << 32) | 1, cuda_gid, 1, 0, os.getuid(), True, True, b"image")])
+            with open(registry, "rb") as mapped, mmap.mmap(mapped.fileno(), 0, prot=mmap.PROT_READ):
+                got = {"desc": [], "cpu": [], "key": []}
+                subs = [s.declare_subscriber(f"{key}/_buf/{cuda_gid.hex()}",
+                                             lambda x: got["desc"].append(x.payload.to_bytes())),
+                        s.declare_subscriber(f"{key}/_buf_cpu", lambda x: got["cpu"].append(x.payload.to_bytes())),
+                        s.declare_subscriber(key, lambda x: got["key"].append(x.payload.to_bytes()))]
+                live_tokens = [s.liveliness().declare_token(cuda_token), s.liveliness().declare_token(cpu_token)]
+                wait_until(lambda: got["desc"], timeout=15)
+                time.sleep(0.3)
+                for x in got.values():
+                    x.clear()
+                time.sleep(1.0)
+                assert got["desc"] and got["cpu"] and got["key"] == [], {k: len(v) for k, v in got.items()}
+                payload = got["desc"][-1]
+                assert b"\xff\xff\xff\xff2SOR" in payload and len(payload) < 300  # the marker words, no pixels
+                assert len(got["cpu"][-1]) > W * H * 3
+                live_tokens.append(s.liveliness().declare_token(jazzy_token))  # reads the key only: all on the key
+                time.sleep(0.5)
+                for x in got.values():
+                    x.clear()
+                time.sleep(0.5)
+                assert got["desc"] == [] and got["cpu"] == [] and got["key"], {k: len(v) for k, v in got.items()}
+                for t in live_tokens:
+                    t.undeclare()
+                for sub in subs:
+                    sub.undeclare()
+        proc.terminate()
+        _, err = proc.communicate(timeout=20)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate(timeout=10)
+        del gpu
+    assert proc.returncode == 0, err
+    stats = json.loads(err.split("xblick-cpp-camera: gpu link ")[1].splitlines()[0])
+    assert stats["sent"] > 0 and stats["blocks"] >= 1 and stats["refused"] == 0, stats
+    assert "ROS reader /gpu gets the frames as CUDA buffers" in err
+    assert sorted(os.listdir(tmp_path)) == [registry.name]  # the pool's files are gone with the camera
 
 
 # ---------------------------------------------------------------- live: against ROS 2 Jazzy's programs (rmw_zenoh)

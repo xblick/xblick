@@ -8,21 +8,27 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/un.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <mutex>
 #include <random>
 #include <sstream>
+#include <stdexcept>
 #include <thread>
+#include <tuple>
 
+#include "xblick/cuda_ring.hpp"
 #include "xblick/ring.hpp"
 #include "xblick/ros2_cdr_msgs.hpp"
 
@@ -977,5 +983,540 @@ namespace xblick::ros_cuda
     {
         std::lock_guard lock(impl_->mutex);
         return static_cast<std::uint32_t>(impl_->blocks.size());
+    }
+
+    // ------------------------------------------------------------------------------------- the link to readers
+
+    bool enabled_by_environment()
+    {
+        const char* value = std::getenv(kEnableEnv);
+        if (value == nullptr or std::string(value) == "1")
+        {
+            return true;
+        }
+        if (std::string(value) == "0")
+        {
+            return false;
+        }
+        throw std::invalid_argument(std::string(kEnableEnv) + "='" + value +
+                                    "': 0 (no GPU link to ROS readers) or 1 (the link, the default)");
+    }
+
+    namespace
+    {
+        std::string env_or(const char* name, const char* fallback)
+        {
+            const char* value = std::getenv(name);
+            return value != nullptr and *value != '\0' ? std::string(value) : std::string(fallback);
+        }
+    }  // namespace
+
+    std::string socket_dir_from_environment() { return env_or(kSocketsEnv, kDefaultSocketDir); }
+    std::string shm_dir_from_environment() { return env_or(kShmEnv, kDefaultShmDir); }
+
+    std::map<std::string, std::string> backends_of(const std::string& part)
+    {
+        std::map<std::string, std::string> out;
+        const std::string_view prefix = "backends:";
+        std::string_view rest(part);
+        if (rest.substr(0, prefix.size()) == prefix)
+        {
+            rest.remove_prefix(prefix.size());
+        }
+        while (not rest.empty())
+        {
+            const std::size_t end = rest.find(';');
+            const std::string_view item = rest.substr(0, end);
+            if (not item.empty())
+            {
+                const std::size_t colon = item.find(':');
+                out[std::string(item.substr(0, colon))] =
+                    colon == std::string_view::npos ? std::string() : std::string(item.substr(colon + 1));
+            }
+            if (end == std::string_view::npos)
+            {
+                break;
+            }
+            rest.remove_prefix(end + 1);
+        }
+        return out;
+    }
+
+    namespace
+    {
+        constexpr unsigned kNvidiaMajor = 195;  // /dev/nvidia<minor>; 254 and 255 are nvidia-modeset and nvidiactl
+        constexpr unsigned kGpuMinors = 254;
+        constexpr const char* kCudaBackend = "cuda";
+        constexpr const char* kCpuBackends = "backends:cpu:";  // ros.hpp's kCpuBackends
+        constexpr const char* kGpuEnv[] = {"CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER"};
+
+        std::map<std::string, std::string> environment_of(int pid)
+        {
+            std::ifstream in("/proc/" + std::to_string(pid) + "/environ", std::ios::binary);
+            if (not in)
+            {
+                throw RingError("cannot read /proc/" + std::to_string(pid) + "/environ: " + errno_text());
+            }
+            std::map<std::string, std::string> out;
+            std::string item;
+            while (std::getline(in, item, '\0'))
+            {
+                const std::size_t eq = item.find('=');
+                if (not item.empty())
+                {
+                    out[item.substr(0, eq)] = eq == std::string::npos ? std::string() : item.substr(eq + 1);
+                }
+            }
+            return out;
+        }
+
+        bool maps_registry(int pid, const std::string& registry)
+        {
+            std::ifstream in("/proc/" + std::to_string(pid) + "/maps");
+            if (not in)
+            {
+                throw RingError("cannot read /proc/" + std::to_string(pid) + "/maps: " + errno_text());
+            }
+            std::string line;
+            const std::string tail = "/" + registry;
+            while (std::getline(in, line))
+            {
+                while (not line.empty() and std::isspace(static_cast<unsigned char>(line.back())))
+                {
+                    line.pop_back();
+                }
+                if (line.size() >= tail.size() and line.compare(line.size() - tail.size(), tail.size(), tail) == 0)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        std::string trim(std::string s)
+        {
+            const auto first = s.find_first_not_of(" \t\r\n");
+            if (first == std::string::npos)
+            {
+                return "";
+            }
+            return s.substr(first, s.find_last_not_of(" \t\r\n") - first + 1);
+        }
+
+        std::string lower_hex(std::string s)
+        {
+            std::string out;
+            for (char c : s)
+            {
+                if (c != '-')
+                {
+                    out += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                }
+            }
+            return out;
+        }
+    }  // namespace
+
+    std::set<int> gpu_minors(const std::string& pid)
+    {
+        const std::string base = "/proc/" + pid + "/fd";
+        DIR* dir = ::opendir(base.c_str());
+        if (dir == nullptr)
+        {
+            throw RingError("cannot read " + base + ": " + errno_text());
+        }
+        std::set<int> minors;
+        while (dirent* e = ::readdir(dir))
+        {
+            if (e->d_name[0] == '.')
+            {
+                continue;
+            }
+            struct stat s{};
+            if (::stat((base + "/" + e->d_name).c_str(), &s) != 0)
+            {
+                continue;  // closed meanwhile
+            }
+            if (S_ISCHR(s.st_mode) and major(s.st_rdev) == kNvidiaMajor and minor(s.st_rdev) < kGpuMinors)
+            {
+                minors.insert(static_cast<int>(minor(s.st_rdev)));
+            }
+        }
+        ::closedir(dir);
+        return minors;
+    }
+
+    std::optional<int> minor_of(const std::string& uuid)
+    {
+        const std::string want = lower_hex(uuid);
+        const std::string root = "/proc/driver/nvidia/gpus";
+        DIR* dir = ::opendir(root.c_str());
+        if (dir == nullptr)
+        {
+            return std::nullopt;
+        }
+        std::vector<std::string> buses;
+        while (dirent* e = ::readdir(dir))
+        {
+            if (e->d_name[0] != '.')
+            {
+                buses.emplace_back(e->d_name);
+            }
+        }
+        ::closedir(dir);
+        for (const std::string& bus : buses)
+        {
+            std::ifstream in(root + "/" + bus + "/information");
+            std::map<std::string, std::string> fields;
+            std::string line;
+            while (std::getline(in, line))
+            {
+                const std::size_t colon = line.find(':');
+                if (colon != std::string::npos)
+                {
+                    fields[line.substr(0, colon)] = line.substr(colon + 1);
+                }
+            }
+            std::string theirs = trim(fields["GPU UUID"]);
+            if (theirs.rfind("GPU-", 0) == 0)
+            {
+                theirs = theirs.substr(4);
+            }
+            if (not theirs.empty() and lower_hex(theirs) == want and fields.contains("Device Minor"))
+            {
+                return std::stoi(trim(fields["Device Minor"]));
+            }
+        }
+        return std::nullopt;
+    }
+
+    namespace
+    {
+        double seconds_now()
+        {
+            return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        }
+
+        struct KnownReader
+        {
+            Reader token;
+            std::optional<std::map<std::string, std::string>> backends;
+            std::optional<bool> importable;  // none: not decided yet (not in the registry)
+            int device_id = 0;               // its CUDA ordinal (the descriptor's device_id)
+            double seen = seconds_now();
+            double checked = -1e9;
+            bool said = false;
+
+            bool wants_cuda() const { return backends and backends->contains(kCudaBackend); }
+            bool cpu_only() const { return token.backends == std::string(kCpuBackends); }
+        };
+    }  // namespace
+
+    struct Link::Impl
+    {
+        std::string topic;
+        int device = 0;
+        std::string socket_dir, shm_dir;
+        std::uint32_t max_blocks = kMaxBlocks;
+        double hold_limit_s = kHoldLimitS, min_reuse_s = kMinReuseS;
+        mutable std::mutex mutex;  // readers, notes
+        std::map<std::string, KnownReader> readers;
+        std::vector<Note> notes;
+        mutable std::mutex minor_mutex;  // own_minor (importable runs inside plan's lock and alone)
+        mutable std::optional<int> own_minor;
+        std::unique_ptr<ExportPool> pool;  // made for the first reader that gets descriptors (the publisher's thread)
+        std::atomic<std::uint64_t> sent{0};
+        bool said_drop = false;
+
+        void say(KnownReader& reader, const std::string& text)
+        {
+            if (not reader.said)
+            {
+                reader.said = true;
+                notes.push_back({true, topic + ": ROS reader " + reader.token.node +
+                                           " accepts CUDA buffers, gets the CPU form: " + text});
+            }
+        }
+
+        void decide(KnownReader& reader, double now, const Link& link)
+        {
+            if (reader.importable or now - reader.checked < kRecheckS)
+            {
+                return;
+            }
+            reader.checked = now;
+            const std::optional<RegistryEntry> entry = registry_lookup(shm_dir, reader.token.gid);
+            if (not entry)
+            {
+                if (now - reader.seen > kUnknownS)
+                {
+                    say(reader, "it is not in the CUDA buffer backend's registry in " + shm_dir +
+                                    " (another host, another /dev/shm, or no backend plugin)");
+                }
+                return;
+            }
+            std::pair<bool, std::string> decision;
+            if (reader.token.keep_all)
+            {
+                decision = {false, "it keeps all messages (KEEP_ALL), more than any pool of blocks holds"};
+            }
+            else
+            {
+                decision = link.importable(*entry);
+            }
+            reader.importable = decision.first;
+            if (decision.first)
+            {
+                reader.device_id = entry->device_id;
+                notes.push_back({false, topic + ": ROS reader " + reader.token.node + " gets the frames as CUDA buffers"});
+            }
+            else
+            {
+                say(reader, decision.second);
+            }
+        }
+    };
+
+    Link::Link(std::string topic, int device, std::string socket_dir, std::string shm_dir, std::uint32_t max_blocks,
+               double hold_limit_s, double min_reuse_s)
+        : impl_(std::make_unique<Impl>())
+    {
+        for (const auto& [what, path, env] : {std::tuple{"sockets", &socket_dir, kSocketsEnv},
+                                              std::tuple{"shm", &shm_dir, kShmEnv}})
+        {
+            struct stat s{};
+            if (::stat(path->c_str(), &s) != 0 or not S_ISDIR(s.st_mode))
+            {
+                throw std::invalid_argument("GPU link to ROS readers: " + *path + " (" + what + ") is no directory (" +
+                                            env + ")");
+            }
+        }
+        Impl& m = *impl_;
+        m.topic = std::move(topic);
+        m.device = device;
+        m.socket_dir = std::move(socket_dir);
+        m.shm_dir = std::move(shm_dir);
+        m.max_blocks = max_blocks;
+        m.hold_limit_s = hold_limit_s;
+        m.min_reuse_s = min_reuse_s;
+    }
+
+    Link::~Link() = default;
+
+    void Link::add(const std::string& token_key, const Reader& reader)
+    {
+        KnownReader known;
+        known.token = reader;
+        if (reader.backends)
+        {
+            known.backends = backends_of(*reader.backends);
+        }
+        std::lock_guard lock(impl_->mutex);
+        impl_->readers.insert_or_assign(token_key, std::move(known));
+    }
+
+    std::optional<std::array<std::uint8_t, 16>> Link::remove(const std::string& token_key)
+    {
+        std::lock_guard lock(impl_->mutex);
+        const auto found = impl_->readers.find(token_key);
+        if (found == impl_->readers.end())
+        {
+            return std::nullopt;
+        }
+        const auto gid = found->second.token.gid;
+        impl_->readers.erase(found);
+        return gid;
+    }
+
+    std::optional<Plan> Link::plan()
+    {
+        Impl& m = *impl_;
+        const double now = seconds_now();
+        std::lock_guard lock(m.mutex);
+        bool any_cuda = false;
+        for (const auto& [key, r] : m.readers)
+        {
+            any_cuda = any_cuda or r.wants_cuda();
+            if (not r.backends)
+            {
+                return std::nullopt;  // Jazzy or an older xblick: the key, for everyone
+            }
+        }
+        if (not any_cuda)
+        {
+            return std::nullopt;
+        }
+        Plan plan;
+        for (auto& [key, r] : m.readers)
+        {
+            if (r.wants_cuda())
+            {
+                m.decide(r, now, *this);
+            }
+        }
+        for (const auto& [key, r] : m.readers)
+        {
+            if (r.wants_cuda() and r.importable.value_or(false))
+            {
+                plan.gpu.emplace_back(r.token.gid, r.device_id);
+                plan.depth = std::max(plan.depth, static_cast<std::uint32_t>(std::max(r.token.depth, 0)));
+            }
+            else if (r.cpu_only())
+            {
+                plan.cpu_group = true;
+            }
+            else
+            {
+                plan.cpu.push_back(r.token.gid);
+            }
+        }
+        if (plan.gpu.empty())
+        {
+            return std::nullopt;
+        }
+        return plan;
+    }
+
+    std::vector<std::pair<std::array<std::uint8_t, 16>, std::vector<std::uint8_t>>> Link::gpu_messages(
+        const Plan& plan, CudaRingWriter& ring, std::uint32_t slot, std::uint64_t nbytes, const ImageHeader& header)
+    {
+        Impl& m = *impl_;
+        if (not m.pool)
+        {
+            m.pool = std::make_unique<ExportPool>(m.device, m.socket_dir, m.shm_dir, m.max_blocks, m.hold_limit_s,
+                                                  m.min_reuse_s);
+        }
+        const int index = m.pool->acquire(nbytes, plan.depth);
+        if (index < 0)
+        {
+            if (not m.said_drop)
+            {
+                m.said_drop = true;
+                std::ostringstream text;
+                text << m.topic << ": every block of the GPU link is held or queued by ROS readers; frames for them "
+                     << "are dropped until one is free (hold limit " << m.hold_limit_s << " s)";
+                std::lock_guard lock(m.mutex);
+                m.notes.push_back({true, text.str()});
+            }
+            return {};
+        }
+        ring.copy_slot(slot, m.pool->block_ptr(index), nbytes);
+        Descriptor descriptor = m.pool->publish(index, nbytes);
+        std::map<int, std::vector<std::uint8_t>> payloads;  // per reader's ordinal
+        std::vector<std::pair<std::array<std::uint8_t, 16>, std::vector<std::uint8_t>>> out;
+        for (const auto& [gid, device_id] : plan.gpu)
+        {
+            auto found = payloads.find(device_id);
+            if (found == payloads.end())
+            {
+                descriptor.device_id = device_id;
+                found = payloads.emplace(device_id, image_payload(header, descriptor)).first;
+            }
+            out.emplace_back(gid, found->second);
+        }
+        m.sent += out.size();
+        return out;
+    }
+
+    std::vector<Note> Link::notes()
+    {
+        std::lock_guard lock(impl_->mutex);
+        return std::exchange(impl_->notes, {});
+    }
+
+    LinkStats Link::stats() const
+    {
+        const Impl& m = *impl_;
+        LinkStats s;
+        s.sent = m.sent.load();
+        if (m.pool)
+        {
+            s.dropped = m.pool->dropped();
+            s.expired = m.pool->expired();
+            s.blocks = m.pool->blocks();
+            s.accepts = m.pool->accepts();
+            s.refused = m.pool->refused();
+        }
+        return s;
+    }
+
+    const std::string& Link::socket_dir() const { return impl_->socket_dir; }
+    const std::string& Link::shm_dir() const { return impl_->shm_dir; }
+
+    std::pair<bool, std::string> Link::importable(const RegistryEntry& entry) const
+    {
+        const Impl& m = *impl_;
+        if (entry.entity_type != kSubscription)
+        {
+            return {false, "its registry entry is no subscription"};
+        }
+        if (entry.uid != ::getuid())
+        {
+            return {false, "it runs as Linux user " + std::to_string(entry.uid) + ", this program as " +
+                               std::to_string(::getuid())};
+        }
+        if (not entry.ipc_capable)
+        {
+            return {false, "its backend cannot import CUDA buffers (no IPC-capable memory pool)"};
+        }
+        const int pid = entry.pid();
+        std::set<int> theirs;
+        std::map<std::string, std::string> env;
+        try
+        {
+            if (not maps_registry(pid, registry_name()))
+            {
+                throw RingError("the process there does not map the registry");
+            }
+            theirs = gpu_minors(std::to_string(pid));
+            env = environment_of(pid);
+        }
+        catch (const RingError& error)
+        {
+            return {false, "its process " + std::to_string(pid) + " cannot be seen from here (" + error.what() +
+                               "): it needs this program's pid namespace"};
+        }
+        std::optional<int> own;
+        {
+            std::lock_guard lock(m.minor_mutex);
+            if (not m.own_minor)
+            {
+                m.own_minor = minor_of(cuda_device_uuid(m.device));
+            }
+            own = m.own_minor;
+        }
+        if (not own)
+        {
+            return {false, "this program cannot tell its own GPU's device file (/proc/driver/nvidia/gpus)"};
+        }
+        if (theirs.size() == 1)
+        {
+            if (*theirs.begin() != *own)
+            {
+                return {false, "it uses GPU /dev/nvidia" + std::to_string(*theirs.begin()) + ", this program /dev/nvidia" +
+                                   std::to_string(*own)};
+            }
+            return {true, ""};
+        }
+        bool same_numbering = theirs == gpu_minors("self");
+        for (const char* name : kGpuEnv)
+        {
+            const char* mine = std::getenv(name);
+            const auto found = env.find(name);
+            const bool theirs_set = found != env.end();
+            same_numbering = same_numbering and theirs_set == (mine != nullptr) and
+                             (not theirs_set or found->second == mine);
+        }
+        if (not same_numbering)
+        {
+            return {false, "it sees several GPUs, numbered otherwise than here (its CUDA_VISIBLE_DEVICES and "
+                           "CUDA_DEVICE_ORDER, its GPUs): the backend compares CUDA ordinals only"};
+        }
+        if (entry.device_id != m.device)
+        {
+            return {false, "it uses CUDA device " + std::to_string(entry.device_id) + ", this program " +
+                               std::to_string(m.device)};
+        }
+        return {true, ""};
     }
 }  // namespace xblick::ros_cuda

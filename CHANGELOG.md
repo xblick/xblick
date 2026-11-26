@@ -25,14 +25,14 @@ streams, transforms and parameters, and it reads theirs.
 - `CountedPublisher.ros_matched`: a ROS subscriber of the key's mirror (`matched` stays our key's).
 - Readers of ROS topics: transport `ros` for images and clouds (`xblick hz`, `xblick snapshot`), `DetectionSubscriber(ros_type=...)`, `TransformBuffer(ros=True)`.
 - ROS 2 Lyrical (`rmw_zenoh_cpp` 0.10.6 or newer): readers of images, compressed images and clouds also take them from Lyrical publishers, which send these types on keys of their own (Python and C++).
-- GPU frames to ROS 2 Lyrical readers that accept CUDA buffers (`cuda_buffer_backend`, experimental upstream), Isaac ROS nodes among them: a Python `CameraPublisher` with `cuda_device` sends them a CUDA buffer on the same PC, user and GPU, the other readers get the bytes as before; `XBLICK_ROS_CUDA=0` turns it off.
+- GPU frames to ROS 2 Lyrical readers that accept CUDA buffers (`cuda_buffer_backend`, experimental upstream), Isaac ROS nodes among them: a `CameraPublisher` with `cuda_device` (Python and C++) sends them a CUDA buffer on the same PC, user and GPU, the other readers get the bytes as before; `XBLICK_ROS_CUDA=0` turns it off.
 - The C++ API and programs (`xblick-cpp-camera`, `xblick-cpp-probe`, `xblick-points`) take part the same way: the options in `Options::add_session_options`, `SessionOptions::ros`, `Transport::Ros`.
 - `--no-ros` and `XBLICK_ROS=0` (only 0 and 1 are taken) turn the part in ROS 2 off; `--ros-clock KEY` sends a clock key to ROS's `/clock` for `use_sim_time`.
 - A fixed frame that another program sends on `/tf_static` with another parent or transform is one error line; a second ROS node of the program's name is one warning line.
 - `_core.ros_gid`: the gid of a ROS entity as `rmw_zenoh` makes it (XXH3-128 of its token), used by both sides.
 - The guide [Durchblick and ROS 2](docs/integrations/ros2.md) and the protocol's section on `rmw_zenoh`.
-- ROS cameras as ROS publishes them: a subscriber name with a leading `/` is a ROS topic of any name (`/image_raw`, `/resize/image`), its camera_info beside it or named; `compressed` reads image_transport's `<topic>/compressed` (Python, `xblick hz`, `xblick snapshot`).
-- With `auto`, a stream that only a ROS node publishes is read from `/<stream>/image_raw`, never our programs' ROS copies; `RGBDInputs` pairs a ROS camera's colour and depth, `CameraSpec` takes ROS topics in `color=` and `depth=` (Python).
+- ROS cameras as ROS publishes them: a subscriber name with a leading `/` is a ROS topic of any name (`/image_raw`, `/resize/image`), its camera_info beside it or named; `compressed` reads image_transport's `<topic>/compressed` (Python and C++, `xblick hz`, `xblick snapshot`).
+- With `auto`, a stream that only a ROS node publishes is read from `/<stream>/image_raw`, never our programs' ROS copies (Python and C++); `RGBDInputs` pairs a ROS camera's colour and depth, `CameraSpec` takes ROS topics in `color=` and `depth=` (Python).
 - `xblick list` shows ROS's image, compressed image, point cloud and camera info topics, marked `ros`.
 - `xblick play` plays rosbag2 bags in the MCAP storage: image_transport's topics as streams, every other topic on the key `/a/b` -> `a/b`; the sqlite3 storage is refused with a line.
 - Recordings also hold ROS's global `/tf_static`, so `ros2 bag play` feeds tf2; `xblick play` leaves that copy out.

@@ -8,6 +8,7 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
@@ -553,4 +554,153 @@ NB_MODULE(_core, m)
         .def_prop_ro("device", &rc::ExportPool::device)
         .def_prop_ro("socket_dir", &rc::ExportPool::socket_dir)
         .def_prop_ro("shm_dir", &rc::ExportPool::shm_dir);
+
+    // the readers, decisions and pool of one topic (ros_cuda.hpp Link); the Zenoh part is ros_cuda.py's
+    const auto gid_bytes = [](const std::array<std::uint8_t, 16>& gid) {
+        return nb::bytes(reinterpret_cast<const char*>(gid.data()), gid.size());
+    };
+    const auto gid_of = [](const nb::bytes& gid) {
+        if (gid.size() != 16)
+        {
+            throw nb::value_error("a gid has 16 bytes");
+        }
+        std::array<std::uint8_t, 16> out{};
+        std::memcpy(out.data(), gid.c_str(), 16);
+        return out;
+    };
+    m.attr("ROS_CUDA_ENABLE_ENV") = rc::kEnableEnv;
+    m.attr("ROS_CUDA_SOCKETS_ENV") = rc::kSocketsEnv;
+    m.attr("ROS_CUDA_SHM_ENV") = rc::kShmEnv;
+    m.attr("ROS_CUDA_RECHECK_S") = rc::kRecheckS;
+    m.attr("ROS_CUDA_UNKNOWN_S") = rc::kUnknownS;
+    m.def("ros_cuda_enabled_by_environment", &rc::enabled_by_environment,
+          "False when XBLICK_ROS_CUDA is 0, True when it is 1 or unset; ValueError otherwise");
+    m.def("ros_cuda_socket_dir_from_environment", &rc::socket_dir_from_environment);
+    m.def("ros_cuda_shm_dir_from_environment", &rc::shm_dir_from_environment);
+    m.def(
+        "ros_cuda_backends_of",
+        [](const std::string& part) {
+            nb::dict out;
+            for (const auto& [name, meta] : rc::backends_of(part))
+            {
+                out[name.c_str()] = meta;
+            }
+            return out;
+        },
+        "part"_a, "the backends of a token's 14th part: backends:cpu:;cuda: -> {cpu: '', cuda: ''}");
+    m.def(
+        "ros_cuda_gpu_minors",
+        [](const std::string& pid) {
+            nb::set out;
+            for (int minor : rc::gpu_minors(pid))
+            {
+                out.add(minor);
+            }
+            return out;
+        },
+        "pid"_a, "the GPUs (minors of /dev/nvidia<N>) a process has open ('self': this one)");
+    m.def("ros_cuda_minor_of", &rc::minor_of, "uuid"_a);
+    nb::class_<rc::Plan>(m, "RosCudaPlan")
+        .def_prop_ro("gpu",
+                     [gid_bytes](const rc::Plan& p) {
+                         nb::list out;
+                         for (const auto& [gid, device_id] : p.gpu)
+                         {
+                             out.append(nb::make_tuple(gid_bytes(gid), device_id));
+                         }
+                         return out;
+                     })
+        .def_ro("cpu_group", &rc::Plan::cpu_group)
+        .def_prop_ro("cpu",
+                     [gid_bytes](const rc::Plan& p) {
+                         nb::list out;
+                         for (const auto& gid : p.cpu)
+                         {
+                             out.append(gid_bytes(gid));
+                         }
+                         return out;
+                     })
+        .def_ro("depth", &rc::Plan::depth)
+        .def_prop_ro("needs_cpu", &rc::Plan::needs_cpu);
+    nb::class_<rc::Link>(m, "RosCudaLink")
+        .def(nb::init<std::string, int, std::string, std::string, std::uint32_t, double, double>(), "topic"_a,
+             "device"_a, "socket_dir"_a, "shm_dir"_a, "max_blocks"_a = rc::kMaxBlocks,
+             "hold_limit_s"_a = rc::kHoldLimitS, "min_reuse_s"_a = rc::kMinReuseS)
+        .def(
+            "add",
+            [gid_of](rc::Link& l, const std::string& key, const nb::bytes& gid, std::optional<std::string> backends,
+                     bool keep_all, int depth, const std::string& node) {
+                l.add(key, rc::Reader{gid_of(gid), std::move(backends), keep_all, depth, node});
+            },
+            "key"_a, "gid"_a, "backends"_a.none(), "keep_all"_a, "depth"_a, "node"_a,
+            "a reader's token came (again: decided anew)")
+        .def(
+            "remove",
+            [gid_bytes](rc::Link& l, const std::string& key) -> std::optional<nb::bytes> {
+                const auto gid = l.remove(key);
+                return gid ? std::optional<nb::bytes>(gid_bytes(*gid)) : std::nullopt;
+            },
+            "key"_a, "a reader's token went: its gid, or None")
+        .def("plan", &rc::Link::plan, nb::call_guard<nb::gil_scoped_release>(),
+             "where the next message goes (RosCudaPlan), or None: on the topic's key as before")
+        .def(
+            "gpu_messages",
+            [gid_bytes](rc::Link& l, const rc::Plan& plan, xblick::CudaRingWriter& ring, std::uint32_t slot,
+                        std::uint64_t nbytes, std::int32_t sec, std::uint32_t nanosec, const std::string& frame_id,
+                        std::uint32_t height, std::uint32_t width, const std::string& encoding, std::uint32_t step) {
+                std::vector<std::pair<std::array<std::uint8_t, 16>, std::vector<std::uint8_t>>> messages;
+                {
+                    nb::gil_scoped_release release;
+                    messages = l.gpu_messages(plan, ring, slot, nbytes,
+                                              {sec, nanosec, frame_id, height, width, encoding, 0, step});
+                }
+                nb::list out;
+                for (const auto& [gid, payload] : messages)
+                {
+                    out.append(nb::make_tuple(gid_bytes(gid), nb::bytes(reinterpret_cast<const char*>(payload.data()),
+                                                                        payload.size())));
+                }
+                return out;
+            },
+            "plan"_a, "ring"_a, "slot"_a, "nbytes"_a, "sec"_a, "nanosec"_a, "frame_id"_a, "height"_a, "width"_a,
+            "encoding"_a, "step"_a,
+            "the frame in a ring slot into a free block, [(gid, descriptor message)] for the plan's GPU readers")
+        .def(
+            "notes",
+            [](rc::Link& l) {
+                nb::list out;
+                for (const rc::Note& n : l.notes())
+                {
+                    out.append(nb::make_tuple(n.warning, n.text));
+                }
+                return out;
+            },
+            "the lines to say since the last call: [(warning, text)]")
+        .def("stats",
+             [](const rc::Link& l) {
+                 const rc::LinkStats s = l.stats();
+                 nb::dict out;
+                 out["sent"] = s.sent;
+                 out["dropped"] = s.dropped;
+                 out["expired"] = s.expired;
+                 out["blocks"] = s.blocks;
+                 out["accepts"] = s.accepts;
+                 out["refused"] = s.refused;
+                 return out;
+             })
+        .def(
+            "importable",
+            [](const rc::Link& l, const nb::dict& e) {
+                rc::RegistryEntry entry;
+                entry.instance_id = static_cast<std::uint64_t>(nb::cast<std::int64_t>(e["pid"])) << 32;
+                entry.entity_type = nb::cast<std::uint8_t>(e["entity_type"]);
+                entry.device_id = nb::cast<std::int32_t>(e["device_id"]);
+                entry.uid = nb::cast<std::uint32_t>(e["uid"]);
+                entry.ipc_capable = nb::cast<bool>(e["ipc_capable"]);
+                entry.active = true;
+                return l.importable(entry);
+            },
+            "entry"_a, "(whether a reader of this registry entry can import our blocks, why not)")
+        .def_prop_ro("socket_dir", &rc::Link::socket_dir)
+        .def_prop_ro("shm_dir", &rc::Link::shm_dir);
 }

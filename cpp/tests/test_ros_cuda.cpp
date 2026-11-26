@@ -1,7 +1,12 @@
 // ros_cuda.hpp: the descriptor message against one cuda_buffer_backend 0.1.2 sent (ROS 2 Lyrical, rmw_zenoh_cpp
-// 0.10.6, captured on <key>/_buf/<gid>; the same bytes as in tests/test_ros_cuda.py), and the registry without one.
+// 0.10.6, captured on <key>/_buf/<gid>; the same bytes as in tests/test_ros_cuda.py), the registry without one, and
+// the link without a reader in a registry (backends part, no plan, no pool).
 #include <cstdio>
 #include <cstring>
+#include <optional>
+#include <stdexcept>
+
+#include <unistd.h>
 #include <string>
 #include <vector>
 
@@ -50,6 +55,62 @@ int main()
         std::printf("FAIL: a registry where there is none\n");
         return 1;
     }
+    namespace rc = xblick::ros_cuda;
+    // the backends part and the plans without a registry entry: nothing goes to the buffer keys yet
+    const auto backends = rc::backends_of("backends:cpu:;cuda:meta");
+    if (backends.size() != 2 or backends.at("cpu") != "" or backends.at("cuda") != "meta")
+    {
+        std::printf("FAIL: backends_of\n");
+        return 1;
+    }
+    try
+    {
+        rc::Link missing("/t/image_raw", 0, "/nonexistent-xblick-test", "/tmp");
+        std::printf("FAIL: a link with a sockets directory that is none\n");
+        return 1;
+    }
+    catch (const std::invalid_argument& e)
+    {
+        if (std::string(e.what()).find("XBLICK_ROS_CUDA_SOCKETS") == std::string::npos)
+        {
+            std::printf("FAIL: %s\n", e.what());
+            return 1;
+        }
+    }
+    char empty[] = "/tmp/xblick-test-link-XXXXXX";  // a directory without a registry, removed below
+    if (::mkdtemp(empty) == nullptr)
+    {
+        std::printf("FAIL: mkdtemp\n");
+        return 1;
+    }
+    std::optional<rc::Link> made;
+    made.emplace("/t/image_raw", 0, empty, empty);
+    rc::Link& link = *made;
+    link.add("cpu", rc::Reader{{1}, std::string("backends:cpu:"), false, 1, "/cpu"});
+    if (link.plan())
+    {
+        std::printf("FAIL: a plan without a reader that accepts CUDA buffers\n");
+        return 1;
+    }
+    link.add("gpu", rc::Reader{{2}, std::string("backends:cuda:"), false, 10, "/gpu"});
+    if (link.plan())  // not in the registry (none in that directory): the CPU form on the key
+    {
+        std::printf("FAIL: a plan for a reader that is in no registry\n");
+        return 1;
+    }
+    if (link.remove("gpu") != std::array<std::uint8_t, 16>{2} or link.remove("gpu"))
+    {
+        std::printf("FAIL: remove\n");
+        return 1;
+    }
+    const auto stats = link.stats();
+    if (stats.sent != 0 or stats.blocks != 0)
+    {
+        std::printf("FAIL: a pool before the first GPU reader\n");
+        return 1;
+    }
+    made.reset();
+    ::rmdir(empty);
     std::printf("ok\n");
     return 0;
 }

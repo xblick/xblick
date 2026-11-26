@@ -300,7 +300,7 @@ def test_python_to_cpp(transport, expected):
     for r in records:
         assert r["transport"] == expected and r["encoding"] == "rgb8" and r["source"] == "py"
         assert r["checksum"] == checksum(pattern("rgb8", r["seq"])), r
-    assert any(r["camera_info"] == {"width": W, "fx": 500.0} for r in records)
+    assert any((r["camera_info"] or {}).items() >= {"width": W, "fx": 500.0}.items() for r in records)
 
 
 @pytest.mark.parametrize("transport", ["compressed", "shm"])

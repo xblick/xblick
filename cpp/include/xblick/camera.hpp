@@ -342,6 +342,9 @@ namespace xblick
                                               std::optional<std::int64_t> stamp_ns = {});
         // What <base>/info answers (JSON).
         std::string info_record() const;
+        // The GPU link's counters (ros.hpp GpuLink, ros_cuda.hpp): none without the link (no cuda_device, no part in
+        // ROS 2, or XBLICK_ROS_CUDA=0).
+        std::optional<ros_cuda::LinkStats> ros_gpu_stats() const;
 
         const std::string& base() const { return base_; }
 
@@ -499,9 +502,14 @@ namespace xblick
         Raw,         // sensor_msgs/Image
         Shm,         // host ring, same host only
         Cuda,        // CUDA ring, same host only; frames in device memory
-        // The stream's ROS 2 topic (/<base>/image_raw, a cloud's /<base>/cloud) of a ROS publisher, for a session
-        // with --ros (ros.hpp); never chosen by Auto. Its frames carry no seq, source or publish time.
+        // A ROS 2 topic of a ROS publisher, for a session in ROS 2 (ros.hpp): the stream's (/<base>/image_raw, a
+        // cloud's /<base>/cloud), or the topic a base with a leading '/' names. Auto takes it for a ROS name, and for
+        // a stream of ours that only a ROS publisher of another program offers. Its frames carry no seq, source or
+        // publish time.
         Ros,
+        // image_transport's compressed topic (<image topic>/compressed) of a ROS name (Transport::Compressed of a
+        // base with a leading '/'), or the one Auto takes when a ROS publisher offers only that. Not to be asked for.
+        RosCompressed,
     };
 
     const char* to_string(Transport transport);
@@ -519,6 +527,9 @@ namespace xblick
         Transport remote = Transport::Compressed;  // what Auto takes for a publisher on another host (or Raw)
         bool copy = true;                          // false: shm/cuda frames are views into the ring (check is_valid)
         bool camera_info = false;                  // also receive the stream's CameraInfo
+        // A ROS topic (/cam/calibration) to read the CameraInfo from while a ROS form is read (camera_info then on);
+        // empty: the stream's, or for a ROS form image_transport's beside the image topic (ros::camera_info_topic).
+        std::string camera_info_topic{};
         // At most so many frames a second, the newest; the others are skipped before they are decoded or read from
         // their ring (skipped_max_hz()). By their stamps, so that a camera's streams take the same frames. 0: all.
         double max_hz = 0.0;

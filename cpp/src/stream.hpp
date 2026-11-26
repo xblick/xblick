@@ -78,6 +78,10 @@ namespace xblick::detail
     // that, as long again the new route's samples are compared with the newest frame kept, and a stamp at most as
     // far behind it is the same frame.
     inline constexpr std::chrono::milliseconds kHandover{2000};
+    // A subscription that reads or looks for a ROS form and has no sample this long looks at ROS's graph once (as
+    // Python's WAIT_HINT_S); Auto on a ROS name looks at the graph this often besides when it changes.
+    inline constexpr std::chrono::milliseconds kWaitHint{5000};
+    inline constexpr std::chrono::milliseconds kRosRecheck{1000};
 
     // The newest sample of a stream, kept as received; take() hands it out once. The samples come by routes (a
     // subscription's subscribers, numbered); those of `route` are kept. When a subscription changes its transport
@@ -131,12 +135,39 @@ namespace xblick::detail
         void leave_old_locked();  // with `mutex` held
     };
 
-    // A ROS subscription (transport Ros, a session with --ros) to the ROS topic of our key `key`: each sample into
-    // `latest` (route `route`) as one of ours of `type` (its encoding), without our attachment (no seq, source or
-    // publish time). std::invalid_argument for a session without --ros.
-    std::unique_ptr<ros::Subscriber> ros_subscriber(zenoh::Session& session, const std::string& key,
+    // A ROS subscription (a ROS form, a session in ROS 2) to `topic`: each sample into `latest` (route `route`) as
+    // one of ours of `type` (its encoding), by `transport`, without our attachment (no seq, source or publish time).
+    // std::invalid_argument for a session that takes no part in ROS 2.
+    std::unique_ptr<ros::Subscriber> ros_subscriber(zenoh::Session& session, const std::string& topic,
                                                     const protocol::MessageType& type, std::shared_ptr<Latest> latest,
-                                                    int route);
+                                                    int route, Transport transport = Transport::Ros);
+
+    // A form of a stream on ROS: its transport (Ros, RosCompressed), its topic and message type.
+    struct RosForm
+    {
+        Transport transport;
+        std::string topic;
+        const protocol::MessageType* type;
+    };
+    bool is_ros_form(Transport t);
+
+    // What a subscriber reads, as Python's Subscription takes its arguments: a base with a leading '/' is a ROS topic
+    // (ros_topic; a session in ROS 2), read by Auto, Ros (and Raw: the topic itself) or, with `compressed_form`,
+    // Compressed (image_transport's compressed topic); `forms` the ROS forms in the order Auto takes them (none
+    // without a part in ROS 2, or for a base that is no ROS name, which then refuses a ROS form). std::invalid_argument
+    // for a ROS name without a part in ROS 2, a transport a ROS name has not, Ros without a part in ROS 2.
+    struct RosSetup
+    {
+        std::string base;
+        Transport transport;
+        bool ros_topic = false;
+        std::vector<RosForm> forms;
+    };
+    // `our_suffix` and `type`: the stream's key below its base and type on ROS (image_raw, Image); `compressed_type`:
+    // the type of image_transport's compressed topic, null for a kind without one (clouds).
+    RosSetup ros_setup(zenoh::Session& session, const std::string& base, Transport transport, bool copy,
+                       std::string_view our_suffix, const protocol::MessageType& type,
+                       const protocol::MessageType* compressed_type);
 
     // The header stamp of a stream's sample, not decoded (every representation starts with std_msgs/Header).
     std::int64_t stamp_of(const Item& item);
@@ -158,14 +189,23 @@ namespace xblick::detail
     // "kind" must be `kind`): `local` on a publisher's host, `remote` elsewhere. The thread chooses again whenever a
     // publisher of the stream comes or goes (their liveliness tokens), so the order in which programs start does not
     // matter. While the subscription moves to another transport it reads both routes and hands out each frame once.
+    //
+    // With ROS forms (ros_setup; a session in ROS 2), Auto reads a stream of ours that no publisher of ours answers
+    // from its ROS form when a ROS publisher of another program offers it (never our programs' ROS copies), and moves
+    // to ours once one answers. A ROS name (ros_topic) is read from ROS's publishers only: Auto takes the first form
+    // its publishers offer. After kWaitHint without a sample of a ROS form, ROS's graph is looked at once: a topic of
+    // another type (ProtocolError), or a ROS name that is no topic but has topics of the kind below it
+    // (std::invalid_argument naming them), is the error take() throws; nothing is chosen in its place.
     class Subscription
     {
     public:
         using Suffix = std::function<std::string_view(Transport)>;
+        using Used = std::function<void(Transport)>;  // called after the subscription took a transport
 
         Subscription(zenoh::Session& session, std::string base, std::string kind, Transport requested, Transport local,
                      Transport remote, Suffix suffix, std::optional<int> cuda_device = std::nullopt,
-                     std::optional<Transport> remote_else = std::nullopt);  // where a source lacks `remote`
+                     std::optional<Transport> remote_else = std::nullopt,  // where a source lacks `remote`
+                     std::vector<RosForm> ros_forms = {}, bool ros_topic = false, Used used = {});
         ~Subscription();
         Subscription(const Subscription&) = delete;
         Subscription& operator=(const Subscription&) = delete;
@@ -198,12 +238,20 @@ namespace xblick::detail
         std::uint64_t overwritten() const;
         const std::string& base() const { return base_; }
         const std::string& host() const { return host_; }
+        const std::vector<RosForm>& ros_forms() const { return ros_forms_; }
+        bool ros_topic() const { return ros_topic_; }
+        // The publishers in ROS's graph (of `topic` or all) once the graph is made (for a ROS name or a ROS transport
+        // at the start, else at Auto's first need); none before.
+        std::vector<ros::Token> ros_publishers(const std::optional<std::string>& topic = std::nullopt) const;
+        std::chrono::steady_clock::time_point started() const { return started_; }
 
     private:
         std::string key_of(Transport t, std::string_view gpu) const;
         void use(Transport t, const std::string& gpu);
         void choose();
         void recheck();
+        bool choose_ros(bool foreign_only, const std::string& why);
+        void check_ros();
 
         zenoh::Session& session_;
         std::string base_;
@@ -217,8 +265,15 @@ namespace xblick::detail
         mutable std::mutex mutex_;
         std::condition_variable chosen_cv_;
         std::optional<Transport> transport_;
+        std::vector<RosForm> ros_forms_;
+        bool ros_topic_ = false;
+        Used used_;
+        const std::chrono::steady_clock::time_point started_ = std::chrono::steady_clock::now();
+        std::atomic<bool> ros_checked_{false};  // the graph looked at, once, for a ROS form that brought nothing
+        std::shared_ptr<ros::Graph> graph_;     // with mutex_
+        int ros_domain_ = 0;
         std::optional<zenoh::Subscriber<void>> subscriber_;
-        std::unique_ptr<ros::Subscriber> ros_subscriber_;  // transport Ros
+        std::unique_ptr<ros::Subscriber> ros_subscriber_;  // a ROS form
         std::optional<zenoh::Subscriber<void>> alive_;  // the publishers' liveliness tokens
         std::optional<zenoh::LivelinessToken> want_;  // asks this host's relay for the stream (chooser's thread)
         std::optional<std::pair<Transport, std::string>> using_;  // transport and GPU of the subscriber in use

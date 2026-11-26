@@ -27,6 +27,9 @@
 // --jpeg-frames: like an MJPEG camera, every frame also exists as a JPEG (written here, with the comment segment
 // "xblick-test-jpeg <seq>" so that a subscriber can tell these bytes from a JPEG the publisher wrote); it is
 // decoded (here: the pattern itself) only if somebody takes the pixels.
+// --check-pattern: frame n has byte i = (i * 13 + n) & 0xFF and frame_id "xb:<n>" (tests/ros/cuda_check checks it on
+// the GPU). With --cuda-device and ROS 2, the GPU link's counters (CameraPublisher::ros_gpu_stats) go to stderr at the
+// end as one line "xblick-cpp-camera: gpu link {...}".
 // --connect, --listen, --zenoh-mode peer|client: the Zenoh session (SessionOptions); none of them: the PC's router.
 #include <atomic>
 #include <chrono>
@@ -99,6 +102,7 @@ int main(int argc, char** argv)
             args.flag("origin-seq") ? std::optional<std::int64_t>(std::stoll(args.get("origin-seq", "0"))) : std::nullopt;
         const bool device_frames = args.flag("device-frames");
         const bool jpeg_frames = args.flag("jpeg-frames");
+        const bool check_pattern = args.flag("check-pattern");
         const double fps = std::stod(args.get("fps", "30"));
         const double seconds = std::stod(args.get("seconds", "0"));
         if (args.flag("points"))
@@ -254,7 +258,29 @@ int main(int argc, char** argv)
                     segment.insert(segment.end(), comment.begin(), comment.end());
                     jpeg.insert(jpeg.begin() + 2, segment.begin(), segment.end());  // after the start marker
                 }
-                if (origin_seq)
+                if (check_pattern)
+                {
+                    std::vector<std::uint8_t> bytes(frame.size());
+                    for (std::size_t i = 0; i < bytes.size(); ++i)
+                    {
+                        bytes[i] = static_cast<std::uint8_t>((i * 13 + seq) & 0xFF);
+                    }
+                    const Origin origin{Header{Time::from_ns(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                 std::chrono::system_clock::now().time_since_epoch())
+                                                                 .count()),
+                                               "xb:" + std::to_string(seq)},
+                                        static_cast<std::int64_t>(seq), options.source};
+                    if (device)
+                    {
+                        device->upload(bytes.data());
+                        camera.publish(DeviceImage{device->ptr(), height, width, 0}, origin);
+                    }
+                    else
+                    {
+                        camera.publish(HostImage{bytes.data(), height, width, 0}, origin);
+                    }
+                }
+                else if (origin_seq)
                 {
                     const Origin origin{Header{Time::from_ns(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                                  std::chrono::system_clock::now().time_since_epoch())
@@ -290,6 +316,12 @@ int main(int argc, char** argv)
                 --seq;  // frames are counted only when published
             }
             std::this_thread::sleep_until(next);
+        }
+        if (const auto link = camera.ros_gpu_stats())
+        {
+            std::cerr << "xblick-cpp-camera: gpu link {\"sent\":" << link->sent << ",\"dropped\":" << link->dropped
+                      << ",\"expired\":" << link->expired << ",\"blocks\":" << link->blocks
+                      << ",\"accepts\":" << link->accepts << ",\"refused\":" << link->refused << "}" << std::endl;
         }
     }
     catch (const std::exception& e)

@@ -2,8 +2,8 @@
 // checksum of the pixels), for checking C++ against Python and as an example of the C++ API.
 //
 //   xblick-cpp-probe --connect host:7447 --base test/camera/color --transport auto|raw|compressed|shm|cuda|ros
-//                        [--view] [--frames 10] [--timeout 10] [--camera-info] [--points [--local cuda]]
-//                        [--max-hz 5]
+//                        [--view] [--frames 10] [--timeout 10] [--camera-info] [--camera-info-topic TOPIC]
+//                        [--points [--local cuda]] [--max-hz 5]
 //   xblick-cpp-probe --connect host:7447 --params <namespace>/<name> [--set NAME:=VALUE]
 //   xblick-cpp-probe --connect host:7447 --tf-static <camera> [--via-ros] [--timeout 10]
 //
@@ -11,6 +11,8 @@
 // result and "checked": its node checked node and deadline), then a line per parameter (name, type, value, read_only,
 // additional_constraints).
 // --points: a point cloud stream (points.hpp); a line per cloud with its fields instead of the encoding.
+// A --base with a leading / is a ROS 2 topic (ImageSubscriber, PointCloudSubscriber); --camera-info-topic reads the
+// CameraInfo of a ROS form from that topic (SubscriberOptions::camera_info_topic).
 // --connect, --listen, --zenoh-mode peer|client: the Zenoh session (SessionOptions); none of them: the PC's router.
 #include <chrono>
 #include <csignal>
@@ -347,6 +349,7 @@ int main(int argc, char** argv)
         options.transport = transports.at(name);
         options.copy = not args.flag("view");
         options.camera_info = args.flag("camera-info");
+        options.camera_info_topic = args.get("camera-info-topic", "");
         options.max_hz = std::stod(args.get("max-hz", "0"));
         ImageSubscriber images(session, args.get("base", "test/camera/color"), options);
         const int frames = std::stoi(args.get("frames", "10"));
@@ -364,11 +367,12 @@ int main(int argc, char** argv)
             const std::string sum = sum_of(frame->data(), frame->device_ptr, frame->owner, options.copy,
                                            frame->height, row, frame->step);
             std::string info = "null";
-            if (options.camera_info)
+            if (options.camera_info or not options.camera_info_topic.empty())
             {
                 if (auto ci = images.camera_info())
                 {
-                    info = "{\"width\":" + std::to_string(ci->width) + ",\"fx\":" + std::to_string(ci->k[0]) + "}";
+                    info = "{\"width\":" + std::to_string(ci->width) + ",\"fx\":" + std::to_string(ci->k[0]) +
+                           ",\"model\":" + ::quoted(ci->distortion_model) + "}";
                 }
             }
             const auto t = images.transport();
@@ -378,7 +382,8 @@ int main(int argc, char** argv)
                       << ",\"source\":\"" << frame->source << "\",\"stamp_ns\":" << frame->stamp_ns()
                       << ",\"age_at_send_ns\":"
                       << (frame->age_at_send_ns() ? std::to_string(*frame->age_at_send_ns()) : "null")
-                      << ",\"valid\":" << (frame->is_valid() ? "true" : "false") << ",\"camera_info\":" << info << "}"
+                      << ",\"valid\":" << (frame->is_valid() ? "true" : "false") << ",\"camera_info\":" << info
+                      << ",\"reason\":" << ::quoted(images.transport_reason()) << "}"
                       << std::endl;
         }
         std::cerr << "xblick-cpp-probe: " << got << " frames, stale " << images.stale() << ", skipped for max-hz "

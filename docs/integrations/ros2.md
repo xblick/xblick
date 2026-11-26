@@ -117,7 +117,7 @@ cases: you name a ROS topic, you ask for the transport `ros`, or the transport `
 | `ImageSubscriber(..., transport="ros")`, `xblick hz --transport ros`, `xblick snapshot --transport ros` | `/<stream>/image_raw`, with `camera_info=True` also `/<stream>/camera_info` |
 | `ImageSubscriber(..., transport="auto")` and every node and command that reads with `auto` | `/<stream>/image_raw` when only a ROS node publishes the stream. See [Streams that only ROS publishes](#streams-that-only-ros-publishes). |
 | `PointCloudSubscriber(..., transport="ros")`, and with `auto` as above | `/<stream>/cloud` |
-| C++: `Transport::Ros` of `ImageSubscriber` (with `camera_info`) and `PointCloudSubscriber`, `xblick-cpp-probe --transport ros` | `/<stream>/image_raw` and `/<stream>/cloud` |
+| C++: `ImageSubscriber` and `PointCloudSubscriber` with the same base, transport and camera_info, `xblick-cpp-probe --base /T` | as in Python, by the rows above. `SubscriberOptions::camera_info_topic` names another camera_info topic. |
 | C++: `StaticTransformSubscriber(..., ros = true)`, `xblick-cpp-probe --tf-static --via-ros` | `/tf_static`, also of publishers that started before it |
 | `DetectionSubscriber(..., ros_type=Detection3DArray)` | `/<key>` of that type |
 | `TransformBuffer(..., ros=True)`, `TransformSubscriber(..., ros=True)`, `StaticTransformSubscriber(..., ros=True)` | `/tf` and `/tf_static` |
@@ -143,6 +143,10 @@ has `/camera_info`, and `/resize/image` has `/resize/camera_info`. Name another 
 `camera_info="/cam/calibration"`. Compressed frames follow image_transport's convention, the topic
 `<image topic>/compressed`.
 
+In C++, `ImageSubscriber(session, "/resize/image", {.camera_info = true})` reads the same topics.
+`SubscriberOptions::camera_info_topic` names another camera_info topic. The compressed topic's transport is
+`Transport::RosCompressed`.
+
 | `transport` | Image topic `/T` |
 | --- | --- |
 | `auto` | `/T`. When the publishers offer only `/T/compressed`, that one. |
@@ -157,6 +161,7 @@ A reader never picks a topic in place of the one you named. After 5 s without a 
   name, and these are below it: /rgbd/color/image_raw, /rgbd/depth/image_raw; name one of them`.
 
 When frames come but no camera_info, the reader logs one line after 5 s with the CameraInfo topics in the graph.
+In C++, `latest()` throws these errors, `ProtocolError` and `std::invalid_argument`.
 
 ### Streams that only ROS publishes
 
@@ -198,8 +203,11 @@ shows the names of other nodes' outputs.
 A Lyrical publisher sends images, compressed images and clouds on keys of its own for each kind of subscriber. Our
 readers of these types announce themselves as subscribers that take plain CDR. A Lyrical publisher then sends them the
 usual bytes on the topic's key with the suffix `/_buf_cpu`, and our readers read that key as well. A Jazzy publisher
-and our own publishers send on the topic's key, which our readers read as before
-([protocol](../concepts/protocol.md#ros-2-on-rmw_zenoh)).
+sends on the topic's key, which our readers read as before
+([protocol](../concepts/protocol.md#ros-2-on-rmw_zenoh)). Our publishers send on the topic's key as well. One case
+differs: while a ROS reader takes the frames of a `CameraPublisher` with `cuda_device` as CUDA buffers, that publisher
+sends on the buffer keys only. Our readers then get the bytes on `/_buf_cpu`
+([GPU frames for ROS readers](#gpu-frames-for-ros-readers)).
 
 ## Several cameras and tf
 
@@ -343,7 +351,7 @@ The C++ API takes part in ROS 2 as the Python API does, with the same keys, toke
 ROS, and `Parameters` serves the six parameter services on the program's node with the same rules as in Python. A publisher that offers only
 its rings, such as a relay's, offers nothing to ROS.
 
-Four differences remain:
+Three differences remain:
 
 - `rmw_zenoh` keeps `/tf_static` for late subscribers with zenoh-ext's advanced publisher. zenoh-c offers it only with
   its unstable API, which its standalone release lacks. The C++ publisher answers late subscribers with its own
@@ -353,8 +361,6 @@ Four differences remain:
   writer blocks therefore also blocks that Zenoh thread, and with it the other traffic that thread delivers. A set
   refused because sets through ROS are off is refused before its parameters are decoded.
 - The C++ API offers no `ParameterClient` for a ROS node yet.
-- The C++ `CameraPublisher` sends its GPU frames to ROS readers as bytes. Only the Python one sends them as CUDA
-  buffers ([GPU frames for ROS readers](#gpu-frames-for-ros-readers)).
 
 ## ROS 2 on DDS through a bridge
 
@@ -450,15 +456,19 @@ A publisher of ours with `cuda_device` sends a frame as a CUDA buffer while all 
    packages do not install this plugin.
 2. The reader accepts the backend, for example with `acceptable_buffer_backends = "any"`.
 3. The reader runs on the same PC and as the same Linux user as the publisher.
-4. The reader shares the publisher's `/dev/shm`, its process ids, its network namespace and its socket directory
-   (`/tmp` by default) at the same path. A container needs `--ipc host`, `--pid host`, `--network host` and
-   `-v /tmp:/tmp`. The release 0.1.2 fetches a block through a socket file in that directory. The current source
-   connects to a socket of the same name in the network namespace.
-5. The reader uses the publisher's GPU. A reader that sees one GPU is compared by that GPU. A reader that sees
+4. The publisher reaches the reader's `/dev/shm`. It reads the backend's registry there and writes each block's
+   record there. By default that is its own `/dev/shm`, which a container shares with `--ipc host`. A container
+   with a `/dev/shm` of its own works too: set `XBLICK_ROS_CUDA_SHM` on the publisher's side to that directory as
+   the publisher sees it, such as `/proc/<pid>/root/dev/shm` for a process `<pid>` of the container.
+5. The reader shares the publisher's process ids, its network namespace and its socket directory (`/tmp` by
+   default) at the same path. A container needs `--pid host`, `--network host` and `-v /tmp:/tmp`. The release
+   0.1.2 fetches a block through a socket file in that directory. The current source connects to a socket of the
+   same name in the network namespace.
+6. The reader uses the publisher's GPU. A reader that sees one GPU is compared by that GPU. A reader that sees
    several GPUs needs the publisher's `CUDA_VISIBLE_DEVICES` and `CUDA_DEVICE_ORDER`, because the backend compares
    CUDA ordinals only.
-6. The reader keeps the last few messages of its topic (`KEEP_LAST`). A reader that keeps all messages gets the bytes.
-7. No reader of the topic is older than Lyrical. A Jazzy reader reads only the topic's key, and then all readers of
+7. The reader keeps the last few messages of its topic (`KEEP_LAST`). A reader that keeps all messages gets the bytes.
+8. No reader of the topic is older than Lyrical. A Jazzy reader reads only the topic's key, and then all readers of
    that topic get the bytes there.
 
 A reader that accepts the backend and misses one of these conditions gets the bytes. The publisher prints one line
@@ -473,8 +483,8 @@ The publisher never waits for a reader. It rewrites a block only when no reader 
 as many frames as the readers' queues hold have gone out since the block's last frame, so that no queued message
 loses its block. A block that a reader holds longer than 2 s counts as free again, because a reader that crashed never
 gives it back. When every block is held,
-the frame does not go to these readers, and the publisher counts it. The pool has at most the readers' queue depth
-plus five blocks. A 1080p `rgb8` block takes 6 MiB of GPU memory.
+the frame does not go to these readers, and the publisher counts it. For one frame size the pool has at most the
+readers' queue depth plus five blocks, and never more than 64. A 1080p `rgb8` block takes 6 MiB of GPU memory.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
@@ -482,8 +492,9 @@ plus five blocks. A 1080p `rgb8` block takes 6 MiB of GPU memory.
 | `XBLICK_ROS_CUDA_SOCKETS` | `/tmp` | the directory of the sockets that hand out the blocks |
 | `XBLICK_ROS_CUDA_SHM` | `/dev/shm` | the readers' `/dev/shm` as the publisher sees it |
 
-Only the Python `CameraPublisher` sends GPU frames to ROS readers so far. [Frames on the
-GPU](../concepts/gpu-frames.md#ros-2-readers) explains the mechanism.
+The Python and the C++ `CameraPublisher` follow these rules alike, and the C++ core holds them for both. In C++,
+`CameraPublisher::ros_gpu_stats()` gives the counters. [Frames on the GPU](../concepts/gpu-frames.md#ros-2-readers)
+explains the mechanism.
 
 ## Wire format
 
@@ -502,15 +513,13 @@ type hashes of the part in ROS 2.
 - A subscriber of every key (`**`), such as the traffic meter of the terminal interface, also subscribes to the ROS
   copies. The publishers then send them as well. The terminal interface shows and counts our keys only.
 - The C++ tool `xblick-cpp-camera` keeps its fixed frame `TestCamera`. It serves the tests, which compare its bytes.
-- ROS topics of any name and the ROS form for `auto` exist in Python only. C++'s `Transport::Ros` reads
-  `/<stream>/image_raw` and `/<stream>/cloud`, and C++'s `Auto` never reads ROS.
 - `xblick rerun`, `xblick record` and the terminal interface find streams by their info records. They do not show a
   camera that only a ROS node publishes. Record such a camera with `ros2 bag record`, and play the bag with
   `xblick play`.
-- A ROS 2 reader gets GPU frames as CUDA buffers only from the Python `CameraPublisher`, only on `rmw_zenoh`, and
-  only on the publisher's PC and GPU ([GPU frames for ROS readers](#gpu-frames-for-ros-readers)). Point clouds and
-  frames from ROS publishers into our readers go as bytes. [Alternatives](../project/alternatives.md) describes the
-  buffer backends.
+- A ROS 2 reader gets GPU frames as CUDA buffers only from a `CameraPublisher` with `cuda_device`, only on
+  `rmw_zenoh`, and only on the publisher's PC and GPU ([GPU frames for ROS readers](#gpu-frames-for-ros-readers)).
+  Point clouds and frames from ROS publishers into our readers go as bytes. [Alternatives](../project/alternatives.md)
+  describes the buffer backends.
 - The CUDA buffer backend keeps a registry in `/dev/shm`, which the first Linux user's ROS node creates. A ROS node
   of a second user with the backend then fails to start on that PC. This is a limit of the backend.
 - [ROS 2 by default](../project/ros-roadmap.md) collects the facts behind the part in ROS 2 and the options that

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <random>
+#include <set>
 #include <stdexcept>
 
 #include "xblick/version.hpp"
@@ -261,28 +262,113 @@ namespace xblick::detail
         return item;
     }
 
-    std::unique_ptr<ros::Subscriber> ros_subscriber(zenoh::Session& session, const std::string& key,
+    std::unique_ptr<ros::Subscriber> ros_subscriber(zenoh::Session& session, const std::string& topic,
                                                     const p::MessageType& type, std::shared_ptr<Latest> latest,
-                                                    int route)
+                                                    int route, Transport transport)
     {
         const std::shared_ptr<ros::Ros> part = ros::of(session);
         if (not part)
         {
-            throw std::invalid_argument("transport ros reads the stream's ROS 2 topic: it needs a session with --ros");
+            throw std::invalid_argument(std::string("transport ros reads the stream's ROS 2 topic: it needs ") +
+                                        ros::kNeedsRos);
         }
-        const std::string topic = ros::topic_of(key);
         const std::string encoding = type.encoding();
         return std::make_unique<ros::Subscriber>(
             session, *part, part->node(), topic, std::string(type.name),
-            [latest, topic, encoding, route](std::vector<std::uint8_t>&& payload, const ros::Attachment&) {
+            [latest, topic, encoding, route, transport](std::vector<std::uint8_t>&& payload, const ros::Attachment&) {
                 auto made = std::make_shared<Item>();
                 made->payload = std::move(payload);
                 made->key = topic;
                 made->encoding = encoding;  // a ROS sample is zenoh/bytes: its type is the topic's
                 made->receive_ns = now_ns();
-                made->transport = Transport::Ros;
+                made->transport = transport;
                 latest->offer(std::move(made), route);
             });
+    }
+
+    bool is_ros_form(Transport t)
+    {
+        return t == Transport::Ros or t == Transport::RosCompressed;
+    }
+
+    RosSetup ros_setup(zenoh::Session& session, const std::string& base, Transport transport, bool copy,
+                       std::string_view our_suffix, const p::MessageType& type, const p::MessageType* compressed_type)
+    {
+        RosSetup s;
+        s.transport = transport;
+        const std::shared_ptr<ros::Ros> part = ros::of(session);
+        s.ros_topic = ros::is_topic(base);
+        if (s.ros_topic)
+        {
+            if (not part)
+            {
+                throw std::invalid_argument(base + ": a ROS 2 topic (a leading /); reading it needs " +
+                                            std::string(ros::kNeedsRos));
+            }
+            const std::string topic = ros::check_ros_name(base);
+            if (transport == Transport::Ros or transport == Transport::Raw)
+            {
+                s.transport = Transport::Ros;
+            }
+            else if (transport == Transport::Compressed and compressed_type != nullptr)
+            {
+                s.transport = Transport::RosCompressed;
+            }
+            else if (transport != Transport::Auto)
+            {
+                throw std::invalid_argument(topic + " is a ROS 2 topic: transport auto, ros, raw" +
+                                            (compressed_type != nullptr ? " or compressed" : "") + ", not " +
+                                            to_string(transport));
+            }
+            s.base = topic;
+        }
+        else
+        {
+            if (transport == Transport::Ros and not part)
+            {
+                throw std::invalid_argument(std::string("transport ros reads the stream's ROS 2 topic: it needs ") +
+                                            ros::kNeedsRos);
+            }
+            if (transport == Transport::RosCompressed)
+            {
+                throw std::invalid_argument("transport ros_compressed is not asked for: transport compressed of a ROS "
+                                            "name (a leading /) reads image_transport's compressed topic");
+            }
+            s.base = check_name(base);
+        }
+        if (not copy and (s.transport == Transport::Compressed or s.transport == Transport::Raw or
+                          is_ros_form(s.transport)))
+        {
+            throw std::invalid_argument("copy = false is for the shm and cuda transports (and auto)");
+        }
+        std::string error;
+        if (part)
+        {
+            try  // a base that is no ROS name ('-' in it): no ROS form
+            {
+                const std::string topic = s.ros_topic ? s.base : ros::topic_of(key(s.base, our_suffix));
+                s.forms.push_back({Transport::Ros, topic, &type});
+                if (compressed_type != nullptr)
+                {
+                    s.forms.push_back({Transport::RosCompressed, ros::compressed_topic(topic), compressed_type});
+                }
+            }
+            catch (const ros::RosError& e)
+            {
+                error = e.what();
+            }
+        }
+        if (is_ros_form(s.transport) and std::none_of(s.forms.begin(), s.forms.end(), [&](const RosForm& f) {
+                return f.transport == s.transport;
+            }))
+        {
+            if (not error.empty())
+            {
+                throw ros::RosError(error);
+            }
+            throw std::invalid_argument(s.base + ": no ROS form " + to_string(s.transport));
+        }
+        return s;
     }
 
     void check_encoding(const Item& item, const p::MessageType& type)
@@ -323,7 +409,8 @@ namespace xblick::detail
 
     Subscription::Subscription(zenoh::Session& session, std::string base, std::string kind, Transport requested,
                                Transport local, Transport remote, Suffix suffix, std::optional<int> cuda_device,
-                               std::optional<Transport> remote_else)
+                               std::optional<Transport> remote_else, std::vector<RosForm> ros_forms, bool ros_topic,
+                               Used used)
         : session_(session),
           base_(std::move(base)),
           kind_(std::move(kind)),
@@ -335,13 +422,37 @@ namespace xblick::detail
           cuda_device_(cuda_device),
           host_(host_id())
     {
+        ros_forms_ = std::move(ros_forms);
+        ros_topic_ = ros_topic;
+        used_ = std::move(used);
+        if (not ros_forms_.empty())
+        {
+            const std::shared_ptr<ros::Ros> part = ros::of(session_);
+            if (not part)
+            {
+                throw std::logic_error("ROS forms without a part in ROS 2");
+            }
+            ros_domain_ = part->domain();
+            if (ros_topic_ or is_ros_form(requested_))
+            {
+                // made now, so that it knows the publishers when it is asked; Auto on a ROS name chooses again
+                // whenever a publisher comes or goes
+                graph_ = std::make_shared<ros::Graph>(session_, ros_domain_,
+                                                      ros_topic_ and requested_ == Transport::Auto
+                                                          ? std::function<void()>([this] { recheck(); })
+                                                          : std::function<void()>());
+            }
+        }
         if (requested_ == Transport::Auto)
         {
-            zenoh::Session::LivelinessSubscriberOptions options;
-            options.history = true;
-            alive_.emplace(session_.liveliness_declare_subscriber(
-                zenoh::KeyExpr(key(base_, p::kInfo) + "/**"), [this](const zenoh::Sample&) { recheck(); },
-                zenoh::closures::none, std::move(options)));
+            if (not ros_topic_)
+            {
+                zenoh::Session::LivelinessSubscriberOptions options;
+                options.history = true;
+                alive_.emplace(session_.liveliness_declare_subscriber(
+                    zenoh::KeyExpr(key(base_, p::kInfo) + "/**"), [this](const zenoh::Sample&) { recheck(); },
+                    zenoh::closures::none, std::move(options)));
+            }
             chooser_ = std::thread([this] { choose(); });
         }
         else
@@ -360,9 +471,24 @@ namespace xblick::detail
         }
         alive_.reset();
         want_.reset();
-        std::lock_guard lock(mutex_);
-        subscriber_.reset();
-        ros_subscriber_.reset();
+        std::shared_ptr<ros::Graph> graph;
+        {
+            std::lock_guard lock(mutex_);
+            subscriber_.reset();
+            ros_subscriber_.reset();
+            graph = std::move(graph_);
+        }
+        graph.reset();  // its listener (recheck) ends with it
+    }
+
+    std::vector<ros::Token> Subscription::ros_publishers(const std::optional<std::string>& topic) const
+    {
+        std::shared_ptr<ros::Graph> graph;
+        {
+            std::lock_guard lock(mutex_);
+            graph = graph_;
+        }
+        return graph ? graph->publishers(topic) : std::vector<ros::Token>{};
     }
 
     void Subscription::recheck()
@@ -392,6 +518,7 @@ namespace xblick::detail
     void Subscription::use(Transport t, const std::string& gpu)
     {
         std::optional<zenoh::Subscriber<void>> old;
+        std::unique_ptr<ros::Subscriber> old_ros;
         int route = 0;
         {
             std::lock_guard lock(mutex_);
@@ -401,12 +528,18 @@ namespace xblick::detail
                 old.emplace(std::move(*subscriber_));
                 subscriber_.reset();
             }
+            old_ros = std::move(ros_subscriber_);
             latest_->move(route);
             auto target = latest_;
-            if (t == Transport::Ros)  // requested only, never chosen: no subscriber before it
+            if (is_ros_form(t))
             {
-                ros_subscriber_ = ros_subscriber(session_, key_of(t, gpu),
-                                                 kind_ == "points" ? p::kPointCloud2Type : p::kImageType, target, route);
+                const auto form = std::find_if(ros_forms_.begin(), ros_forms_.end(),
+                                               [t](const RosForm& f) { return f.transport == t; });
+                if (form == ros_forms_.end())
+                {
+                    throw std::logic_error(base_ + ": no ROS form " + to_string(t));
+                }
+                ros_subscriber_ = ros_subscriber(session_, form->topic, *form->type, target, route, t);
             }
             else
             {
@@ -418,7 +551,11 @@ namespace xblick::detail
             using_ = std::make_pair(t, gpu);
         }
         chosen_cv_.notify_all();
-        if (not old)
+        if (used_)
+        {
+            used_(t);
+        }
+        if (not old and not old_ros)
         {
             return;
         }
@@ -430,6 +567,147 @@ namespace xblick::detail
         // before the subscriber goes: Zenoh can still hand over a sample of the old one while it is undeclared
         latest_->leave_old();
         old.reset();
+        old_ros.reset();
+    }
+
+    // Takes the ROS form a ROS publisher offers now (of the form's type; foreign_only: of another program than ours,
+    // so that the ROS copies of a stream of ours are never read in place of its own forms) when it is not the one in
+    // use. True when one is offered.
+    bool Subscription::choose_ros(bool foreign_only, const std::string& why)
+    {
+        std::shared_ptr<ros::Graph> graph;
+        {
+            std::lock_guard lock(mutex_);
+            graph = graph_;
+        }
+        std::optional<Transport> chosen;
+        for (const RosForm& form : ros_forms_)
+        {
+            for (const ros::Token& token : graph->publishers(form.topic))
+            {
+                if (token.type_name == std::string(form.type->name) and
+                    not(foreign_only and graph->by_xblick(token.zid)))
+                {
+                    chosen = form.transport;
+                    break;
+                }
+            }
+            if (chosen)
+            {
+                break;
+            }
+        }
+        if (not chosen)
+        {
+            return false;
+        }
+        const std::string gpu(p::kAnyGpu);
+        if (not using_ or *using_ != std::make_pair(*chosen, gpu))
+        {
+            {
+                std::lock_guard lock(mutex_);
+                reason_ = std::string(to_string(*chosen)) + " (" + (why.empty() ? "a ROS publisher" : why) + ")";
+            }
+            use(*chosen, gpu);
+        }
+        return true;
+    }
+
+    // Once, kWaitHint after the start without a sample, for a subscription that reads or looks for a ROS form: a ROS
+    // publisher of its topic with another type is a ProtocolError, a ROS name that is no topic but has topics of the
+    // kind below it a std::invalid_argument naming them; both kept and thrown by take() (Python's _check_ros).
+    void Subscription::check_ros()
+    {
+        if (ros_checked_.load() or ros_forms_.empty() or std::chrono::steady_clock::now() - started_ < kWaitHint)
+        {
+            return;
+        }
+        std::shared_ptr<ros::Graph> graph;
+        std::optional<Transport> in_use;
+        {
+            std::lock_guard lock(mutex_);
+            std::lock_guard inner(latest_->mutex);
+            if (latest_->received > 0)
+            {
+                return;
+            }
+            graph = graph_;
+            in_use = transport_;
+        }
+        const bool in_form = in_use and is_ros_form(*in_use);
+        if (not(ros_topic_ or in_form) or not graph)
+        {
+            return;
+        }
+        ros_checked_.store(true);
+        const auto join = [](const std::set<std::string>& items) {
+            std::string out;
+            for (const std::string& item : items)
+            {
+                out += (out.empty() ? "" : ", ") + item;
+            }
+            return out;
+        };
+        std::set<std::string> kinds;
+        for (const RosForm& form : ros_forms_)
+        {
+            kinds.insert(std::string(form.type->name));
+        }
+        for (const RosForm& form : ros_forms_)
+        {
+            if (in_form and form.transport != *in_use)
+            {
+                continue;
+            }
+            const std::string reads(form.type->name);
+            std::set<std::string> other;
+            for (const ros::Token& token : graph->publishers(form.topic))
+            {
+                if (token.type_name and *token.type_name != reads)
+                {
+                    other.insert(*token.type_name);
+                }
+            }
+            if (not other.empty())
+            {
+                std::string hint;
+                const std::string suffix = "/" + std::string(ros::kCompressedTopic);
+                if (other == std::set<std::string>{"sensor_msgs/msg/CompressedImage"} and
+                    form.topic.size() > suffix.size() and
+                    form.topic.compare(form.topic.size() - suffix.size(), suffix.size(), suffix) == 0)
+                {
+                    hint = ": image_transport's compressed topic of " + form.topic.substr(0, form.topic.rfind('/')) +
+                           ", which transport compressed reads";
+                }
+                const ProtocolError error(form.topic + ": its ROS publishers send " + join(other) +
+                                          ", this subscriber reads " + reads + hint);
+                std::lock_guard lock(mutex_);
+                error_ = std::make_exception_ptr(error);
+                throw error;
+            }
+        }
+        if (ros_topic_ and std::none_of(ros_forms_.begin(), ros_forms_.end(), [&](const RosForm& f) {
+                return not graph->publishers(f.topic).empty();
+            }))
+        {
+            std::set<std::string> below;
+            for (const ros::Token& token : graph->publishers())
+            {
+                if (token.type_name and kinds.contains(*token.type_name) and token.topic and
+                    token.topic->rfind(base_ + "/", 0) == 0)
+                {
+                    below.insert(*token.topic);
+                }
+            }
+            if (not below.empty())
+            {
+                const std::invalid_argument error(base_ + ": no ROS topic of this name, and these are below it: " +
+                                                  join(below) + "; name one of them");
+                std::lock_guard lock(mutex_);
+                error_ = std::make_exception_ptr(error);
+                throw error;
+            }
+        }
     }
 
     // The chooser's thread: chooses when a publisher is found and again whenever one comes or goes (recheck()).
@@ -444,6 +722,13 @@ namespace xblick::detail
                 {
                     std::lock_guard lock(recheck_mutex_);
                     recheck_ = false;
+                }
+                if (ros_topic_)  // a ROS name: ROS's publishers only, told by the graph's listener
+                {
+                    choose_ros(false, "");
+                    std::unique_lock lock(recheck_mutex_);
+                    recheck_cv_.wait_for(lock, kRosRecheck, [this] { return recheck_ or closed_.load(); });
+                    continue;
                 }
                 bool found = false;
                 bool local = false;
@@ -555,6 +840,20 @@ namespace xblick::detail
                         use(t, gpu);
                     }
                 }
+                else if (not found and not closed_.load() and not ros_forms_.empty())
+                {
+                    // no publisher of ours answers: the stream's ROS form when a ROS publisher of another program
+                    // offers it (a ROS camera, ros2 bag play); ours keep priority, the next round with an answer
+                    // takes them. The graph is made at the first need: a stream of ours that answers never needs it
+                    {
+                        std::lock_guard lock(mutex_);
+                        if (not graph_)
+                        {
+                            graph_ = std::make_shared<ros::Graph>(session_, ros_domain_);
+                        }
+                    }
+                    choose_ros(true, "only a ROS publisher offers it");
+                }
                 std::unique_lock lock(recheck_mutex_);
                 const auto woken = [this] { return recheck_ or closed_.load(); };
                 bool event = true;
@@ -588,6 +887,14 @@ namespace xblick::detail
                                                           std::optional<std::chrono::milliseconds> timeout)
     {
         const auto start = std::chrono::steady_clock::now();
+        {
+            std::lock_guard lock(mutex_);
+            if (error_)
+            {
+                std::rethrow_exception(error_);
+            }
+        }
+        check_ros();
         std::shared_ptr<Latest> source;
         {
             std::unique_lock lock(mutex_);

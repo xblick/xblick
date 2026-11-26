@@ -432,6 +432,9 @@ namespace xblick
         std::vector<std::string> offered;  // PublisherOptions::transports, checked (all if it was empty)
         // --ros: image_raw, image_raw/compressed (jpeg, png) and camera_info on ROS's keys (null: not offered)
         std::unique_ptr<ros::Publisher> ros_raw, ros_compressed, ros_info;
+        // the GPU link of ros_raw (ros.hpp GpuLink): with cuda_device, ROS readers that accept CUDA buffers get the
+        // frames in the CUDA ring as such (null: none); after ros_raw, so destroyed before it
+        std::unique_ptr<ros::GpuLink> ros_gpu;
         // Last, so destroyed first, also when the constructor throws: Zenoh's threads answer <base>/info (and rays)
         // from the members above, and undeclaring waits for a callback that runs (zenoh-c 1.10). Declared before them,
         // a query during the destruction read freed members (a CUDA ring's server takes up to 200 ms to stop;
@@ -448,9 +451,49 @@ namespace xblick
         // Host representations of a frame (rows packed if the image has padding where a ring needs none). With
         // `in_shm`, the frame is already in the host ring's slot `*in_shm` (image points there): only its descriptor
         // goes out.
+        // A frame's way to ROS readers while the GPU link is on (GpuLink::plan): its plan, and the attachment of all
+        // its ROS samples.
+        struct LinkFrame
+        {
+            ros_cuda::Plan plan;
+            std::vector<std::uint8_t> attachment;
+        };
+
+        // The frame in the CUDA ring's slot `w` to the GPU link's readers when it is on: the way of its CPU form then.
+        std::optional<LinkFrame> to_gpu_readers(const Written& w, std::uint32_t height, std::uint32_t width,
+                                                const Header& header, std::vector<std::string>& sent)
+        {
+            if (not ros_gpu or not ros_wants(ros_raw))
+            {
+                return std::nullopt;
+            }
+            std::optional<ros_cuda::Plan> plan = ros_gpu->plan();
+            if (not plan)
+            {
+                return std::nullopt;
+            }
+            LinkFrame frame{std::move(*plan), ros_raw->attachment()};
+            const std::uint32_t row = width * static_cast<std::uint32_t>(enc.pixel_bytes());
+            const ros_cuda::ImageHeader h{header.stamp.sec, header.stamp.nanosec, header.frame_id, height, width,
+                                          o.encoding, 0, row};
+            for (std::string& key : ros_gpu->send_gpu(frame.plan, *rings.cuda, w.slot,
+                                                      static_cast<std::uint64_t>(row) * height, h, frame.attachment))
+            {
+                sent.push_back(std::move(key));
+            }
+            return frame;
+        }
+
+        // ROS readers take the image's bytes: on the key, or (GPU link on) those of the plan that take the CPU form
+        bool ros_raw_bytes(const LinkFrame* link) const
+        {
+            return ros_wants(ros_raw) and (link == nullptr or link->plan.needs_cpu());
+        }
+
         void publish_host(const std::string& base, const HostImage& image, const Header& header,
                           const detail::FrameAttachment& attachment, std::vector<std::string>& sent,
-                          std::span<const std::uint8_t> jpeg, const Written* in_shm = nullptr)
+                          std::span<const std::uint8_t> jpeg, const Written* in_shm = nullptr,
+                          const LinkFrame* link = nullptr)
         {
             const std::uint32_t row = image.width * static_cast<std::uint32_t>(enc.pixel_bytes());
             const std::uint32_t step = image.step == 0 ? row : image.step;
@@ -490,7 +533,7 @@ namespace xblick
                 put(*shm, d.serialize(), attachment);
                 sent.push_back(shm_key);
             }
-            if (matching(raw) or ros_wants(ros_raw))
+            if (matching(raw) or ros_raw_bytes(link))
             {
                 Image m;
                 m.header = header;
@@ -499,7 +542,26 @@ namespace xblick
                 m.encoding = o.encoding;
                 m.step = step;
                 m.data = std::span<const std::uint8_t>(pixels, static_cast<std::size_t>(step) * image.height);
-                send(raw, ros_raw, m.serialize(), attachment, key(base, p::kImageRaw), sent);
+                if (link == nullptr)
+                {
+                    send(raw, ros_raw, m.serialize(), attachment, key(base, p::kImageRaw), sent);
+                }
+                else  // the GPU link on: ROS's samples on the buffer keys only, nothing on ROS's key
+                {
+                    std::vector<std::uint8_t> payload = m.serialize();
+                    if (ros_raw_bytes(link))
+                    {
+                        for (std::string& k : ros_gpu->send_cpu(link->plan, payload, link->attachment))
+                        {
+                            sent.push_back(std::move(k));
+                        }
+                    }
+                    if (matching(raw))
+                    {
+                        put(*raw, std::move(payload), attachment);
+                        sent.push_back(key(base, p::kImageRaw));
+                    }
+                }
             }
             if (matching(compressed) or ros_wants(ros_compressed))
             {
@@ -639,6 +701,20 @@ namespace xblick
             if (offers("raw"))
             {
                 m.ros_raw = publisher(p::kImageRaw, p::kImageType);
+            }
+            bool gpu_link = false;
+            try
+            {
+                gpu_link = m.ros_raw and m.o.cuda_device and ros_cuda::enabled_by_environment();
+            }
+            catch (const std::invalid_argument& error)
+            {
+                throw ros::RosError(error.what());
+            }
+            if (gpu_link)
+            {
+                // frames in the CUDA ring go to ROS readers that accept CUDA buffers as such (ros.hpp GpuLink)
+                m.ros_gpu = std::make_unique<ros::GpuLink>(session, *m.ros_raw, *m.o.cuda_device);
             }
             if (offers("compressed") and (m.o.codec == kJpeg or m.o.codec == kPng))
             {
@@ -1035,6 +1111,12 @@ namespace xblick
                m.ros_wants(m.ros_info);
     }
 
+    std::optional<ros_cuda::LinkStats> CameraPublisher::ros_gpu_stats() const
+    {
+        const Impl& m = *impl_;
+        return m.ros_gpu ? std::optional<ros_cuda::LinkStats>(m.ros_gpu->stats()) : std::nullopt;
+    }
+
     std::string CameraPublisher::info_record() const
     {
         const Impl& m = *impl_;
@@ -1089,6 +1171,7 @@ namespace xblick
     {
         Impl& m = *this;
         std::vector<std::string> sent;
+        std::optional<LinkFrame> link;
         if (matching(m.cuda))
         {
             const std::uint32_t row = image.width * static_cast<std::uint32_t>(m.enc.pixel_bytes());
@@ -1099,8 +1182,10 @@ namespace xblick
             const std::uint64_t nbytes = static_cast<std::uint64_t>(row) * image.height;
             const Written w = m.cuda_ring(nbytes).write_host(image.data, nbytes);
             m.publish_cuda_descriptor(w, image.height, image.width, header, attachment, sent);
+            // in the CUDA ring anyway: the GPU link's readers get it from there (as Python's publisher)
+            link = m.to_gpu_readers(w, image.height, image.width, header, sent);
         }
-        m.publish_host(base_, image, header, attachment, sent, jpeg);
+        m.publish_host(base_, image, header, attachment, sent, jpeg, nullptr, link ? &*link : nullptr);
         m.publish_camera_info(base_, header, attachment, sent);
         return sent;
     }
@@ -1152,6 +1237,10 @@ namespace xblick
         {
             m.publish_cuda_descriptor(w, image.height, image.width, header, attachment, sent);
         }
+        // the GPU link (ros.hpp GpuLink): ROS readers that accept CUDA buffers get the frame as one, its message then
+        // on the buffer keys only; the CPU form only if another ROS reader needs it
+        const std::optional<LinkFrame> link = m.to_gpu_readers(w, image.height, image.width, header, sent);
+        const LinkFrame* way = link ? &*link : nullptr;
         if (matching(m.shm))
         {
             // one download, straight into the host ring's next slot; the other CPU representations read it there
@@ -1168,14 +1257,14 @@ namespace xblick
             }
             const Written in_shm = host_ring.commit(nbytes);
             m.publish_host(base_, HostImage{slot, image.height, image.width, 0}, header, attachment, sent, jpeg,
-                           &in_shm);
+                           &in_shm, way);
         }
-        else if (m.wants_raw() or (m.wants_compressed() and jpeg.empty()))
+        else if (matching(m.raw) or m.ros_raw_bytes(way) or (m.wants_compressed() and jpeg.empty()))
         {
             std::vector<std::uint8_t> host(nbytes);  // one download for every CPU representation
             ring.read_host(w.slot, host.data(), nbytes);
             m.publish_host(base_, HostImage{host.data(), image.height, image.width, 0}, header, attachment, sent,
-                           jpeg);
+                           jpeg, nullptr, way);
         }
         else if (m.wants_compressed())
         {
@@ -1226,6 +1315,7 @@ namespace xblick
             case Transport::Shm: return "shm";
             case Transport::Cuda: return "cuda";
             case Transport::Ros: return "ros";
+            case Transport::RosCompressed: return "ros_compressed";
         }
         return "?";
     }
@@ -1239,6 +1329,7 @@ namespace xblick
                 case Transport::Compressed: return p::kCompressedImageType;
                 case Transport::Raw: return p::kImageType;
                 case Transport::Ros: return p::kImageType;
+                case Transport::RosCompressed: return p::kCompressedImageType;
                 case Transport::Shm: return p::kShmImageType;
                 case Transport::Cuda: return p::kCudaImageType;
                 case Transport::Auto: break;
@@ -1253,6 +1344,7 @@ namespace xblick
                 case Transport::Compressed: return p::kCompressed;
                 case Transport::Raw: return p::kImageRaw;
                 case Transport::Ros: return p::kImageRaw;
+                case Transport::RosCompressed: return p::kCompressed;
                 case Transport::Shm: return p::kShm;
                 case Transport::Cuda: return p::kCuda;
                 case Transport::Auto: break;
@@ -1635,17 +1727,98 @@ namespace xblick
     struct ImageSubscriber::Impl
     {
         SubscriberOptions o;
+        zenoh::Session& session;
+        std::shared_ptr<detail::Latest> info_latest;
+        // a ROS form's camera_info, while one is read (used); before `subscription`, which is destroyed first (its
+        // chooser thread makes and drops it)
+        mutable std::mutex info_mutex;
+        std::unique_ptr<ros::Subscriber> ros_info;
+        mutable std::atomic<bool> info_hinted{false};
+        std::optional<zenoh::Subscriber<void>> info_subscriber;  // our key's
         detail::Subscription subscription;
         detail::RingReaders rings;
         std::atomic<std::uint64_t> stale{0};
         std::atomic<std::uint64_t> decoded{0};
-        std::shared_ptr<detail::Latest> info_latest;
-        std::optional<zenoh::Subscriber<void>> info_subscriber;
-        std::unique_ptr<ros::Subscriber> ros_info_subscriber;  // transport Ros: /<base>/camera_info
 
-        Impl(zenoh::Session& session, const std::string& base, SubscriberOptions options)
-            : o(options), subscription(session, base, "image", o.transport, o.local, o.remote, suffix_of, o.cuda_device)
+        Impl(zenoh::Session& session_, detail::RosSetup setup, SubscriberOptions options)
+            : o(std::move(options)),
+              session(session_),
+              info_latest(o.camera_info ? std::make_shared<detail::Latest>() : nullptr),
+              subscription(session_, setup.base, "image", setup.transport, o.local, o.remote, suffix_of, o.cuda_device,
+                           std::nullopt, std::move(setup.forms), setup.ros_topic,
+                           [this](Transport t) { used(t); })
         {
+        }
+
+        // The ROS topic of the camera_info read with a ROS form: the one named, else image_transport's beside the
+        // image topic; empty without camera_info or a ROS form.
+        std::string info_topic() const
+        {
+            if (not info_latest or subscription.ros_forms().empty())
+            {
+                return "";
+            }
+            return o.camera_info_topic.empty() ? ros::camera_info_topic(subscription.ros_forms().front().topic)
+                                               : o.camera_info_topic;
+        }
+
+        // A ROS form taken: its camera_info read from ROS too; our form taken: no longer.
+        void used(Transport t)
+        {
+            if (not info_latest)
+            {
+                return;
+            }
+            std::lock_guard lock(info_mutex);
+            if (detail::is_ros_form(t) and not ros_info)
+            {
+                ros_info = detail::ros_subscriber(session, info_topic(), p::kCameraInfoType, info_latest, 0);
+            }
+            else if (not detail::is_ros_form(t) and ros_info)
+            {
+                ros_info.reset();
+            }
+        }
+
+        // Once, while a ROS form is read and frames came for kWaitHint but no camera_info: one line naming the
+        // CameraInfo topics in ROS's graph (none is taken in its place).
+        void hint_info() const
+        {
+            {
+                std::lock_guard lock(info_mutex);
+                if (not ros_info)
+                {
+                    return;
+                }
+            }
+            if (info_hinted.load() or subscription.received() == 0 or
+                std::chrono::steady_clock::now() - subscription.started() < detail::kWaitHint)
+            {
+                return;
+            }
+            info_hinted.store(true);
+            const std::string topic = info_topic();
+            std::set<std::string> others;
+            for (const ros::Token& t : subscription.ros_publishers())
+            {
+                if (t.type_name == std::string(p::kCameraInfoType.name) and t.topic and *t.topic != topic)
+                {
+                    others.insert(*t.topic);
+                }
+            }
+            std::string list;
+            for (const std::string& other : others)
+            {
+                list += (list.empty() ? "" : ", ") + other;
+            }
+            const std::string line =
+                subscription.base() + ": frames, but no CameraInfo on " + topic +
+                (o.camera_info_topic.empty() ? " (ROS's convention: camera_info beside the image topic)" : "") +
+                (others.empty() ? "; ROS's graph has no other CameraInfo topic"
+                                : "; CameraInfo topics in ROS's graph: " + list +
+                                      "; name one (SubscriberOptions::camera_info_topic)");
+            std::fprintf(stderr, "xblick: %s\n", line.c_str());
+            std::fflush(stderr);
         }
     };
 
@@ -1659,24 +1832,27 @@ namespace xblick
         {
             throw std::invalid_argument("local: Auto, Shm or Cuda");
         }
-        if (not options.copy and (options.transport == Transport::Compressed or options.transport == Transport::Raw or
-                                  options.transport == Transport::Ros))
+        if (not options.camera_info_topic.empty())
         {
-            throw std::invalid_argument("copy = false is for the shm and cuda transports (and auto)");
+            ros::check_ros_name(options.camera_info_topic, "camera_info topic");
+            if (not(ros::is_topic(base) or options.transport == Transport::Ros or
+                    options.transport == Transport::Auto))
+            {
+                throw std::invalid_argument("camera_info " + options.camera_info_topic +
+                                            ": a ROS topic, for a ROS form (a base with a leading /, transport ros or "
+                                            "auto), not transport " + to_string(options.transport));
+            }
+            options.camera_info = true;
         }
-        impl_ = std::make_unique<Impl>(session, check_name(base), options);
+        detail::RosSetup setup = detail::ros_setup(session, base, options.transport, options.copy, p::kImageRaw,
+                                                   p::kImageType, &p::kCompressedImageType);
+        const bool ours = options.camera_info and not setup.ros_topic and options.transport != Transport::Ros;
+        impl_ = std::make_unique<Impl>(session, std::move(setup), std::move(options));
         Impl& m = *impl_;
-        m.subscription.limit_rate(options.max_hz);
-        m.subscription.keep_recent(options.keep_recent);
-        if (options.camera_info and options.transport == Transport::Ros)
+        m.subscription.limit_rate(m.o.max_hz);
+        m.subscription.keep_recent(m.o.keep_recent);
+        if (ours)  // our key's camera_info (a ROS form's comes with it: Impl::used)
         {
-            m.info_latest = std::make_shared<detail::Latest>();
-            m.ros_info_subscriber = detail::ros_subscriber(session, key(m.subscription.base(), p::kCameraInfo),
-                                                           p::kCameraInfoType, m.info_latest, 0);
-        }
-        else if (options.camera_info)
-        {
-            m.info_latest = std::make_shared<detail::Latest>();
             auto target = m.info_latest;
             m.info_subscriber.emplace(session.declare_subscriber(
                 zenoh::KeyExpr(key(m.subscription.base(), p::kCameraInfo)),
@@ -1686,8 +1862,7 @@ namespace xblick
 
     ImageSubscriber::~ImageSubscriber()
     {
-        impl_->info_subscriber.reset();
-        impl_->ros_info_subscriber.reset();
+        impl_->info_subscriber.reset();  // the rest in the order of Impl's members: the subscription first
     }
 
     std::optional<Transport> ImageSubscriber::transport() const
@@ -1729,6 +1904,7 @@ namespace xblick
         auto item = impl_->info_latest->take(false, std::nullopt);
         if (not item)
         {
+            impl_->hint_info();
             return std::nullopt;
         }
         detail::check_encoding(*item, p::kCameraInfoType);
@@ -1803,7 +1979,7 @@ namespace xblick
         f.publish_ns = meta.publish_ns;
         f.source = meta.source;
 
-        if (t == Transport::Compressed)
+        if (t == Transport::Compressed or t == Transport::RosCompressed)
         {
             const CompressedImage message = CompressedImage::deserialize(item.payload);
             DecodedImage d = decompress(message);

@@ -581,6 +581,7 @@ namespace xblick
                 case Transport::Raw: return p::kPointCloud2Type;
                 case Transport::Ros: return p::kPointCloud2Type;
                 case Transport::Shm: return p::kShmPointCloud2Type;
+                case Transport::RosCompressed: break;
                 case Transport::Cuda: return p::kCudaPointCloud2Type;
                 case Transport::Compressed: return p::kCompressedPointCloud2Type;
                 case Transport::Auto: break;
@@ -595,6 +596,7 @@ namespace xblick
                 case Transport::Raw: return p::kCloud;
                 case Transport::Ros: return p::kCloud;
                 case Transport::Shm: return p::kCloudShm;
+                case Transport::RosCompressed: break;
                 case Transport::Cuda: return p::kCloudCuda;
                 case Transport::Compressed: return p::kCloudCompressed;
                 case Transport::Auto: break;
@@ -632,12 +634,13 @@ namespace xblick
         std::uint32_t rays_height = 0, rays_width = 0;
 
         // Auto from another host: compressed where every source offers it (has rays), else raw
-        Impl(zenoh::Session& session, const std::string& base, CloudSubscriberOptions options)
+        Impl(zenoh::Session& session, detail::RosSetup setup, CloudSubscriberOptions options)
             : o(options),
-              subscription(session, base, "points", o.transport, o.local,
+              subscription(session, setup.base, "points", setup.transport, o.local,
                            o.remote == Transport::Raw ? Transport::Raw : Transport::Compressed, cloud_suffix_of,
                            o.cuda_device,
-                           o.remote == Transport::Auto ? std::optional<Transport>(Transport::Raw) : std::nullopt),
+                           o.remote == Transport::Auto ? std::optional<Transport>(Transport::Raw) : std::nullopt,
+                           std::move(setup.forms), setup.ros_topic),
               session(session)
         {
         }
@@ -696,12 +699,10 @@ namespace xblick
         {
             throw std::invalid_argument("local: Auto, Shm or Cuda");
         }
-        if (not options.copy and (options.transport == Transport::Raw or options.transport == Transport::Compressed or
-                                  options.transport == Transport::Ros))
-        {
-            throw std::invalid_argument("copy = false is for the shm and cuda transports (and auto)");
-        }
-        impl_ = std::make_unique<Impl>(session, check_name(base), options);
+        impl_ = std::make_unique<Impl>(
+            session, detail::ros_setup(session, base, options.transport, options.copy, p::kCloud, p::kPointCloud2Type,
+                                       nullptr),
+            options);
         impl_->subscription.limit_rate(options.max_hz);
     }
 

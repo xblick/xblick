@@ -12,6 +12,7 @@
 #include <cstring>
 #include <regex>
 
+#include "xblick/camera.hpp"
 #include "xblick/msg.hpp"
 
 namespace xblick::ros
@@ -1202,11 +1203,7 @@ namespace xblick::ros
         {
             check(payload);
         }
-        std::vector<std::uint8_t> attachment;
-        {
-            std::lock_guard lock(mutex_);
-            attachment = encode_attachment(++seq_, now_ns(), entity_.gid);
-        }
+        std::vector<std::uint8_t> attachment = this->attachment();
         if (cache_)
         {
             std::lock_guard lock(cache_->mutex);
@@ -1219,6 +1216,334 @@ namespace xblick::ros
         zenoh::Publisher::PutOptions options;
         options.attachment = zenoh::Bytes(std::move(attachment));
         publisher_->put(zenoh::Bytes(std::vector<std::uint8_t>(payload.begin(), payload.end())), std::move(options));
+    }
+
+    std::vector<std::uint8_t> Publisher::attachment()
+    {
+        std::lock_guard lock(mutex_);
+        return encode_attachment(++seq_, now_ns(), entity_.gid);
+    }
+
+    // ------------------------------------------------------------------------- ROS cameras as ROS names them
+
+    bool is_topic(const std::string& name)
+    {
+        return not name.empty() and name.front() == '/';
+    }
+
+    std::string compressed_topic(const std::string& image_topic)
+    {
+        return image_topic + "/" + std::string(kCompressedTopic);
+    }
+
+    std::string camera_info_topic(const std::string& image_topic)
+    {
+        return image_topic.substr(0, image_topic.rfind('/')) + "/" + std::string(kCameraInfoTopic);
+    }
+
+    struct Graph::State
+    {
+        mutable std::mutex mutex;
+        std::map<std::string, Token> tokens;
+        std::map<std::string, bool> xblick;  // a session's zid -> it declares a program of ours
+        std::function<void()> changed;
+        std::string own_zid;
+        std::atomic<bool> closed{false};
+    };
+
+    Graph::Graph(zenoh::Session& session, int domain, std::function<void()> changed)
+        : session_(session), state_(std::make_shared<State>())
+    {
+        state_->changed = std::move(changed);
+        state_->own_zid = session.get_zid().to_string();
+        const std::string pattern = std::string(kAdminSpace) + "/" + std::to_string(domain) + "/*/*/*/" +
+                                    std::string(kPublisher) + "/*/*/*/**";
+        zenoh::Session::LivelinessSubscriberOptions options;
+        options.history = true;
+        subscriber_.emplace(session.liveliness_declare_subscriber(
+            zenoh::KeyExpr(pattern),
+            [state = state_](const zenoh::Sample& sample) {
+                if (state->closed.load())
+                {
+                    return;
+                }
+                const std::string key(sample.get_keyexpr().as_string_view());
+                {
+                    std::lock_guard lock(state->mutex);
+                    if (sample.get_kind() == Z_SAMPLE_KIND_PUT)
+                    {
+                        try
+                        {
+                            state->tokens.insert_or_assign(key, Token::parse(key));
+                        }
+                        catch (const RosError&)
+                        {
+                            return;  // not a token rmw_zenoh would take
+                        }
+                    }
+                    else if (state->tokens.erase(key) == 0)
+                    {
+                        return;
+                    }
+                }
+                if (state->changed)
+                {
+                    state->changed();
+                }
+            },
+            zenoh::closures::none, std::move(options)));
+    }
+
+    Graph::~Graph()
+    {
+        state_->closed.store(true);
+        subscriber_.reset();
+    }
+
+    std::vector<Token> Graph::publishers(const std::optional<std::string>& topic) const
+    {
+        std::lock_guard lock(state_->mutex);
+        std::vector<Token> out;
+        for (const auto& [key, t] : state_->tokens)
+        {
+            if ((not topic or t.topic == *topic) and t.zid != state_->own_zid)
+            {
+                out.push_back(t);
+            }
+        }
+        return out;
+    }
+
+    bool Graph::by_xblick(const std::string& zid)
+    {
+        {
+            std::lock_guard lock(state_->mutex);
+            const auto known = state_->xblick.find(zid);
+            if (known != state_->xblick.end())
+            {
+                return known->second;
+            }
+        }
+        // a liveliness query of its declaration: a program declares itself before it takes part in ROS
+        // (open_session), so its declaration is known wherever its ROS tokens are
+        struct Asked
+        {
+            std::mutex mutex;
+            std::condition_variable cv;
+            bool found = false, done = false;
+        };
+        auto asked = std::make_shared<Asked>();
+        zenoh::Session::LivelinessGetOptions options;
+        options.timeout_ms = 1000;
+        session_.liveliness_get(
+            zenoh::KeyExpr(declaration_key(zid)),
+            [asked](const zenoh::Reply& reply) {
+                std::lock_guard lock(asked->mutex);
+                asked->found = asked->found or reply.is_ok();
+            },
+            [asked] {
+                std::lock_guard lock(asked->mutex);
+                asked->done = true;
+                asked->cv.notify_all();
+            },
+            std::move(options));
+        bool found = false;
+        {
+            std::unique_lock lock(asked->mutex);
+            // Zenoh does not always finalize a query at its timeout (replies() in camera.hpp): at most 1 s more
+            asked->cv.wait_for(lock, std::chrono::milliseconds(2000), [&] { return asked->done; });
+            found = asked->found;
+        }
+        std::lock_guard lock(state_->mutex);
+        state_->xblick[zid] = found;
+        return found;
+    }
+
+    // ------------------------------------------------------------------------------------------- GpuLink
+
+    namespace
+    {
+        // <key>/_buf/<gid in hex>: where a Lyrical publisher sends to one buffer-aware subscription
+        std::string buffer_key(const std::string& key, const std::array<std::uint8_t, 16>& gid)
+        {
+            static const char* digits = "0123456789abcdef";
+            std::string out = key + "/_buf/";
+            for (const std::uint8_t b : gid)
+            {
+                out += digits[b >> 4];
+                out += digits[b & 15];
+            }
+            return out;
+        }
+    }  // namespace
+
+    struct GpuLink::State
+    {
+        State(const std::string& topic, int device, std::string socket_dir, std::string shm_dir)
+            : link(topic, device, std::move(socket_dir), std::move(shm_dir))
+        {
+        }
+        ros_cuda::Link link;
+        std::mutex mutex;  // outs
+        std::map<std::string, std::shared_ptr<zenoh::Publisher>> outs;  // buffer key -> its publisher
+        std::string key;  // the publisher's data key
+    };
+
+    GpuLink::GpuLink(zenoh::Session& session, Publisher& publisher, int device, std::optional<std::string> socket_dir,
+                     std::optional<std::string> shm_dir)
+        : session_(session), publisher_(publisher)
+    {
+        if (publisher.type_name() != "sensor_msgs/msg/Image")
+        {
+            throw RosError(publisher.type_name() + ": the GPU link carries sensor_msgs/msg/Image");
+        }
+        try
+        {
+            state_ = std::make_shared<State>(publisher.topic(), device,
+                                             socket_dir.value_or(ros_cuda::socket_dir_from_environment()),
+                                             shm_dir.value_or(ros_cuda::shm_dir_from_environment()));
+        }
+        catch (const std::invalid_argument& error)
+        {
+            throw RosError(error.what());
+        }
+        state_->key = publisher.key();
+        const Token& token = publisher.entity().token;
+        const std::string pattern = std::string(kAdminSpace) + "/" + std::to_string(token.domain) + "/*/*/*/" +
+                                    std::string(kSubscription) + "/*/*/*/" + mangle(publisher.topic()) + "/" +
+                                    dds_type(publisher.type_name()) + "/" + *token.type_hash + "/**";
+        zenoh::Session::LivelinessSubscriberOptions options;
+        options.history = true;
+        std::weak_ptr<State> weak = state_;
+        tokens_.emplace(session.liveliness_declare_subscriber(
+            zenoh::KeyExpr(pattern),
+            [weak](const zenoh::Sample& sample) {
+                const std::shared_ptr<State> state = weak.lock();
+                if (not state)
+                {
+                    return;
+                }
+                const std::string key(sample.get_keyexpr().as_string_view());
+                if (sample.get_kind() != Z_SAMPLE_KIND_PUT)
+                {
+                    if (const auto gid = state->link.remove(key))
+                    {
+                        std::shared_ptr<zenoh::Publisher> gone;
+                        {
+                            std::lock_guard lock(state->mutex);
+                            const auto found = state->outs.find(buffer_key(state->key, *gid));
+                            if (found != state->outs.end())
+                            {
+                                gone = std::move(found->second);
+                                state->outs.erase(found);
+                            }
+                        }
+                    }
+                    return;
+                }
+                try
+                {
+                    const Token t = Token::parse(key);
+                    ros_cuda::Reader reader;
+                    reader.gid = gid(key);
+                    reader.backends = t.backends;
+                    const Qos qos = t.qos.value_or(Qos{});
+                    reader.keep_all = qos.history == kKeepAll;
+                    reader.depth = qos.depth;
+                    reader.node = t.fully_qualified_node();
+                    state->link.add(key, reader);
+                }
+                catch (const RosError&)
+                {
+                    // not a token rmw_zenoh would take: no reader
+                }
+            },
+            zenoh::closures::none, std::move(options)));
+    }
+
+    GpuLink::~GpuLink()
+    {
+        tokens_.reset();
+        std::lock_guard lock(state_->mutex);
+        state_->outs.clear();
+    }
+
+    std::string GpuLink::buf_key(const std::array<std::uint8_t, 16>& gid) const
+    {
+        return buffer_key(state_->key, gid);
+    }
+
+    std::shared_ptr<zenoh::Publisher> GpuLink::out(const std::string& key)
+    {
+        std::lock_guard lock(state_->mutex);
+        std::shared_ptr<zenoh::Publisher>& found = state_->outs[key];
+        if (not found)
+        {
+            zenoh::Session::PublisherOptions options;
+            options.congestion_control = congestion(publisher_.qos());
+            found = std::make_shared<zenoh::Publisher>(
+                session_.declare_publisher(zenoh::KeyExpr(key), std::move(options)));
+        }
+        return found;  // shared: a token that goes meanwhile drops only the map's
+    }
+
+    void GpuLink::say_notes()
+    {
+        for (const ros_cuda::Note& note : state_->link.notes())
+        {
+            say(note.text);
+        }
+    }
+
+    std::optional<ros_cuda::Plan> GpuLink::plan()
+    {
+        std::optional<ros_cuda::Plan> plan = state_->link.plan();
+        say_notes();
+        return plan;
+    }
+
+    std::vector<std::string> GpuLink::send_gpu(const ros_cuda::Plan& plan, CudaRingWriter& ring, std::uint32_t slot,
+                                               std::uint64_t nbytes, const ros_cuda::ImageHeader& header,
+                                               const std::vector<std::uint8_t>& attachment)
+    {
+        auto messages = state_->link.gpu_messages(plan, ring, slot, nbytes, header);
+        say_notes();
+        std::vector<std::string> sent;
+        for (auto& [gid, payload] : messages)
+        {
+            const std::string key = buf_key(gid);
+            zenoh::Publisher::PutOptions options;
+            options.attachment = zenoh::Bytes(attachment);
+            out(key)->put(zenoh::Bytes(std::move(payload)), std::move(options));
+            sent.push_back(key);
+        }
+        return sent;
+    }
+
+    std::vector<std::string> GpuLink::send_cpu(const ros_cuda::Plan& plan, std::span<const std::uint8_t> payload,
+                                               const std::vector<std::uint8_t>& attachment)
+    {
+        std::vector<std::string> keys;
+        if (plan.cpu_group)
+        {
+            keys.push_back(cpu_group_key(state_->key));
+        }
+        for (const auto& gid : plan.cpu)
+        {
+            keys.push_back(buf_key(gid));
+        }
+        for (const std::string& key : keys)
+        {
+            zenoh::Publisher::PutOptions options;
+            options.attachment = zenoh::Bytes(attachment);
+            out(key)->put(zenoh::Bytes(std::vector<std::uint8_t>(payload.begin(), payload.end())), std::move(options));
+        }
+        return keys;
+    }
+
+    ros_cuda::LinkStats GpuLink::stats() const
+    {
+        return state_->link.stats();
     }
 
     // What a subscription's callbacks share (Zenoh's threads may still call them while it goes): the reader's

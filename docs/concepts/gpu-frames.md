@@ -108,7 +108,8 @@ A ROS 2 Lyrical node can accept image data as a CUDA buffer through ROS 2's CUDA
 (`cuda_buffer_backend`, experimental upstream). Isaac ROS nodes do this. Such a reader gets our GPU frames on the GPU
 as well. [GPU frames for ROS readers](../integrations/ros2.md#gpu-frames-for-ros-readers) lists what the reader
 needs. In short, it runs on `rmw_zenoh` with the backend's plugin, as the same Linux user on the same PC and GPU, and
-it shares `/dev/shm`, `/tmp`, the process ids and the network with the publisher.
+it shares `/tmp`, the process ids and the network with the publisher. The publisher reaches its `/dev/shm`: the
+same one, or the reader's own through `XBLICK_ROS_CUDA_SHM`.
 
 The backend's reader maps one whole CUDA allocation from its start. A slot of our CUDA ring is a part of one
 allocation, so the reader cannot map it. The publisher therefore keeps a small pool of blocks, each one allocation of
@@ -156,8 +157,8 @@ time. The pool had 11 blocks, which take 66 MiB of GPU memory.
 - A reader sets up CUDA when its first frame arrives. When 16 readers opened one ring at the same time, each reader
   needed about 3 s for this.
 - We measured the copy between GPUs on one machine with two GPUs of the same model.
-- A ROS reader gets CUDA buffers only from the Python `CameraPublisher`, only on the publisher's GPU, and only
-  through a backend whose wire format matches ours. The backend is experimental and has no version on the wire.
+- A ROS reader gets CUDA buffers only from a `CameraPublisher` with `cuda_device`, only on the publisher's GPU,
+  and only through a backend whose wire format matches ours. The backend is experimental and has no version on the wire.
 - A ROS reader on another GPU gets the bytes. The backend's reader cannot copy between GPUs.
 
 ## Related pages
