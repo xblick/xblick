@@ -21,6 +21,7 @@
 #include "xblick/ray_cloud.hpp"
 #include "xblick/rectify.hpp"
 #include "xblick/ring.hpp"
+#include "xblick/ros_cuda.hpp"
 #include "xblick/ros_gid.hpp"
 #include "xblick/rvl.hpp"
 #include "xblick/version.hpp"
@@ -420,6 +421,13 @@ NB_MODULE(_core, m)
                 w.read_host(slot, out.data(), nbytes_of(out));
             },
             "slot"_a, "out"_a)
+        .def(
+            "copy_slot",
+            [](xblick::CudaRingWriter& w, std::uint32_t slot, std::uint64_t dst, std::uint64_t nbytes) {
+                nb::gil_scoped_release release;
+                w.copy_slot(slot, dst, nbytes);
+            },
+            "slot"_a, "dst"_a, "nbytes"_a, "Copy a slot to device memory of the ring's device; returns when done.")
         .def_prop_ro("endpoint", &xblick::CudaRingWriter::endpoint)
         .def_prop_ro("device_uuid", &xblick::CudaRingWriter::device_uuid)
         .def_prop_ro("device", &xblick::CudaRingWriter::device)
@@ -450,4 +458,99 @@ NB_MODULE(_core, m)
         .def_prop_ro("ring_device", &xblick::CudaRingReader::ring_device)
         .def_prop_ro("direct", &xblick::CudaRingReader::direct)
         .def_prop_ro("slot_count", &xblick::CudaRingReader::slot_count);
+
+    // the GPU link to ROS readers (ros_cuda.hpp)
+    namespace rc = xblick::ros_cuda;
+    m.attr("ROS_CUDA_HOLD_LIMIT_S") = rc::kHoldLimitS;
+    m.attr("ROS_CUDA_MIN_REUSE_S") = rc::kMinReuseS;
+    m.attr("ROS_CUDA_SPARE_BLOCKS") = rc::kSpareBlocks;
+    m.attr("ROS_CUDA_MAX_BLOCKS") = rc::kMaxBlocks;
+    m.attr("ROS_CUDA_SOCKET_DIR") = rc::kDefaultSocketDir;
+    m.attr("ROS_CUDA_SHM_DIR") = rc::kDefaultShmDir;
+    m.attr("ROS_CUDA_SUBSCRIPTION") = rc::kSubscription;
+    m.def("ros_cuda_image_payload",
+          [](std::int32_t sec, std::uint32_t nanosec, const std::string& frame_id, std::uint32_t height,
+             std::uint32_t width, const std::string& encoding, std::uint8_t is_bigendian, std::uint32_t step,
+             const nb::dict& d) {
+              rc::Descriptor descriptor;
+              descriptor.size = nb::cast<std::uint64_t>(d["size"]);
+              descriptor.device_id = nb::cast<std::int32_t>(d["device_id"]);
+              descriptor.use_ipc = nb::cast<bool>(d["use_ipc"]);
+              descriptor.pid = nb::cast<std::int32_t>(d["pid"]);
+              descriptor.block_id = nb::cast<std::uint32_t>(d["block_id"]);
+              descriptor.block_size = nb::cast<std::uint64_t>(d["block_size"]);
+              descriptor.socket_path = nb::cast<std::string>(d["socket_path"]);
+              descriptor.uid = nb::cast<std::uint64_t>(d["uid"]);
+              if (d.contains("event"))  // an IPC event handle (64 bytes); without one all zero
+              {
+                  const auto event = nb::cast<nb::bytes>(d["event"]);
+                  if (event.size() != descriptor.event.size())
+                  {
+                      throw nb::value_error("an IPC event handle has 64 bytes");
+                  }
+                  std::memcpy(descriptor.event.data(), event.c_str(), event.size());
+              }
+              const auto payload = rc::image_payload({sec, nanosec, frame_id, height, width, encoding, is_bigendian,
+                                                      step}, descriptor);
+              return nb::bytes(reinterpret_cast<const char*>(payload.data()), payload.size());
+          },
+          "sec"_a, "nanosec"_a, "frame_id"_a, "height"_a, "width"_a, "encoding"_a, "is_bigendian"_a, "step"_a,
+          "descriptor"_a, "sensor_msgs/Image in CDR with a CUDA buffer descriptor (a dict of its fields) as its data");
+    m.def("ros_cuda_registry_name", &rc::registry_name, "the CUDA buffer backend's host registry file name");
+    m.def("ros_cuda_registry_lookup",
+          [](const std::string& shm_dir, const nb::bytes& gid) -> std::optional<nb::dict> {
+              if (gid.size() != 16)
+              {
+                  throw nb::value_error("a gid has 16 bytes");
+              }
+              std::array<std::uint8_t, 16> key{};
+              std::memcpy(key.data(), gid.c_str(), 16);
+              const auto entry = rc::registry_lookup(shm_dir, key);
+              if (not entry)
+              {
+                  return std::nullopt;
+              }
+              nb::dict out;
+              out["pid"] = entry->pid();
+              out["instance_id"] = entry->instance_id;
+              out["entity_type"] = entry->entity_type;
+              out["device_id"] = entry->device_id;
+              out["uid"] = entry->uid;
+              out["ipc_capable"] = entry->ipc_capable;
+              out["name"] = entry->name;
+              return out;
+          },
+          "shm_dir"_a, "gid"_a, "the active entry of a gid in the CUDA buffer backend's host registry, or None");
+    nb::class_<rc::ExportPool>(m, "RosCudaPool")
+        .def(nb::init<int, std::string, std::string, std::uint32_t, double, double>(), "device"_a,
+             "socket_dir"_a = rc::kDefaultSocketDir, "shm_dir"_a = rc::kDefaultShmDir,
+             "max_blocks"_a = rc::kMaxBlocks, "hold_limit_s"_a = rc::kHoldLimitS,
+             "min_reuse_s"_a = rc::kMinReuseS)
+        .def("acquire", &rc::ExportPool::acquire, "nbytes"_a, "reuse_frames"_a,
+             "a block no reader holds or queues (its index), or -1 when there is none (counted as dropped)")
+        .def("block_ptr", &rc::ExportPool::block_ptr, "index"_a)
+        .def(
+            "publish",
+            [](rc::ExportPool& p, int index, std::uint64_t nbytes) {
+                const rc::Descriptor d = p.publish(index, nbytes);
+                nb::dict out;
+                out["size"] = d.size;
+                out["device_id"] = d.device_id;
+                out["use_ipc"] = d.use_ipc;
+                out["pid"] = d.pid;
+                out["block_id"] = d.block_id;
+                out["block_size"] = d.block_size;
+                out["socket_path"] = d.socket_path;
+                out["uid"] = d.uid;
+                return out;
+            },
+            "index"_a, "nbytes"_a, "a new uid in the block's record, and its descriptor (a dict)")
+        .def_prop_ro("dropped", &rc::ExportPool::dropped)
+        .def_prop_ro("expired", &rc::ExportPool::expired)
+        .def_prop_ro("blocks", &rc::ExportPool::blocks)
+        .def_prop_ro("accepts", &rc::ExportPool::accepts)
+        .def_prop_ro("refused", &rc::ExportPool::refused)
+        .def_prop_ro("device", &rc::ExportPool::device)
+        .def_prop_ro("socket_dir", &rc::ExportPool::socket_dir)
+        .def_prop_ro("shm_dir", &rc::ExportPool::shm_dir);
 }

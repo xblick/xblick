@@ -64,7 +64,7 @@ find_package(Threads REQUIRED)
 
 add_library(xblick_core cpp/src/ring.cpp cpp/src/cuda_ring.cpp cpp/src/rvl.cpp cpp/src/ray_cloud.cpp
             cpp/src/rectify.cpp cpp/src/pairing.cpp cpp/src/paths.cpp cpp/src/command.cpp
-            cpp/src/ros_gid.cpp)
+            cpp/src/ros_gid.cpp cpp/src/ros_cuda.cpp)
 add_library(xblick::core ALIAS xblick_core)
 set_target_properties(xblick_core PROPERTIES EXPORT_NAME core)
 target_include_directories(xblick_core
@@ -149,6 +149,9 @@ if(BUILD_TESTING)
   add_executable(test_ros_gid cpp/tests/test_ros_gid.cpp)
   target_link_libraries(test_ros_gid PRIVATE xblick_core)
   add_test(NAME ros_gid COMMAND test_ros_gid)
+  add_executable(test_ros_cuda cpp/tests/test_ros_cuda.cpp)
+  target_link_libraries(test_ros_cuda PRIVATE xblick_core)
+  add_test(NAME ros_cuda COMMAND test_ros_cuda)
   add_test(NAME cuda_ring COMMAND test_rings cuda)
   set_tests_properties(cuda_ring PROPERTIES SKIP_RETURN_CODE 77)  # no GPU: skipped, not failed
   if(XBLICK_CAMERA)

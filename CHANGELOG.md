@@ -25,6 +25,7 @@ streams, transforms and parameters, and it reads theirs.
 - `CountedPublisher.ros_matched`: a ROS subscriber of the key's mirror (`matched` stays our key's).
 - Readers of ROS topics: transport `ros` for images and clouds (`xblick hz`, `xblick snapshot`), `DetectionSubscriber(ros_type=...)`, `TransformBuffer(ros=True)`.
 - ROS 2 Lyrical (`rmw_zenoh_cpp` 0.10.6 or newer): readers of images, compressed images and clouds also take them from Lyrical publishers, which send these types on keys of their own (Python and C++).
+- GPU frames to ROS 2 Lyrical readers that accept CUDA buffers (`cuda_buffer_backend`, experimental upstream), Isaac ROS nodes among them: a Python `CameraPublisher` with `cuda_device` sends them a CUDA buffer on the same PC, user and GPU, the other readers get the bytes as before; `XBLICK_ROS_CUDA=0` turns it off.
 - The C++ API and programs (`xblick-cpp-camera`, `xblick-cpp-probe`, `xblick-points`) take part the same way: the options in `Options::add_session_options`, `SessionOptions::ros`, `Transport::Ros`.
 - `--no-ros` and `XBLICK_ROS=0` (only 0 and 1 are taken) turn the part in ROS 2 off; `--ros-clock KEY` sends a clock key to ROS's `/clock` for `use_sim_time`.
 - A fixed frame that another program sends on `/tf_static` with another parent or transform is one error line; a second ROS node of the program's name is one warning line.

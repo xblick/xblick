@@ -38,7 +38,7 @@ from dataclasses import dataclass, field, replace
 import numpy as np
 import zenoh
 
-from . import _core, declaration, ros, topics
+from . import _core, declaration, ros, ros_cuda, topics
 from .codecs import JPEG, PNG, check_codec, compress, decompress
 from .encodings import check_array, image_to_numpy, info, numpy_to_image
 from .gpu import (CudaArray, CudaImage, check_cuda_array, cuda_array, device_ordinal, device_uuid, is_cuda_array,
@@ -213,7 +213,8 @@ class CameraPublisher:
     A session in ROS 2 (``session.ros``, the default) also offers the stream to ROS 2 under ``/<base>/image_raw`` and
     ``/<base>/camera_info`` (each frame's camera_info with the image's header, as image_transport has it), and under
     ``/<base>/image_raw/compressed`` with codec jpeg or png (image_transport's compressed format); RVL has no ROS
-    topic. Each only while a ROS subscriber is there; the rings and our keys stay as they are."""
+    topic. Each only while a ROS subscriber is there; the rings and our keys stay as they are. With ``cuda_device``, a
+    ROS reader that accepts CUDA buffers gets a frame that is in the CUDA ring as one (ros_cuda.py)."""
 
     def __init__(self, session: zenoh.Session, base: str, *, encoding: str, frame_id: str,
                  camera_info: CameraInfo | None = None, source: str = "", codec: str | None = JPEG,
@@ -261,11 +262,15 @@ class CameraPublisher:
         self._sent = ({str(p.key_expr): SentCount(session, p) for p in (self._raw, self._compressed, self._info)
                        if p is not None} if blocking else {})
         self._ros_raw = self._ros_compressed = self._ros_info = None
+        self._ros_gpu: ros_cuda.GpuLink | None = None
         taking_part = getattr(session, "ros", None)
         # a base that is no ROS name (a "-" in it): not offered to ROS, one warning line (ros.offered_topic)
         if taking_part is not None and ros.offered_topic(topics.image_raw(self.base)) is not None:
             node = taking_part.node
             self._ros_raw = node.publisher(ros.topic_of(topics.image_raw(self.base)), Image.TYPE)
+            if cuda_device is not None and ros_cuda.enabled_by_environment():
+                # frames on the GPU go to ROS readers that accept CUDA buffers as such (ros_cuda.py)
+                self._ros_gpu = ros_cuda.GpuLink(self._ros_raw, cuda_device)
             if codec in (JPEG, PNG):  # image_transport's compressed plugin; RVL is no ROS format there
                 self._ros_compressed = node.publisher(ros.topic_of(topics.compressed(self.base)), CompressedImage.TYPE)
             self._ros_info = node.publisher(ros.topic_of(topics.camera_info(self.base)), CameraInfo.TYPE)
@@ -375,7 +380,18 @@ class CameraPublisher:
                 sent.append(str(self._cuda.key_expr))
         compressed = encode and self._compressed is not None and want[self._compressed]
         ros_compressed = encode and want["ros_compressed"]
-        raw = want[self._raw] or want["ros_raw"]
+        # the GPU link (ros_cuda.py): a frame in the CUDA ring goes to ROS readers that accept CUDA buffers as one,
+        # the message then on the buffer keys only; the CPU form only if another ROS reader needs it
+        plan = (self._ros_gpu.plan() if self._ros_gpu is not None and want["ros_raw"] and cuda_slot is not None
+                else None)
+        ros_raw = want["ros_raw"] and (plan is None or plan.needs_cpu)
+        ros_attachment = self._ros_raw.attachment() if plan is not None else None
+        if plan is not None:
+            channels = 1 if len(image.shape) == 2 else image.shape[2]
+            sent += self._ros_gpu.send_gpu(plan, self._cuda_ring, cuda_slot[0], image.nbytes, header, image.shape[0],
+                                           image.shape[1], self.encoding,
+                                           image.shape[1] * channels * image.dtype.itemsize, ros_attachment)
+        raw = want[self._raw] or ros_raw
         if raw or compressed or ros_compressed or want[self._shm]:
             host = image
             if gpu:  # one download for all CPU representations
@@ -390,7 +406,9 @@ class CameraPublisher:
                 payload = numpy_to_image(host, self.encoding, header).serialize()
                 if want[self._raw]:
                     self._put(self._raw, payload, attachment, sent)
-                if want["ros_raw"]:
+                if ros_raw and plan is not None:
+                    sent += self._ros_gpu.send_cpu(plan, payload, ros_attachment)
+                elif ros_raw:
                     self._put_ros(self._ros_raw, payload, sent)
             if compressed or ros_compressed:
                 payload = compress(host, self.encoding, self.codec, self.jpeg_quality, header).serialize()
@@ -456,6 +474,8 @@ class CameraPublisher:
             count.close()
         for publisher in self._image_publishers() + [self._info]:
             publisher.undeclare()
+        if self._ros_gpu is not None:
+            self._ros_gpu.close()
         for publisher in (self._ros_raw, self._ros_compressed, self._ros_info):
             if publisher is not None:
                 publisher.close()

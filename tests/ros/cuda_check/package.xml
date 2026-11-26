@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>xblick_cuda_check</name>
+  <version>0.0.0</version>
+  <description>A stock CUDA-buffer Image subscriber for xblick's GPU link test (tests/test_ros_cuda_live.py)</description>
+  <maintainer email="none@example.invalid">xblick tests</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>cuda_buffer</depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

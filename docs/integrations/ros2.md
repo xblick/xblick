@@ -255,7 +255,7 @@ The C++ API takes part in ROS 2 as the Python API does, with the same keys, toke
 ROS, and `Parameters` serves the six parameter services on the program's node with the same rules as in Python. A publisher that offers only
 its rings, such as a relay's, offers nothing to ROS.
 
-Three differences remain:
+Four differences remain:
 
 - `rmw_zenoh` keeps `/tf_static` for late subscribers with zenoh-ext's advanced publisher. zenoh-c offers it only with
   its unstable API, which its standalone release lacks. The C++ publisher answers late subscribers with its own
@@ -265,6 +265,8 @@ Three differences remain:
   writer blocks therefore also blocks that Zenoh thread, and with it the other traffic that thread delivers. A set
   refused because sets through ROS are off is refused before its parameters are decoded.
 - The C++ API offers no `ParameterClient` for a ROS node yet.
+- The C++ `CameraPublisher` sends its GPU frames to ROS readers as bytes. Only the Python one sends them as CUDA
+  buffers ([GPU frames for ROS readers](#gpu-frames-for-ros-readers)).
 
 ## ROS 2 on DDS through a bridge
 
@@ -343,6 +345,58 @@ These limits hold for ROS 2 nodes behind `zenoh-bridge-ros2dds`:
   The bridge creates a topic only for a reader that names its type, so the topics never appear. Record on the direct
   route through `rmw_zenoh` instead.
 
+## GPU frames for ROS readers
+
+A ROS 2 Lyrical subscriber can accept image data as a CUDA buffer. Such a subscriber, an Isaac ROS node for
+example, receives a frame that a publisher of ours has on the GPU as a CUDA buffer. The frame then stays in GPU
+memory. Every other ROS reader gets the bytes as before. Our own readers are not affected.
+
+This uses ROS 2's CUDA buffer backend `cuda_buffer_backend` of `ros2/rosidl_buffer_backends`. The backend is
+experimental upstream, and its wire format carries no version. Its released package 0.1.2 and its current source
+already differ in how the reader fetches a block, and our publisher serves both forms. A later change of the backend
+can break the link until Durchblick follows it.
+
+A publisher of ours with `cuda_device` sends a frame as a CUDA buffer while all of these hold for the reader:
+
+1. The reader runs on `rmw_zenoh_cpp` and has the backend's plugin `ros-lyrical-cuda-buffer-backend`. Isaac ROS's
+   packages do not install this plugin.
+2. The reader accepts the backend, for example with `acceptable_buffer_backends = "any"`.
+3. The reader runs on the same PC and as the same Linux user as the publisher.
+4. The reader shares the publisher's `/dev/shm`, its process ids, its network namespace and its socket directory
+   (`/tmp` by default) at the same path. A container needs `--ipc host`, `--pid host`, `--network host` and
+   `-v /tmp:/tmp`. The release 0.1.2 fetches a block through a socket file in that directory. The current source
+   connects to a socket of the same name in the network namespace.
+5. The reader uses the publisher's GPU. A reader that sees one GPU is compared by that GPU. A reader that sees
+   several GPUs needs the publisher's `CUDA_VISIBLE_DEVICES` and `CUDA_DEVICE_ORDER`, because the backend compares
+   CUDA ordinals only.
+6. The reader keeps the last few messages of its topic (`KEEP_LAST`). A reader that keeps all messages gets the bytes.
+7. No reader of the topic is older than Lyrical. A Jazzy reader reads only the topic's key, and then all readers of
+   that topic get the bytes there.
+
+A reader that accepts the backend and misses one of these conditions gets the bytes. The publisher prints one line
+that names the reason.
+
+The publisher keeps the CUDA ring as it is. While at least one such reader is there, it copies each frame on the GPU
+into a block of a small pool of its own and sends the block's descriptor to the reader. The reader maps the block in
+place. The publisher allocates nothing before the first such reader appears, and it removes the blocks and their
+files when it closes.
+
+The publisher never waits for a reader. It rewrites a block only when no reader holds the block. It also waits until
+as many frames as the readers' queues hold have gone out since the block's last frame, so that no queued message
+loses its block. A block that a reader holds longer than 2 s counts as free again, because a reader that crashed never
+gives it back. When every block is held,
+the frame does not go to these readers, and the publisher counts it. The pool has at most the readers' queue depth
+plus five blocks. A 1080p `rgb8` block takes 6 MiB of GPU memory.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `XBLICK_ROS_CUDA` | `1` | `0` sends the bytes to every ROS reader |
+| `XBLICK_ROS_CUDA_SOCKETS` | `/tmp` | the directory of the sockets that hand out the blocks |
+| `XBLICK_ROS_CUDA_SHM` | `/dev/shm` | the readers' `/dev/shm` as the publisher sees it |
+
+Only the Python `CameraPublisher` sends GPU frames to ROS readers so far. [Frames on the
+GPU](../concepts/gpu-frames.md#ros-2-readers) explains the mechanism.
+
 ## Wire format
 
 The [protocol](../concepts/protocol.md#ros-2-on-rmw_zenoh) page lists the keys, the attachment, the tokens and the
@@ -360,7 +414,11 @@ type hashes of the part in ROS 2.
 - A subscriber of every key (`**`), such as the traffic meter of the terminal interface, also subscribes to the ROS
   copies. The publishers then send them as well. The terminal interface shows and counts our keys only.
 - The C++ tool `xblick-cpp-camera` keeps its fixed frame `TestCamera`. It serves the tests, which compare its bytes.
-- To make the streams visible to ROS 2 nodes that read rings in place, ROS 2 Lyrical's buffer backends
-  (`rosidl::Buffer`) would be needed. [Alternatives](../project/alternatives.md) describes these projects.
+- A ROS 2 reader gets GPU frames as CUDA buffers only from the Python `CameraPublisher`, only on `rmw_zenoh`, and
+  only on the publisher's PC and GPU ([GPU frames for ROS readers](#gpu-frames-for-ros-readers)). Point clouds and
+  frames from ROS publishers into our readers go as bytes. [Alternatives](../project/alternatives.md) describes the
+  buffer backends.
+- The CUDA buffer backend keeps a registry in `/dev/shm`, which the first Linux user's ROS node creates. A ROS node
+  of a second user with the backend then fails to start on that PC. This is a limit of the backend.
 - [ROS 2 by default](../project/ros-roadmap.md) collects the facts behind the part in ROS 2 and the options that
   would change our own keys.
