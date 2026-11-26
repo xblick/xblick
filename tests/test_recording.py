@@ -14,7 +14,7 @@ from xblick.camera import (CameraPublisher, ImageSubscriber, StaticTransformPubl
                            cdr_encoding, find_streams)
 from xblick.codecs import PNG
 from xblick.gpu import CudaImage
-from xblick.session import open_session
+from xblick.session import open_session, replies
 from xblick.detections import DetectionPublisher, DetectionSubscriber
 from xblick.msg import (BoundingBox3D, CameraInfo, CompressedImage, Detection3D, Detection3DArray, Header,
                         ObjectHypothesis, ObjectHypothesisWithPose, Point, Pose, Quaternion, TFMessage, Time, Transform,
@@ -141,6 +141,10 @@ def test_record_and_play(sessions, tmp_path):  # noqa: F811
     static = StaticTransformSubscriber(b, f"replay/{CAMERA}", statics.append)
     wait_until(lambda: statics)
     assert statics[0].transforms[0].child_frame_id == "depth"
+    # zenoh-ext's form (zenoh-bridge-ros2dds for a late transient-local ROS subscriber): once, on the played key
+    bridge = [r.ok for r in replies(b, f"replay/{CAMERA}/tf_static/@adv/**?_max=100;_anyke", 1.0) if r.ok is not None]
+    assert [str(r.key_expr) for r in bridge] == [f"replay/{CAMERA}/tf_static"]
+    assert TFMessage.deserialize(bridge[0].payload.to_bytes()).transforms[0].child_frame_id == "depth"
     assert player.sent == len(messages)
     for c in (static, boxes, raw, compressed, images, player, recorder, scene):
         c.close()

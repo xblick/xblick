@@ -85,7 +85,7 @@ import zenoh
 
 from . import _core, declaration, ros, topics
 from .camera import (FIND_PERIOD, SENT_VERSION, CameraPublisher, ProtocolError, _attachment, _check_encoding,
-                     congestion, find_streams, parse_attachment)
+                     _declare_advanced_history, congestion, find_streams, parse_attachment)
 from .codecs import parse_format
 from .msg import CameraInfo, Clock, CompressedImage, Message, Time
 from .msgdefs import MSGDEFS
@@ -1543,6 +1543,8 @@ class Player(Paced):
             out = self._out(key)
             if key.endswith(topics.TF_STATIC):
                 self._queryables.append(self.session.declare_queryable(out, lambda q, k=key: self._answer_static(k, q)))
+                self._queryables.append(_declare_advanced_history(self.session, out,
+                                                                 lambda q, k=key: self._answer_static(k, q)))
             if not key.endswith("/" + topics.CAMERA_INFO):  # those go with their stream's frames
                 self._publishers[key] = self.session.declare_publisher(out, encoding=zenoh.Encoding(encoding),
                                                                        congestion_control=self._congestion)

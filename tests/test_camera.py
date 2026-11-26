@@ -352,6 +352,39 @@ def test_static_transforms(sessions):
     publisher.close()
 
 
+def test_static_transforms_for_zenoh_ext(sessions):
+    """zenoh-bridge-ros2dds asks zenoh-ext's form for a late transient-local ROS subscriber: ``<key>/@adv/**`` with
+    ``_max`` and ``_anyke``. It gets the transforms once, on the key itself; a query without ``_anyke`` gets none.
+    Durchblick's own queries (the key, a wildcard below the camera) still get one answer."""
+    from xblick.camera import StaticTransformPublisher, StaticTransformSubscriber, cdr_encoding
+    from xblick.msg import Header, Quaternion, TFMessage, Time, Transform, TransformStamped, Vector3
+
+    a, b = sessions
+    camera = BASE.rpartition("/")[0]
+    key = topics.tf_static(camera)
+    transforms = [TransformStamped(Header(Time(1, 2), "depth"), "rgb",
+                                   Transform(Vector3(-0.032, 0.002, 0.004), Quaternion(0.1, 0.0, 0.0, 0.995)))]
+    publisher = StaticTransformPublisher(a, camera, transforms)
+    late = []
+    subscriber = StaticTransformSubscriber(b, camera, late.append)  # b now knows the publisher's queryables
+    wait_until(lambda: late)
+
+    def ok(selector):
+        return [r.ok for r in replies(b, selector, 1.0) if r.ok is not None]
+
+    (bridge,) = ok(f"{key}/@adv/**?_max=100;_anyke")
+    assert str(bridge.key_expr) == key
+    assert str(bridge.encoding) == str(cdr_encoding(TFMessage))
+    assert TFMessage.deserialize(bridge.payload.to_bytes()) == TFMessage(transforms=transforms)
+    assert ok(f"{key}/@adv/**?_max=100") == []  # the reply's key lies outside the query's key
+    assert [str(r.key_expr) for r in ok(key)] == [key]
+    assert [str(r.key_expr) for r in ok(f"{camera}/**")] == [key]  # ** matches no chunk that starts with @
+    time.sleep(0.3)  # an answer of the new queryable to the subscriber's query would have come by now
+    assert late == [TFMessage(transforms=transforms)]
+    subscriber.close()
+    publisher.close()
+
+
 @pytest.mark.skipif(_core.cuda_device_count() == 0, reason="no CUDA device")
 def test_local_auto_takes_the_cuda_ring_on_its_gpu(sessions, monkeypatch):  # noqa: F811
     """local "auto" (the default): the publisher's CUDA ring when it is on the subscriber's GPU (by the GPU's UUID,

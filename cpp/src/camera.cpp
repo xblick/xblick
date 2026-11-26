@@ -772,14 +772,25 @@ namespace xblick
                                                        TFMessage transforms)
         : key_(check_name(camera) + "/" + std::string(p::kTfStatic)), payload_(transforms.serialize())
     {
-        // the queryable first: a subscriber that starts after the put asks for it
-        queryable_ = session.declare_queryable(
-            zenoh::KeyExpr(key_),
-            [this](const zenoh::Query& query)
+        // the queryables first: a subscriber that starts after the put asks for it
+        auto answer = [this](const zenoh::Query& query)
+        {
+            zenoh::Query::ReplyOptions options;
+            options.encoding = zenoh::Encoding(p::kTFMessageType.encoding());
+            query.reply(zenoh::KeyExpr(key_), zenoh::Bytes(payload_), std::move(options));
+        };
+        queryable_ = session.declare_queryable(zenoh::KeyExpr(key_), answer, zenoh::closures::none);
+        // zenoh-ext's AdvancedSubscriber (zenoh-bridge-ros2dds) asks <key>/@adv/** and takes the reply on the key
+        // itself, which lies outside the query's key: only a query with _anyke accepts it, another gets no reply
+        history_queryable_ = session.declare_queryable(
+            zenoh::KeyExpr(key_ + "/" + std::string(p::kAdvancedPublisher) + "/" + session.get_zid().to_string() +
+                           "/**"),
+            [answer](const zenoh::Query& query)
             {
-                zenoh::Query::ReplyOptions options;
-                options.encoding = zenoh::Encoding(p::kTFMessageType.encoding());
-                query.reply(zenoh::KeyExpr(key_), zenoh::Bytes(payload_), std::move(options));
+                if (query.get_accepts_replies() == Z_REPLY_KEYEXPR_ANY)
+                {
+                    answer(query);
+                }
             },
             zenoh::closures::none);
         zenoh::Session::PutOptions options;

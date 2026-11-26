@@ -215,6 +215,7 @@ NB_MODULE(_core, m)
     protocol.attr("INFO") = std::string(p::kInfo);
     protocol.attr("WANT") = std::string(p::kWant);
     protocol.attr("TF_STATIC") = std::string(p::kTfStatic);
+    protocol.attr("ADVANCED_PUBLISHER") = std::string(p::kAdvancedPublisher);
     protocol.attr("TF") = std::string(p::kTf);
     protocol.attr("IMU") = std::string(p::kImu);
     protocol.attr("DIAGNOSTICS") = std::string(p::kDiagnostics);

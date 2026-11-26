@@ -39,6 +39,10 @@
 //   tf_static             tf2_msgs/msg/TFMessage: the fixed transforms between its streams' frames (header.frame_id
 //                         of their camera_info), as ROS's /tf_static; published once and answered on request (a
 //                         queryable on the same key), so that a subscriber that starts later gets them too
+//   tf_static/@adv/pub/<zid>/**  queryable: the same answer, on the key tf_static, to zenoh-ext's AdvancedSubscriber,
+//                         which asks tf_static/@adv/** with _anyke (zenoh-bridge-ros2dds for a transient-local
+//                         ROS subscriber); <zid> the publisher's session. A chunk that starts with @ matches no
+//                         wildcard, so Durchblick's own queries never reach it
 //   tf                    tf2_msgs/msg/TFMessage: the camera's moving transforms, as ROS's /tf: its pose in the
 //                         world (header.frame_id "world", child a frame of its streams), stamped as the image taken
 //                         from it, one message per image (the simulation; on a robot: from the robot's state)
@@ -167,6 +171,8 @@ namespace xblick::protocol
     inline constexpr std::string_view kInfo = "info";
     inline constexpr std::string_view kWant = "want";  // below a stream: the readers' want tokens (above)
     inline constexpr std::string_view kTfStatic = "tf_static";  // below a camera, not a stream
+    // below a once-published key, then the session's zid: zenoh-ext's space of that session's AdvancedPublisher
+    inline constexpr std::string_view kAdvancedPublisher = "@adv/pub";
     inline constexpr std::string_view kTf = "tf";                // below a camera
     inline constexpr std::string_view kImu = "imu";                  // below a camera
     inline constexpr std::string_view kDiagnostics = "diagnostics";  // below a camera

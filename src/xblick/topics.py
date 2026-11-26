@@ -24,7 +24,8 @@ A point cloud stream (e.g. ``test/camera/points``) has the same structure:
 * ``<base>/info``                  as above
 
 A camera ``<namespace>/<camera>`` with several streams has ``<camera>/tf_static`` (tf2_msgs/TFMessage): the fixed
-transforms between its streams' frames, as ROS's ``/tf_static``; published once and answered on request;
+transforms between its streams' frames, as ROS's ``/tf_static``; published once and answered on request (also to
+zenoh-ext's AdvancedSubscriber: ``advanced_history``);
 ``<camera>/tf`` (tf2_msgs/TFMessage): its moving transforms, as ROS's ``/tf``, its pose in the world (parent frame
 ``world``) stamped as the image taken from it, one message per image. And
 ``<camera>/imu`` (sensor_msgs/Imu, one message per sample) and ``<camera>/diagnostics``
@@ -72,6 +73,7 @@ SHM = _protocol.SHM
 CUDA = _protocol.CUDA
 INFO = _protocol.INFO
 TF_STATIC = _protocol.TF_STATIC
+ADVANCED_PUBLISHER = _protocol.ADVANCED_PUBLISHER
 TF = _protocol.TF
 WORLD = "world"  # the parent frame of the cameras' poses on <camera>/tf
 MAP = "map"  # the localisation's map frame (<robot>/tf: world -> map -> odom -> root)
@@ -197,6 +199,14 @@ def wanted_stream(key: str) -> str:
 
 def tf_static(camera: str) -> str:
     return f"{check_name(camera)}/{TF_STATIC}"
+
+
+def advanced_history(key: str, zid: str) -> str:
+    """The queryable of a once-published ``key`` (a ``tf_static``) for zenoh-ext's AdvancedSubscriber, as
+    zenoh-bridge-ros2dds declares one for a transient-local ROS subscriber: it asks ``<key>/@adv/**`` and takes the
+    reply on ``key`` itself. ``@adv/pub/<zid>`` is zenoh-ext's space of the session ``zid``'s publisher of ``key``.
+    A chunk that starts with ``@`` matches no wildcard, so no query of Durchblick reaches it."""
+    return f"{key}/{ADVANCED_PUBLISHER}/{zid}/**"
 
 
 def tf(camera: str) -> str:
