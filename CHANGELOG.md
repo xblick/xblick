@@ -11,15 +11,20 @@ Each version below is a heading with its release notes: one summary sentence, th
 (and Known limit), one line on compatibility. `tools/release_notes.sh <version>` prints a version's notes for its
 GitHub release. The rule is in [Development](docs/project/development.md#release-notes).
 
-## 0.5.16
+## 0.5.17
 
-A script that ends without closing what it opened now exits.
+A script that ends without closing what it opened now exits. 0.5.16 was not released.
 
 ### Fixed
 
-- A script that ends without closing its session or subscriber no longer hangs at interpreter exit.
+- A script that ends without closing its session or subscriber no longer hangs at interpreter exit. That close takes at most 5 s; a stalled Zenoh then ends the program with exit code 1 and one line on stderr.
+- A session dropped without `close()` no longer aborts the program now and then at its end ("FATAL: exception not rethrown"): its declaration is undeclared when the session is dropped.
 
 Compatible with 0.5.15: nothing on the wire changes.
+
+## 0.5.16
+
+Not released: a test failed on CI. Its changes are part of 0.5.17.
 
 ## 0.5.15
 
