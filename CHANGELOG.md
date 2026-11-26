@@ -65,8 +65,37 @@ streams, transforms and parameters, and it reads theirs.
 - C++: a ROS subscriber that starts late may get a `/tf_static` message twice (zenoh-c's standalone build has no advanced publisher).
 - C++: ROS topics of any name and `auto`'s ROS form are not there yet; `Transport::Ros` reads `/<stream>/image_raw`.
 
-Compatible with 0.5.14: our own keys are unchanged, and with `--no-ros` no byte on the wire changes. New recordings
-hold one more channel, `/tf_static`, which 0.5.14 plays as the key `tf_static`.
+Compatible with 0.5.17: our own keys are unchanged, and with `--no-ros` no byte on the wire changes. New recordings
+hold one more channel, `/tf_static`, which 0.5.17 plays as the key `tf_static`.
+
+## 0.5.17
+
+A script that ends without closing what it opened now exits. 0.5.16 was not released.
+
+### Fixed
+
+- A script that ends without closing its session or subscriber no longer hangs at interpreter exit. That close takes at most 5 s; a stalled Zenoh then ends the program with exit code 1 and one line on stderr.
+- A session dropped without `close()` no longer aborts the program now and then at its end ("FATAL: exception not rethrown"): its declaration is undeclared when the session is dropped.
+
+Compatible with 0.5.15: nothing on the wire changes.
+
+## 0.5.16
+
+Not released: a test failed on CI. Its changes are part of 0.5.17.
+
+## 0.5.15
+
+`xblick play` shows photos and phone videos upright, and a command without its extra prints the install command that
+works for your installation.
+
+### Fixed
+
+- `xblick play` turns and mirrors each image of a directory or glob as its EXIF orientation says. A phone's portrait photo becomes a portrait stream, with the size and `camera_info` of the upright image ([videos](docs/guides/video.md#what-counts-as-a-video)).
+- `xblick play` applies a video's display matrix in the same way, so a phone's portrait video plays upright. It refuses a display matrix that turns by an angle other than a multiple of 90 degrees or that scales.
+- `xblick rerun` (also from the terminal interface), `record`, `play`, `cam` and `relay` without their extra name it and print the command that installs it. A uv tool or a pipx application gets one command, which keeps the extras installed now. Any other installation gets one line each for pip, `uv pip` and `uv add`, a checkout also its `uv sync`. Up to 0.5.14 they printed only `pip install`, which a uv tool does not have.
+- A node's message for gated weights gives a login that works for its installation: the `hf` of its environment, else `uvx --from huggingface-hub hf auth login`, or only `HF_TOKEN` where huggingface_hub is not installed. Up to 0.5.14 it named `.venv/bin/hf`, which a uv tool does not have.
+
+Compatible with 0.5.14: nothing on the wire changes.
 
 ## 0.5.14
 

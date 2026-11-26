@@ -19,6 +19,8 @@ import traceback
 import pytest
 from _pytest.faulthandler import fault_handler_stderr_fd_key
 
+from xblick.session import EXIT_WATCHDOG  # one thread for the whole process, started with its first session
+
 THREADS_END_S = 6.0  # how long a test's threads may take to end after its teardown (session.close waits up to 5 s)
 HANG_EXIT_S = 30.0   # the watchdog: this long after the test's timeout (pytest-timeout's turn first)
 
@@ -36,7 +38,7 @@ def no_thread_outlives_its_test():
 
     def left():
         return [t for t in threading.enumerate() if t not in before and t.is_alive()
-                and not t.name.startswith("pytest_timeout ")]
+                and not t.name.startswith("pytest_timeout ") and t.name != EXIT_WATCHDOG]
 
     yield
     end = time.monotonic() + THREADS_END_S

@@ -145,6 +145,20 @@ saw this in our tests. Zenoh's documentation does not describe it. The Python se
 destructor of `zenoh::Session` without such a limit. We have not seen the hang in C++, because the C++ programs never
 query the router's admin space. A C++ program that does should close its session in a separate thread with a deadline.
 
+**A program that does not close its session still ends.** Zenoh runs the callbacks of a subscriber or queryable in a
+thread that is not a daemon, and that thread ends only when the subscriber or queryable is undeclared. A Python program
+that left a session open would wait at its end for good. The sessions from `open_session` and `open_from_args`
+are therefore closed when the main thread ends, after the program's own threads that are not daemons, together with the
+subscriptions with `transport="auto"`. This close takes at most 5 s in all. A close that takes longer, a stalled Zenoh,
+ends the program with exit code 1 and one line on stderr that names what did not close. A session from your own
+`zenoh.open` call needs the same wrap in `session.Session(...)`.
+
+A session that the program drops without closing it, its last reference gone, is not kept until the end: its program's
+declaration and its part in ROS 2 are closed at once, and Zenoh closes the session. A daemon thread that is still
+inside a Zenoh call when Python finalises aborts the process with "FATAL: exception not rethrown"; the declaration's
+thread was such a thread when it outlived its session. Close what you open, and end your own daemon threads that call
+Zenoh before the program ends.
+
 ## Related pages
 
 - [Transports](transports.md): what a reader takes on the same host and across hosts.

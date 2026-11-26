@@ -222,7 +222,23 @@ def test_a_gated_repository_says_how_to_get_access(home, store, server, monkeypa
     with pytest.raises(weights.WeightsError) as error:
         store.ensure([gated], out=io.StringIO())
     message = str(error.value)
-    assert "https://huggingface.co/facebook/sam3.1" in message and "hf auth login" in message and "HF_TOKEN" in message
+    assert "https://huggingface.co/facebook/sam3.1" in message and message.endswith(weights.hf_login())
+
+
+def test_the_login_hint_fits_the_installation(tmp_path):
+    """The gated repository's hint: the hf next to this Python (a checkout's .venv, a uv tool's environment), else uvx;
+    without huggingface_hub only HF_TOKEN, since then no login is read."""
+    python = tmp_path / "env" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    text = weights.hf_login(str(python), hub=False)
+    assert text.startswith("set HF_TOKEN to a token from https://huggingface.co/settings/tokens") and "login" in text
+    assert "auth login" not in text
+    assert weights.hf_login(str(python), hub=True).startswith("log in once with: uvx --from huggingface-hub hf auth "
+                                                               "login (or set HF_TOKEN")
+    hf = python.parent / "hf"
+    hf.write_text("#!/bin/sh\n")
+    hf.chmod(0o755)
+    assert weights.hf_login(str(python), hub=True).startswith(f"log in once with: {hf} auth login (or set HF_TOKEN")
 
 
 def test_without_a_network_download_only_ends_with_one_line(home, store, server, stand_in, capsys):

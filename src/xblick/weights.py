@@ -97,7 +97,7 @@ class HuggingFace:
         denied = None
         if self.gated:
             denied = (f"{self.repo} is gated: accept its licence at https://huggingface.co/{self.repo} with your "
-                      "Hugging Face account, then log in once with .venv/bin/hf auth login or set HF_TOKEN")
+                      f"Hugging Face account, then {hf_login()}")
         return store.http(self.url(), tmp, progress, token=_hf_token(), denied=denied)
 
 
@@ -386,6 +386,26 @@ class Store:
                 yield
             finally:
                 fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def hf_login(python: str | None = None, hub: bool | None = None) -> str:
+    """How to give this environment a Hugging Face token, for the message of a gated repository. With huggingface_hub
+    (``hub``) the environment reads the login: the ``hf`` next to its Python (``python``, default ``sys.executable``)
+    when there is one (a checkout's ``.venv``, a uv tool's or pipx's environment, whose ``hf`` is not on PATH), else
+    ``uvx`` (the login is a file of the user, the same for every environment). Without huggingface_hub only
+    ``HF_TOKEN`` is read (:func:`_hf_token`)."""
+    import importlib.util  # noqa: PLC0415 - only for this message
+
+    hub = importlib.util.find_spec("huggingface_hub") is not None if hub is None else hub
+    tokens = "https://huggingface.co/settings/tokens"
+    if not hub:
+        return (f"set HF_TOKEN to a token from {tokens} (this installation has no huggingface_hub, so it reads no "
+                "Hugging Face login)")
+    beside = Path(sys.executable if python is None else python).parent / "hf"
+    if beside.is_file() and os.access(beside, os.X_OK):
+        return f"log in once with: {shlex.quote(str(beside))} auth login (or set HF_TOKEN to a token from {tokens})"
+    return (f"log in once with: uvx --from huggingface-hub hf auth login (or set HF_TOKEN to a token from "
+            f"{tokens})")
 
 
 def _hf_token() -> str | None:

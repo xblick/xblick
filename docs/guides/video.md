@@ -46,6 +46,12 @@ xblick play 'frames/*.png' --camera video/clip --fps 10
 
 An RGB-D camera can therefore be two files, one for colour and one for depth.
 
+`play` shows every frame upright, as a photo viewer does. It turns and mirrors each image as its EXIF orientation
+says, so a portrait photo of a phone becomes a portrait stream. It applies a video's display matrix in the same way.
+`play` refuses a display matrix that turns by an angle other than a multiple of 90 degrees or that scales. The
+stream's size, `--size` and `camera_info` refer to the upright frame. The first image of a sequence sets the
+stream's size, and `play` resizes every later image to it.
+
 Each video stream offers `image_raw` with the transports `shm` and `compressed`, its `camera_info`, an info record
 with the source `video`, and diagnostics. With `--cuda-device`, `play` uploads each decoded frame once and also
 offers a CUDA ring.

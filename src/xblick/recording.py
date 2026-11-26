@@ -141,7 +141,9 @@ def import_mcap():
     except ModuleNotFoundError as error:
         if error.name != "mcap":
             raise
-        raise SystemExit("xblick record and play need the mcap package: pip install 'xblick[record]'") from error
+        from .extras import missing_extra
+
+        raise SystemExit(missing_extra("xblick record and play need the mcap package", "record")) from error
     return mcap
 
 

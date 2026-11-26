@@ -50,7 +50,7 @@ def test_no_relay_fails_and_names_both_ways_to_install_it(tmp_path):
     done = xblick(["--help"], tmp_path, [tmp_path / "empty"], HIDE_PACKAGE)
     assert done.returncode == 1
     assert "xblick-relay not found" in done.stderr
-    assert "pip install 'xblick[relay]'" in done.stderr and "CMake" in done.stderr
+    assert "the extra relay, which is not installed" in done.stderr and "CMake" in done.stderr
     assert not (tmp_path / "out.txt").exists()
 
 

@@ -102,7 +102,7 @@ Reference check: `tools/check_references.sh` (no internal or robot-framework nam
 | Nodes misbehave on a looped playback | `xblick play --loop` moves all stamps forward on each pass. Nodes rely on stamps that only grow. |
 | A test or harness never ends | Zenoh threads keep a process alive. Close sessions. Run long checks in the background with `timeout`. A shell script starts background jobs with SIGINT ignored: `xblick` commands, `node.start` (`node.end_on_signals`) and the C++ tools end on it anyway, other programs and nodes on an older xblick may not. Stop by PID with SIGTERM. Never kill by name pattern. |
 | Large writes fail | NFS. Build and write large outputs on a local disk. |
-| A test sees extra keys, tokens, queryables or a first output line it did not expect | Every session takes part in ROS 2 by default (ros.py): rmw_zenoh keys (they start with the domain id), `@ros2_lv` tokens, six parameter services per program, a start line on stderr. A test of native behaviour turns it off explicitly: `ros_options=False`, `--no-ros`, `XBLICK_ROS=0` (C++ `.ros = std::nullopt`). A dropped Session in ROS 2 is closed by a finalizer when it is collected (session.py `_release`; not at exit); still close every session. |
+| A test sees extra keys, tokens, queryables or a first output line it did not expect | Every session takes part in ROS 2 by default (ros.py): rmw_zenoh keys (they start with the domain id), `@ros2_lv` tokens, six parameter services per program, a start line on stderr. A test of native behaviour turns it off explicitly: `ros_options=False`, `--no-ros`, `XBLICK_ROS=0` (C++ `.ros = std::nullopt`). A dropped Session closes its declaration and its ROS part when it is collected (session.py `_release`, `_drop`); still close every session. |
 
 ## Layout
 
@@ -119,7 +119,7 @@ Reference check: `tools/check_references.sh` (no internal or robot-framework nam
 | `src/xblick/camera.py`, `points.py`, `detections.py`, `session.py` | Python API: streams, sessions |
 | `src/xblick/node.py`, `history.py`, `tensors.py`, `rgbd.py`, `parameters.py` | helpers for nodes |
 | `src/xblick/declaration.py`, `cpp/src/declaration.cpp` | every program's declaration (`xblick/sessions/<zid>/program`), opened with the session |
-| `src/xblick/cli.py`, `tui.py`, `tui_nodes.py`, `tui_graph.py`, `rerun_bridge.py`, `recording.py`, `video.py`, `cam.py`, `v4l2.py`, `pick.py` | tools |
+| `src/xblick/cli.py`, `tui.py`, `tui_nodes.py`, `tui_graph.py`, `rerun_bridge.py`, `recording.py`, `video.py`, `cam.py`, `v4l2.py`, `pick.py`, `extras.py` (the message of a missing extra) | tools |
 | `src/xblick/robot.py`, `sim.py`, `controller.py`, `poses.py`, `mps.py` | robot state, simulation, controller link, poses, MPS |
 | `tests/`, `cpp/tests/` | Python and C++ tests |
 | `tools/` | `check_references.sh` (+ `reference_allowlist.txt`), `install_zenoh.sh`, `gen_msgdefs.py`, `setup_python.sh`, `tui_screenshots.py`, `release_notes.sh` |

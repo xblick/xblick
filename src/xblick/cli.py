@@ -724,7 +724,7 @@ RELAY = "xblick-relay"      # the relay program (github.com/xblick/xblick-relay)
 def relay_program() -> str:
     """The relay program that ``xblick relay`` starts, looked for in this order and nowhere else:
 
-    1. the installed package xblick-relay (``pip install xblick[relay]``): its ``xblick_relay.binary()``;
+    1. the installed package xblick-relay (the extra ``relay``): its ``xblick_relay.binary()``;
     2. ``xblick-relay`` on PATH (a CMake build of the relay repository).
 
     An installed xblick-relay without its program raises; the lookup does not go on to PATH then."""
@@ -732,9 +732,12 @@ def relay_program() -> str:
         return str(importlib.import_module("xblick_relay").binary())
     found = shutil.which(RELAY)
     if found is None:
-        raise FileNotFoundError(f"{RELAY} not found: neither the package xblick-relay is installed nor {RELAY} on "
-                                f"PATH. Install it with: pip install 'xblick[relay]'. Or build it with CMake from "
-                                f"https://github.com/xblick/xblick-relay and put its bin directory on PATH.")
+        from .extras import missing_extra
+
+        raise FileNotFoundError(missing_extra(f"{RELAY} not found: neither the package xblick-relay is installed nor "
+                                              f"{RELAY} on PATH. xblick relay needs xblick-relay", "relay")
+                                + "\nOr build it with CMake from https://github.com/xblick/xblick-relay and put its "
+                                  "bin directory on PATH.")
     return found
 
 

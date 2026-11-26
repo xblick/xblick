@@ -45,7 +45,7 @@ from .gpu import (CudaArray, CudaImage, check_cuda_array, cuda_array, device_ord
                   write_ring)
 from .msg import CameraInfo, CompressedImage, Header, Image, Message, ShmImage, TFMessage, Time, TransformStamped
 from .msg import CudaImage as CudaImageMsg
-from .session import ASK_PERIOD, ask, replies
+from .session import ASK_PERIOD, ask, close_at_exit, forget_at_exit, replies
 
 log = logging.getLogger("xblick")
 
@@ -1060,6 +1060,9 @@ class Subscription:
                                                                       lambda sample: self._recheck.set(), history=True)
             self._chooser = threading.Thread(target=self._choose, name=f"xblick-auto {self.base}", daemon=True)
             self._chooser.start()
+            # the chooser keeps the subscription alive: left open, its ring readers would never be freed (nanobind
+            # reports them as leaked when the program ends)
+            close_at_exit(self, f"the subscription of {self.base}")
         else:
             self._use(transport)
 
@@ -1456,6 +1459,7 @@ class Subscription:
         return array, (lambda r=ring, s=message.slot, q=message.seq: r.validate(s, q))
 
     def close(self):
+        forget_at_exit(self)
         self._closed.set()
         self._recheck.set()
         if self._chooser is not None:

@@ -428,3 +428,56 @@ def test_the_per_video_rule(sessions, tmp_path, capsys):  # noqa: F811
     command, options = recording.parse_command(b'{"command": "play", "files": ["a.mp4"], "streams": ["t/a/color"], '
                                                b'"poses": [[0, 0, 1, 0, 0, 0]], "camera_infos": ["a.yaml"]}')
     assert command == "play" and options["poses"] == [[0, 0, 1, 0, 0, 0]]
+
+
+def blocks() -> np.ndarray:
+    """64 x 32 pixels in eight blocks of 16 x 16, each a grey of its own: every turn and mirror gives another image."""
+    greys = np.array([[0, 40, 80, 120], [160, 200, 240, 20]], np.uint8)
+    return np.repeat(np.repeat(np.repeat(greys, 16, axis=0), 16, axis=1)[..., None], 3, axis=2)
+
+
+@pytest.mark.parametrize("degrees, hflip", [(0, False), (90, False), (180, False), (-90, False), (0, True),
+                                            (90, True), (180, True), (-90, True)])
+def test_a_video_with_a_display_matrix_comes_out_upright(tmp_path, degrees, hflip):
+    """A video's display matrix (a phone's portrait video: -90, turned clockwise) is applied: its frames, its size,
+    and --size of the turned frame. Its meaning as PyAV writes it: turned counter-clockwise, then mirrored."""
+    from xblick import video
+
+    if not hasattr(av.video.stream.VideoStream, "set_display_rotation"):
+        pytest.skip(f"PyAV {av.__version__} cannot write a display matrix (VideoStream.set_display_rotation is new in "
+                    "PyAV 19); reading one works from PyAV 14 on")
+    path = tmp_path / "turned.mp4"
+    with av.open(str(path), "w") as out:
+        s = out.add_stream("libx264", rate=10)
+        s.width, s.height, s.pix_fmt = 64, 32, "yuv444p"
+        s.options = {"qp": "0"}  # lossless: the blocks exact to the colour conversion
+        s.set_display_rotation(degrees, hflip=hflip)
+        for _ in range(3):
+            for packet in s.encode(av.VideoFrame.from_ndarray(blocks(), format="rgb24")):
+                out.mux(packet)
+        for packet in s.encode():
+            out.mux(packet)
+    expected = np.rot90(blocks(), degrees // 90)
+    expected = expected[:, ::-1] if hflip else expected
+    source = video.VideoFile(path)
+    assert (source.width, source.height) == (expected.shape[1], expected.shape[0])
+    _, image = next(source.frames())
+    assert image.shape == expected.shape and np.abs(image.astype(int) - expected).max() <= 3
+    sized = video.VideoFile(path, size=(expected.shape[1] // 2, expected.shape[0] // 2))
+    assert next(sized.frames())[1].shape == (expected.shape[0] // 2, expected.shape[1] // 2, 3)
+
+
+def test_a_display_matrix_that_is_no_quarter_turn_is_refused():
+    from types import SimpleNamespace
+
+    from xblick import video
+
+    one = video.FIXED_ONE
+    half = round(one * np.sqrt(0.5))
+    for matrix, rotation in (([half, -half, 0, half, half, 0, 0, 0, 1 << 30], 45),
+                             ([2 * one, 0, 0, 0, 2 * one, 0, 0, 0, 1 << 30], 0)):  # turned by 45 degrees, scaled
+        frame = SimpleNamespace(side_data={av.sidedata.sidedata.Type.DISPLAYMATRIX: np.array(matrix, np.int32).tobytes()},
+                                rotation=rotation)
+        with pytest.raises(video.VideoError, match=f"turns it by {rotation} degrees or scales it"):
+            video.display_turn(frame, av, "clip.mp4")
+    assert video.display_turn(SimpleNamespace(side_data={}), av, "clip.mp4") == (False, False, False)
