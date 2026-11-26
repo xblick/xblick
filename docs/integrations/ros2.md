@@ -14,7 +14,7 @@ read the topics through a bridge.
 | Transforms, diagnostics, clock | the types and roles of `/tf`, `/tf_static`, `/diagnostics` and `/clock` |
 | Parameters | the messages and services of `rcl_interfaces`, with the same bytes ([parameters](../reference/parameters.md)) |
 | Calibration files | the YAML format of `camera_calibration`. `CameraInfo.read_file` reads it and `write_file` writes it. |
-| Recordings | MCAP files with ROS 2 schemas, which ROS 2 tools open ([recording](../guides/recording.md)) |
+| Recordings | MCAP files with ROS 2 schemas, which ROS 2 tools open. `ros2 bag play` of a recording feeds tf2 from its `/tf_static`, and `xblick play` plays bags of `ros2 bag record` ([recording](../guides/recording.md)). |
 
 Durchblick's own keys differ from the keys of `rmw_zenoh`. A ROS 2 node therefore sees nothing of a program that
 is started with `--no-ros`.
@@ -107,20 +107,93 @@ line.
 
 ### What a program reads from ROS 2
 
-A reader reads a ROS topic only when you ask for it. It then needs a session in ROS 2, which every session is by
-default.
+A reader needs a session in ROS 2 to read a ROS topic, which every session is by default. It reads one in three
+cases: you name a ROS topic, you ask for the transport `ros`, or the transport `auto` finds only a ROS publisher.
 
 | Reader | ROS topic |
 | --- | --- |
+| `ImageSubscriber(session, "/T")`, `xblick hz /T`, `xblick snapshot /T` | an image topic `/T` of any name, such as `/image_raw` or `/resize/image`, with `camera_info=True` also its camera_info. See [Read a ROS camera](#read-a-ros-camera). |
+| `PointCloudSubscriber(session, "/T")` | a point cloud topic `/T` of any name |
 | `ImageSubscriber(..., transport="ros")`, `xblick hz --transport ros`, `xblick snapshot --transport ros` | `/<stream>/image_raw`, with `camera_info=True` also `/<stream>/camera_info` |
-| `PointCloudSubscriber(..., transport="ros")` | `/<stream>/cloud` |
-| C++: `Transport::Ros` of `ImageSubscriber` (with `camera_info`) and `PointCloudSubscriber`, `xblick-cpp-probe --transport ros` | the same topics |
+| `ImageSubscriber(..., transport="auto")` and every node and command that reads with `auto` | `/<stream>/image_raw` when only a ROS node publishes the stream. See [Streams that only ROS publishes](#streams-that-only-ros-publishes). |
+| `PointCloudSubscriber(..., transport="ros")`, and with `auto` as above | `/<stream>/cloud` |
+| C++: `Transport::Ros` of `ImageSubscriber` (with `camera_info`) and `PointCloudSubscriber`, `xblick-cpp-probe --transport ros` | `/<stream>/image_raw` and `/<stream>/cloud` |
 | C++: `StaticTransformSubscriber(..., ros = true)`, `xblick-cpp-probe --tf-static --via-ros` | `/tf_static`, also of publishers that started before it |
 | `DetectionSubscriber(..., ros_type=Detection3DArray)` | `/<key>` of that type |
 | `TransformBuffer(..., ros=True)`, `TransformSubscriber(..., ros=True)`, `StaticTransformSubscriber(..., ros=True)` | `/tf` and `/tf_static` |
 | `ParameterClient(..., ros=True)`, `xblick param --via-ros` | the parameter services of a ROS node |
 
 A ROS sample carries no attachment of ours. Its frames therefore have no `seq`, `source` or publish time.
+
+### Read a ROS camera
+
+A name with a leading `/` is a ROS topic, as `ros2 topic list` prints it. A name without one is a stream of ours.
+
+```python
+images = db.ImageSubscriber(session, "/resize/image", transport="auto", camera_info=True)
+```
+
+```bash
+xblick hz /image_raw
+xblick snapshot /resize/image frame.png
+```
+
+The camera_info follows ROS's convention: the topic `camera_info` in the namespace of the image topic. `/image_raw`
+has `/camera_info`, and `/resize/image` has `/resize/camera_info`. Name another topic with
+`camera_info="/cam/calibration"`. Compressed frames follow image_transport's convention, the topic
+`<image topic>/compressed`.
+
+| `transport` | Image topic `/T` |
+| --- | --- |
+| `auto` | `/T`. When the publishers offer only `/T/compressed`, that one. |
+| `ros` or `raw` | `/T` |
+| `compressed` | `/T/compressed` |
+
+A reader never picks a topic in place of the one you named. After 5 s without a frame it looks at ROS's graph, and
+`latest()` raises an error in two cases:
+
+- The topic's publishers send another type. For `/T/compressed` the error names `/T` and the transport `compressed`.
+- No topic has the name, but topics of the kind lie below it. `xblick hz /rgbd` then says `no ROS topic of this
+  name, and these are below it: /rgbd/color/image_raw, /rgbd/depth/image_raw; name one of them`.
+
+When frames come but no camera_info, the reader logs one line after 5 s with the CameraInfo topics in the graph.
+
+### Streams that only ROS publishes
+
+A subscriber with the transport `auto` waits for a publisher of its stream. When no program of ours answers, a ROS
+node that publishes the stream's ROS topic counts as well. The subscriber then reads `/<stream>/image_raw`, or
+`/<stream>/image_raw/compressed` when the node publishes only that, with `camera_info` beside it. A cloud's topic is
+`/<stream>/cloud`. Its `transport` then says `ros` or `ros_compressed`. A publisher of ours has priority: once one
+answers, the subscriber moves to it.
+
+The ROS copies that our programs publish never count. A ROS publisher belongs to a program of ours when its session
+declares a program ([protocol](../concepts/protocol.md)). So a camera of ours is read in its own forms, as before.
+
+`xblick hz usb_cam` therefore reads a ROS camera on `/usb_cam/image_raw`. A node with `--camera lab/cam` reads
+`/lab/cam/color/image_raw` when only a ROS node publishes it. `RGBDInputs` pairs a ROS camera's `/<camera>/color/image_raw` and
+`/<camera>/depth/image_raw` ([pairing](../guides/pairing-streams.md)). `xblick list` shows the ROS topics of the types
+Image, CompressedImage, PointCloud2 and CameraInfo after our streams, with `ros` in the transports column and the
+publishing nodes. It leaves out the ROS copies of our streams.
+
+### Read an Isaac ROS node's output
+
+An Isaac ROS node on `rmw_zenoh_cpp` reaches our programs through the same router. Its output topics keep the node's
+own names. Read them as ROS topics, with no remap. A `ResizeNode` of `isaac_ros_image_proc` that reads our test
+camera publishes `/resize/image` and `/resize/camera_info`:
+
+```bash
+ros2 component load /container isaac_ros_image_proc nvidia::isaac_ros::image_proc::ResizeNode -n resize \
+  -r image:=/test/camera/color/image_raw -r camera_info:=/test/camera/color/camera_info \
+  -p output_width:=320 -p output_height:=240
+xblick hz /resize/image
+```
+
+```python
+resized = db.ImageSubscriber(session, "/resize/image", transport="auto", camera_info=True)
+```
+
+The frames arrive as plain CDR, with the input's stamp and frame id and the scaled camera_info. `ros2 topic list`
+shows the names of other nodes' outputs.
 
 A Lyrical publisher sends images, compressed images and clouds on keys of its own for each kind of subscriber. Our
 readers of these types announce themselves as subscribers that take plain CDR. A Lyrical publisher then sends them the
@@ -154,8 +227,9 @@ before it in the same way.
 A ROS node with `use_sim_time` reads ROS's global `/clock`. Our worlds publish their clock on `<world>/clock`, which
 ROS sees as `/<world>/clock`. Start the program that publishes the clock with `--ros-clock <world>/clock`, such as
 `--ros-clock sim/clock`. That key then goes to `/clock` instead of `/<world>/clock`, and ROS nodes need no remap. The
-key must be of type `rosgraph_msgs/msg/Clock`, else the program stops with one line. The option names one key and
-chooses nothing by itself. Give it to one program per domain, because ROS has one `/clock` per domain.
+key must be of type `rosgraph_msgs/msg/Clock`, else the program stops with one line. A program that has published no
+such key 1 s after its start writes one warning line and goes on, because a simulation may publish its clock later.
+The option names one key and chooses nothing by itself. Give it to one program per domain, because ROS has one `/clock` per domain.
 
 ## Parameters and services
 
@@ -202,10 +276,12 @@ A Zenoh router serves our programs and ROS nodes alike. Both default to port 744
 ## Try it with ROS 2's tools
 
 These commands need a shell with ROS 2 Jazzy or Lyrical (such as `source /opt/ros/jazzy/setup.bash`) and
-`RMW_IMPLEMENTATION=rmw_zenoh_cpp`. Keep `ROS_DOMAIN_ID` the same in both shells, or pass `--ros-domain`. On Lyrical,
-add `--no-daemon` to each `ros2 node`, `ros2 topic` and `ros2 param` command. The daemon of Lyrical's `ros2` command
-fails on `ros2 topic echo` and `ros2 topic info -v` with `unknown tag 'rclpy.topic_endpoint_info.TopicEndpointInfo'`,
-also between ROS nodes alone.
+`RMW_IMPLEMENTATION=rmw_zenoh_cpp`. Keep `ROS_DOMAIN_ID` the same in both shells, or pass `--ros-domain`.
+
+On Lyrical, add `--no-daemon` to `ros2 topic echo` and `ros2 topic info -v`. With the daemon, Lyrical's `ros2`
+command stops there with `unknown tag 'rclpy.topic_endpoint_info.TopicEndpointInfo'`, also between ROS nodes alone.
+`ros2 topic echo` with an explicit QoS option, such as `--qos-durability`, works with the daemon. `ros2 topic hz` has
+no `--no-daemon` option and works without it. `ros2 node list`, `ros2 topic list` and `ros2 param` work either way.
 
 1. Start one router: `xblick router`, or `ros2 run rmw_zenoh_cpp rmw_zenohd`.
 2. Start a test camera with a fixed pose:
@@ -220,20 +296,24 @@ also between ROS nodes alone.
    ros2 node list                                   # /test/camera/xblick_test_camera
    ros2 topic list                                  # /test/camera/color/image_raw, .../camera_info, /tf_static, ...
    ros2 topic hz /test/camera/color/image_raw
-   ros2 topic echo /test/camera/color/camera_info --once
+   ros2 topic echo /test/camera/color/camera_info --once          # Lyrical: add --no-daemon
    ros2 topic echo /tf_static --qos-durability transient_local --once
    ros2 run tf2_ros tf2_echo world test_camera_color_optical
    rviz2                                            # Image display on /test/camera/color/image_raw, TF display
    ```
 
-4. Look at a node's parameters, such as those of a node started with `xblick-yolox --camera test/camera`. The node
-   is installed with its own repository:
+4. Look at a node's parameters. The record and play node has some, and it needs `xblick[record]`. It records
+   every stream until you stop it with Ctrl-C:
 
    ```bash
-   ros2 param list /test/camera/yolox
-   ros2 param get /test/camera/yolox threshold
-   ros2 param set /test/camera/yolox threshold 0.4
+   xblick record --dir /tmp/recordings
+   ros2 param list /xblick/recorder
+   ros2 param get /xblick/recorder rate
+   ros2 param set /xblick/recorder rate 2.0         # refused: sets through ROS 2 are off on this node
    ```
+
+   A node of another repository works the same way under its parameters' name, such as `/test/camera/yolox` for
+   `xblick-yolox --camera test/camera`. Start it with `--ros-params-writable` to allow ROS's sets.
 
 5. Read a ROS node's parameters from Durchblick:
 
@@ -243,8 +323,16 @@ also between ROS nodes alone.
    xblick param --via-ros --node parameter_blackboard --set use_sim_time:=true
    ```
 
+6. Read a ROS camera from Durchblick:
+
+   ```bash
+   ros2 run image_tools cam2image --ros-args -p burger_mode:=true   # publishes /image
+   xblick hz /image
+   xblick list                                      # /image  Image  ros  node /cam2image
+   ```
+
 The test camera's frames are `world`, `test_camera_color` (`--frame-id`) and `test_camera_color_optical`, the
-images' frame. The names in step 4 depend on the node. `ros2 topic list` and `ros2 node list` show the real ones.
+images' frame. `ros2 topic list` and `ros2 node list` show the names of other nodes.
 
 ## C++ and ROS 2
 
@@ -360,6 +448,11 @@ type hashes of the part in ROS 2.
 - A subscriber of every key (`**`), such as the traffic meter of the terminal interface, also subscribes to the ROS
   copies. The publishers then send them as well. The terminal interface shows and counts our keys only.
 - The C++ tool `xblick-cpp-camera` keeps its fixed frame `TestCamera`. It serves the tests, which compare its bytes.
+- ROS topics of any name and the ROS form for `auto` exist in Python only. C++'s `Transport::Ros` reads
+  `/<stream>/image_raw` and `/<stream>/cloud`, and C++'s `Auto` never reads ROS.
+- `xblick rerun`, `xblick record` and the terminal interface find streams by their info records. They do not show a
+  camera that only a ROS node publishes. Record such a camera with `ros2 bag record`, and play the bag with
+  `xblick play`.
 - To make the streams visible to ROS 2 nodes that read rings in place, ROS 2 Lyrical's buffer backends
   (`rosidl::Buffer`) would be needed. [Alternatives](../project/alternatives.md) describes these projects.
 - [ROS 2 by default](../project/ros-roadmap.md) collects the facts behind the part in ROS 2 and the options that

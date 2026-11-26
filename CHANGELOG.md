@@ -30,6 +30,13 @@ streams, transforms and parameters, and it reads theirs.
 - A fixed frame that another program sends on `/tf_static` with another parent or transform is one error line; a second ROS node of the program's name is one warning line.
 - `_core.ros_gid`: the gid of a ROS entity as `rmw_zenoh` makes it (XXH3-128 of its token), used by both sides.
 - The guide [Durchblick and ROS 2](docs/integrations/ros2.md) and the protocol's section on `rmw_zenoh`.
+- ROS cameras as ROS publishes them: a subscriber name with a leading `/` is a ROS topic of any name (`/image_raw`, `/resize/image`), its camera_info beside it or named; `compressed` reads image_transport's `<topic>/compressed` (Python, `xblick hz`, `xblick snapshot`).
+- With `auto`, a stream that only a ROS node publishes is read from `/<stream>/image_raw`, never our programs' ROS copies; `RGBDInputs` pairs a ROS camera's colour and depth, `CameraSpec` takes ROS topics in `color=` and `depth=` (Python).
+- `xblick list` shows ROS's image, compressed image, point cloud and camera info topics, marked `ros`.
+- `xblick play` plays rosbag2 bags in the MCAP storage: image_transport's topics as streams, every other topic on the key `/a/b` -> `a/b`; the sqlite3 storage is refused with a line.
+- Recordings also hold ROS's global `/tf_static`, so `ros2 bag play` feeds tf2; `xblick play` leaves that copy out.
+- `--ros-clock` with a key the program never publishes is one warning line after 1 s.
+- An Isaac ROS node's output is read under its own names, with no remap ([guide](docs/integrations/ros2.md#read-an-isaac-ros-nodes-output)).
 
 ### Changed
 
@@ -37,12 +44,16 @@ streams, transforms and parameters, and it reads theirs.
 - A program is one ROS node that carries its publishers, subscribers and parameter services; it takes the name of its parameters (`/test/camera/yolox`), else the program's name in the namespace of its `--camera`; `--ros-node` also takes `/namespace/NAME`.
 - `xblick test-camera` names its frame after the stream (`test_camera_color`, was `TestCamera`); `xblick-cpp-probe --tf-static` reads ROS's `/tf_static` with `--via-ros` (was `--ros`).
 - A key that is no ROS name is left out of ROS with one warning line instead of stopping the program.
+- A subscriber name with a leading `/` is a ROS topic (it was our stream without the `/`); `CameraSpec` refuses a camera with a leading `/`.
+- After its parameters close, a program's ROS node serves the six parameter services without parameters again, so `ros2 param list` keeps answering.
 - C++: a ROS-only subscriber now counts in `CameraPublisher::subscribed()`, `needs_pixels()` and `ImuPublisher::subscribed()`, so frames render for it; a ROS reader of camera_info alone counts in `subscribed()`, not in `needs_pixels()`.
 
 ### Fixed
 
 - C++: a request with a forged list length no longer allocates far more than the request holds.
 - C++: the option structs (`SessionOptions`, `PublisherOptions`, `SubscriberOptions`, the cloud options) give every field a default, so designated initializers that leave fields out compile without `-Wmissing-field-initializers`.
+- A Session in ROS 2 that a program drops without `close()` is released again when it is collected, as without ROS.
+- `xblick play --loop`: a `/tf_static` held twice in a file no longer adds a gap as long as the recording between passes.
 
 ### Known limit
 
@@ -50,8 +61,10 @@ streams, transforms and parameters, and it reads theirs.
 - Keys with a part `command` never go to ROS.
 - A Jazzy subscriber gets no images, compressed images or clouds from a Lyrical publisher, between ROS nodes as well.
 - C++: a ROS subscriber that starts late may get a `/tf_static` message twice (zenoh-c's standalone build has no advanced publisher).
+- C++: ROS topics of any name and `auto`'s ROS form are not there yet; `Transport::Ros` reads `/<stream>/image_raw`.
 
-Compatible with 0.5.14: our own keys are unchanged, and with `--no-ros` no byte on the wire changes.
+Compatible with 0.5.14: our own keys are unchanged, and with `--no-ros` no byte on the wire changes. New recordings
+hold one more channel, `/tf_static`, which 0.5.14 plays as the key `tf_static`.
 
 ## 0.5.14
 
