@@ -90,8 +90,12 @@ frame = images.latest(timeout=1.0)
 
 `latest()` returns the newest frame, or `None` after the timeout.
 
-With `transport="auto"` the subscriber waits for a publisher of its stream. After 5 s without one it logs a single
-line: the camera may not have started yet, or the name may be wrong. When nobody publishes the stream but the name
+With `transport="auto"` the subscriber waits for a publisher of its stream. In a session in ROS 2, a ROS node that
+publishes the stream's ROS form also counts: `/<stream>/image_raw`, else `/<stream>/image_raw/compressed`, and a
+point cloud's `/<stream>/cloud`. The subscriber then reads that topic, and `transport` is `"ros"` or
+`"ros_compressed"`. A publisher of ours has priority, and the subscriber moves to it when it appears. The ROS copies
+that our own programs publish are never read in place of a stream's own forms. After 5 s without a publisher the
+subscriber logs a single line: the camera may not have started yet, or the name may be wrong. When nobody publishes the stream but the name
 before its last part answers as a stream, `latest()` raises `camera.StreamGivenAsCamera`. This happens to a node that
 was given a stream as its camera, such as `--camera cam/video2/color`. The exception is a `SystemExit` with one line
 that names the camera, so the program ends with exit code 1. The subscriber never reads the camera in its place.
@@ -106,13 +110,43 @@ that names the camera, so the program ends with exit code 1. The subscriber neve
 
 | Argument of `ImageSubscriber` | Default | Meaning |
 | --- | --- | --- |
-| `transport` | `"compressed"` | `auto`, `compressed`, `raw`, `shm` or `cuda`. Use `auto`. |
+| `transport` | `"compressed"` | `auto`, `compressed`, `raw`, `shm`, `cuda` or `ros`. Use `auto`. |
 | `local` | `"auto"` | with `auto` on the publisher's host: `auto`, `shm` or `cuda` |
 | `remote` | `"compressed"` | with `auto` on another host: `compressed` or `raw` |
 | `device` | `None` | your GPU: an ordinal, `"cuda:N"` or a torch device. Without it the subscriber works on the CPU. |
 | `copy` | `True` | `False` returns views into the ring |
-| `camera_info` | `False` | also receive the calibration |
+| `camera_info` | `False` | `True` also receives the calibration. A ROS topic such as `"/cam/calibration"` names the calibration topic of a ROS camera. |
 | `max_hz` | `None` | hand out at most this many frames per second |
+
+## Read a ROS camera
+
+```python
+images = db.ImageSubscriber(session, "/resize/image", transport="auto", camera_info=True)
+clouds = db.PointCloudSubscriber(session, "/velodyne_points")
+```
+
+A name with a leading `/` is a ROS 2 topic as `ros2 topic list` prints it. The subscriber reads it from ROS
+publishers, so the session must take part in ROS 2. The topic can have any name, such as `/image_raw` or
+`/resize/image`. The frames of a ROS topic carry no `seq`, `source` or publish time.
+
+| `transport` with a ROS topic | Image topic `/T` | Point cloud topic `/T` |
+| --- | --- | --- |
+| `auto` | `/T`. When the publishers offer only `/T/compressed`, that topic. | `/T` |
+| `ros` or `raw` | `/T` (`sensor_msgs/Image`) | `/T` (`sensor_msgs/PointCloud2`) |
+| `compressed` | `/T/compressed` (`sensor_msgs/CompressedImage`, image_transport's name) | refused |
+| `shm` or `cuda` | refused | refused |
+
+With `camera_info=True` the subscriber reads `camera_info` in the namespace of the image topic. This is ROS's
+convention: `/resize/image` has `/resize/camera_info`, and `/image_raw` has `/camera_info`. A ROS topic as
+`camera_info` names another one. When frames come but no calibration, the subscriber logs one line after 5 s. That
+line lists the CameraInfo topics in ROS's graph. The subscriber never takes one of them by itself.
+
+After 5 s without a frame the subscriber looks at ROS's graph. `latest()` then raises in two cases:
+
+- The topic's publishers send another type. For image_transport's `/T/compressed` the message names `/T` with
+  `transport="compressed"`.
+- No topic has the name, but image topics lie below it, such as `/rs/color/image_raw` below `/rs`. The
+  `ValueError` lists them. Name one of them.
 
 ## Read without a copy
 

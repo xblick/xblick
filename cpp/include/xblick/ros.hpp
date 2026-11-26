@@ -45,6 +45,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -103,6 +104,7 @@ namespace xblick::ros
     // false when XBLICK_ROS is 0, true when it is 1 or unset; RosError for any other value.
     bool enabled_by_environment();
     inline constexpr std::string_view kClockTopic = "/clock";  // ROS's global clock (use_sim_time)
+    inline constexpr int kClockWaitS = 1;  // --ros-clock: a program without its clock's publisher by then is told
     // sensor_msgs/msg/Image -> sensor_msgs::msg::dds_::Image_ (a service: pkg/srv/Name -> pkg::srv::dds_::Name_).
     std::string dds_type(const std::string& type_name);
     std::string type_of_dds(const std::string& dds);
@@ -274,6 +276,9 @@ namespace xblick::ros
         void detach();
         // a sample of ROS's /tf_static (a static Publisher's companion, mirror_tf): compared with this program's
         void on_static_sample(std::span<const std::uint8_t> payload, const Attachment& attachment);
+        // --ros-clock: mirror made the clock key's publisher. Without one within kClockWaitS of attach, one warning
+        // line says so (a program may still make it later: no error).
+        void clock_published() { clock_published_.store(true); }
 
     private:
         struct Duplicates;
@@ -300,6 +305,8 @@ namespace xblick::ros
         std::vector<std::string> tf_clashes_;
         std::map<std::string, detail::StaticTransform> static_mine_, static_others_;
         std::set<std::string> static_said_;
+        std::atomic<bool> clock_published_{false};
+        std::jthread clock_check_;  // last: it ends first (it reads the members above)
     };
 
     // The part in ROS 2 of `session` (opened by open_session with SessionOptions::ros), null when it takes none.

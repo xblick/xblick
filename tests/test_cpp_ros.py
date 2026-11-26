@@ -377,6 +377,15 @@ def test_cpp_ros_options_refused():
         assert done.returncode == 1 and "xblick-cpp-camera:" in done.stderr, (argv, done.stderr)
 
 
+def test_cpp_a_clock_key_the_program_never_publishes_is_one_warning():
+    """--ros-clock with a key the camera never publishes: one line after a second, the program goes on (as Python)."""
+    done = subprocess.run([tool("xblick-cpp-camera"), "--listen", f"127.0.0.1:{free_port()}", "--seconds", "2",
+                           "--ros-domain", "92", "--ros-clock", "nowhere/clock"], capture_output=True, text=True,
+                          timeout=30)
+    assert done.returncode == 0, done.stderr
+    assert done.stderr.count("--ros-clock nowhere/clock: this program has published no nowhere/clock") == 1
+
+
 # ------------------------------------------------------------------- C++ Parameters as a ROS node's (command path)
 
 NODE = "rc/cpp/cpp_camera"  # xblick-cpp-camera --params: fps, pattern.shift (refuses 13), pattern.auto_shift, codec
@@ -553,7 +562,8 @@ def test_cpp_reads_the_tf_static_of_a_ros_node_late(ros_env):
                                stderr=subprocess.DEVNULL)
     try:
         time.sleep(2.0)
-        probe = CppOnRouter(port, "xblick-cpp-probe", "--tf-static", "unused", "--timeout", "15", ready=False)
+        probe = CppOnRouter(port, "xblick-cpp-probe", "--tf-static", "unused", "--via-ros", "--timeout", "15",
+                            ready=False)
         out, _ = probe.proc.communicate(timeout=60)
         probe.close()
     finally:

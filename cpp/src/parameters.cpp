@@ -853,6 +853,7 @@ namespace xblick
             {
                 node = *program_node;
                 ros_part_ = part;
+                ros_session_ = &session;
             }
             else
             {
@@ -930,6 +931,18 @@ namespace xblick
         if (ros_part_)
         {
             ros_part_->release_parameters();
+            // the program's node answers ROS's parameter tools again, without parameters, as before its first ones
+            // (Python's Ros.release_parameters); not on a session that is closing
+            try
+            {
+                if (ros_session_ != nullptr and not ros_session_->is_closed())
+                {
+                    serve_none(*ros_session_, ros_part_);
+                }
+            }
+            catch (...)  // NOLINT(bugprone-empty-catch): a destructor; the node then has no services until the end
+            {
+            }
         }
         token_.reset();
         queryables_.clear();

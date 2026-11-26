@@ -13,7 +13,9 @@ Streams without a compressed form (float disparity, feature maps) are left out. 
 namespace: a robot's ``joint_states``, ``tf``, ``odom`` and ``wrench/*``, each camera's ``tf``, ``tf_static`` (also
 asked for at the start of each file, as it is published once), ``imu``, ``diagnostics`` and bodies, and a node's
 ``tf`` and ``odom`` (``<camera>/<node>/...``, e.g. cuVSLAM's). The recorder reads what goes over the network, never
-shared memory, so it runs on any PC that reaches the robot's routers.
+shared memory, so it runs on any PC that reaches the robot's routers. Each camera's ``tf_static`` is also copied onto
+ROS's global ``/tf_static`` (all cameras' static transforms so far in each message, transient local), so that ``ros2
+bag play`` feeds tf2 from a recording; ``play`` leaves that copy out (``ROS_COPY``).
 
 **One node records and plays** (``Recorder``; ``xblick record`` starts it recording, ``xblick play`` playing,
 both take every command later). On ``xblick/<name>/control`` (plain text or JSON ``{"command": ...}``) it takes
@@ -76,6 +78,7 @@ import dataclasses
 import datetime
 import fnmatch
 import json
+import logging
 import queue
 import threading
 import time
@@ -84,15 +87,18 @@ from pathlib import Path
 import zenoh
 
 from . import _core, declaration, ros, topics
-from .camera import (FIND_PERIOD, SENT_VERSION, CameraPublisher, ProtocolError, _attachment, _check_encoding,
-                     _declare_advanced_history, congestion, find_streams, parse_attachment)
-from .codecs import parse_format
-from .msg import CameraInfo, Clock, CompressedImage, Message, Time
+from .camera import (FIND_PERIOD, INFO_VERSION, SENT_VERSION, CameraPublisher, ProtocolError, _attachment,
+                     _check_encoding, _declare_advanced_history, congestion, find_streams, parse_attachment)
+from .codecs import CODEC_ENCODINGS, JPEG, RVL, decompress, parse_format
+from .encodings import image_to_numpy
+from .msg import CameraInfo, Clock, CompressedImage, Image, Message, PointCloud2, TFMessage, Time
 from .msgdefs import MSGDEFS
 from .parameters import Parameters
 from .session import CommandQuery, CommandRefused, answer_attachment, node_id, one_node, refuse, replies
 from .session import command as send_once
 from .stamps import header_stamp  # recording.header_stamp: its old home
+
+log = logging.getLogger("xblick")
 
 STATUS_VERSION = 3
 REPLY_VERSION = 1  # of a request's reply
@@ -196,8 +202,19 @@ def is_literal(key: str) -> bool:
 
 
 
+ROS_COPY = "xblick_ros_copy"  # channel metadata of a copy for ROS's tools (ROS's /tf_static): not played back
+# rosbag2's offered_qos_profiles of tf2's static broadcaster (reliable, transient local, depth 1), as ros2 bag record
+# writes it: ros2 bag play then offers the copy transient local, so that a tf2 listener that starts later gets it
+TF_STATIC_QOS_PROFILE = (
+    "- history: keep_last\n  depth: 1\n  reliability: reliable\n  durability: transient_local\n  deadline:\n"
+    "    sec: 9223372036\n    nsec: 854775807\n  lifespan:\n    sec: 9223372036\n    nsec: 854775807\n"
+    "  liveliness: automatic\n  liveliness_lease_duration:\n    sec: 9223372036\n    nsec: 854775807\n"
+    "  avoid_ros_namespace_conventions: false")
+
+
 class _File:
-    """One MCAP file being written: its channels and schemas. Used by the writer thread only."""
+    """One MCAP file being written: its channels and schemas. Used by the writer thread only. Each camera's
+    ``tf_static`` also goes to a copy on ROS's ``/tf_static`` (``_write_ros_static``)."""
 
     def __init__(self, path: Path, compression: str):
         mcap = import_mcap()
@@ -207,8 +224,15 @@ class _File:
         self._writer.start(profile="ros2", library=f"xblick {_core.__version__}")
         self._schemas: dict[str, int] = {}
         self._channels: dict[tuple[str, str], int] = {}
-        self.messages = 0
+        self._static: dict[str, object] = {}  # child frame -> its TransformStamped, of every camera's tf_static so far
+        self._static_channel: int | None = None
+        self.messages = 0  # the samples recorded (the /tf_static copies left out)
         self.bytes = 0
+
+    def _schema(self, name: str) -> int:
+        if name not in self._schemas:
+            self._schemas[name] = self._writer.register_schema(name, "ros2msg", MSGDEFS[name].encode())
+        return self._schemas[name]
 
     def _channel(self, key: str, encoding: str, info: dict | None) -> int:
         channel = self._channels.get((key, encoding))
@@ -218,9 +242,7 @@ class _File:
         if encoding.startswith(CDR):
             name = encoding[len(CDR):]
             if name in MSGDEFS:
-                if name not in self._schemas:
-                    self._schemas[name] = self._writer.register_schema(name, "ros2msg", MSGDEFS[name].encode())
-                schema, message_encoding = self._schemas[name], "cdr"
+                schema, message_encoding = self._schema(name), "cdr"
         elif encoding == JSON:
             message_encoding = "json"
         metadata = {"zenoh_key": key, "zenoh_encoding": encoding}
@@ -236,6 +258,29 @@ class _File:
         self._writer.add_message(channel, log_ns, payload, received_ns)
         self.messages += 1
         self.bytes += len(payload)
+        if key.endswith("/" + topics.TF_STATIC) and encoding == CDR + TFMessage.TYPE:
+            self._write_ros_static(key, payload, log_ns, received_ns)
+
+    def _write_ros_static(self, key: str, payload: bytes, log_ns: int, received_ns: int):
+        """A camera's tf_static also on ROS's global ``/tf_static``, for ROS's tools (``ros2 bag play`` feeds tf2
+        from it): every camera's static transforms in this file so far in one message, as tf2's static broadcaster
+        sends them, so that the last message holds all; transient local, as rosbag2 records tf2's. Marked
+        ``ROS_COPY``: our playback leaves it out (its cameras' tf_static go to /tf_static themselves)."""
+        try:
+            transforms = TFMessage.deserialize(payload).transforms
+        except Exception as error:  # noqa: BLE001 - a sample that does not decode stays recorded, without a copy
+            log.warning(f"{key}: no TFMessage ({error}); not copied to /tf_static")
+            return
+        for t in transforms:
+            self._static[t.child_frame_id] = t
+        if self._static_channel is None:
+            self._static_channel = self._writer.register_channel(
+                ros.TF_STATIC_TOPIC, "cdr", self._schema(TFMessage.TYPE),
+                {"zenoh_key": topics.TF_STATIC, "zenoh_encoding": CDR + TFMessage.TYPE, ROS_COPY: ros.TF_STATIC_TOPIC,
+                 "offered_qos_profiles": TF_STATIC_QOS_PROFILE, "topic_type_hash": ros.hash_of(TFMessage.TYPE)})
+        copy = bytes(TFMessage(transforms=list(self._static.values())).serialize())
+        self._writer.add_message(self._static_channel, log_ns, copy, received_ns)
+        self.bytes += len(copy)
 
     def metadata(self, name: str, values: dict):
         """An MCAP metadata record: string values (others as JSON)."""
@@ -245,6 +290,92 @@ class _File:
     def finish(self):
         self._writer.finish()
         self._stream.close()
+
+
+ROSBAG_METADATA = "metadata.yaml"  # a rosbag2 directory's file (ros2 bag record -o <dir>)
+SQLITE_MAGIC = b"SQLite format 3\x00"  # rosbag2's sqlite3 storage (.db3)
+
+
+class RosbagError(ValueError):
+    """A rosbag2 that xblick play cannot read: the sqlite3 storage, or a directory without MCAP files."""
+
+
+def rosbag_files(path: str | Path) -> list[Path]:
+    """The files to play for ``path``: a rosbag2 directory (it has metadata.yaml) is its MCAP files in name order,
+    another path itself. RosbagError for rosbag2's sqlite3 storage (a directory of .db3 files, or such a file)."""
+    path = Path(path)
+    if path.is_dir() and (path / ROSBAG_METADATA).is_file():
+        files = sorted(path.glob("*.mcap"))
+        if not files:
+            if any(path.glob("*.db3")):
+                raise RosbagError(sqlite_text(path))
+            raise RosbagError(f"{path}: a rosbag2 directory without MCAP files")
+        return files
+    if path.is_file():
+        with open(path, "rb") as stream:
+            if stream.read(len(SQLITE_MAGIC)) == SQLITE_MAGIC:
+                raise RosbagError(sqlite_text(path))
+    return [path]
+
+
+def sqlite_text(path: Path) -> str:
+    return (f"{path}: a rosbag2 in the sqlite3 storage; xblick play reads rosbag2's MCAP storage only. Convert it "
+            "with ros2 bag convert -i BAG -o OUT.yaml, OUT.yaml naming an output bag with storage_id: mcap and "
+            "all_topics: true; or record with ros2 bag record -s mcap")
+
+
+def key_of(channel) -> str | None:
+    """The key of a channel's messages: its ``zenoh_key`` (xblick record's), else a rosbag2's ROS topic as live
+    reading maps it (``/<key>``: the topic without its leading ``/``); None for a copy for ROS's tools (``ROS_COPY``),
+    which is not played."""
+    if ROS_COPY in channel.metadata:
+        return None
+    key = channel.metadata.get("zenoh_key")
+    return key if key is not None else channel.topic.lstrip("/")
+
+
+def channel_key(channel, schema) -> tuple[str | None, str | None]:
+    """(key, Zenoh encoding) of a channel: xblick record's from its metadata; a rosbag2's (ros2 bag record, no
+    zenoh_key) from its ROS topic (``key_of``) and its CDR type, ``application/cdr;<type>``; (None, None) for a copy
+    for ROS's tools (``ROS_COPY``). ValueError for a channel that is neither."""
+    if ROS_COPY in channel.metadata:
+        return None, None
+    key, encoding = channel.metadata.get("zenoh_key"), channel.metadata.get("zenoh_encoding")
+    if key is not None and encoding is not None:
+        return key, encoding
+    if key is None and channel.message_encoding == "cdr" and schema is not None and schema.encoding == "ros2msg":
+        try:
+            ros.check_ros_name(channel.topic)
+        except ros.RosError as error:
+            raise ValueError(f"channel {channel.topic}: {error}") from None
+        return key_of(channel), CDR + schema.name
+    raise ValueError(f"channel {channel.topic}: neither xblick record's (zenoh_key, zenoh_encoding) nor rosbag2's "
+                     f"(CDR with a ros2msg schema); it has {channel.message_encoding!r}")
+
+
+def rosbag_streams(channels, wanted) -> tuple[set[str], set[str]]:
+    """The image streams of a rosbag2's channels (no zenoh_key): the bases with a sensor_msgs/Image on
+    ``<base>/image_raw``, and those with a sensor_msgs/CompressedImage on ``<base>/image_raw/compressed``
+    (image_transport's names, as live reading maps them)."""
+    raw, compressed = set(), set()
+    for channel, schema in channels:
+        if "zenoh_key" in channel.metadata or schema is None or not wanted(key_of(channel)):
+            continue
+        key = key_of(channel)
+        if schema.name == Image.TYPE and key.endswith("/" + topics.IMAGE_RAW):
+            raw.add(key[: -len(topics.IMAGE_RAW) - 1])
+        elif schema.name == CompressedImage.TYPE and key.endswith("/" + topics.COMPRESSED):
+            compressed.add(key[: -len(topics.COMPRESSED) - 1])
+    return raw, compressed
+
+
+def raw_codec(encoding: str) -> str | None:
+    """The compressed form a playback camera offers for a rosbag2's raw frames, as a live camera's: JPEG for 8-bit
+    colour and grey, RVL for 16-bit depth, none for other encodings (float depth)."""
+    for codec in (JPEG, RVL):
+        if encoding in CODEC_ENCODINGS[codec]:
+            return codec
+    return None
 
 
 def glob_any(pattern: str) -> bool:
@@ -772,6 +903,7 @@ class Recorder:
         for path in given:
             if not Path(path).exists() and not (videos._is_glob(path) and glob_any(path)):
                 raise FileNotFoundError(f"{path}: no such recording or video")
+        given = [str(p) for path in given for p in rosbag_files(path)]  # a rosbag2 directory: its MCAP files
         kinds = {videos.is_video_input(path) for path in given}
         if kinds == {True, False}:
             raise ValueError("MCAP recordings and videos together: play one kind at a time (recordings play one "
@@ -1339,7 +1471,10 @@ class Seeked(Exception):
 
 
 class Player(Paced):
-    """Plays MCAP recordings (``record``'s; other publishers' channels need its metadata) back onto Zenoh, below
+    """Plays MCAP recordings (``record``'s, and rosbag2's MCAP files, whose ROS topics map to keys as live reading
+    maps them: ``/a/b`` is ``a/b``; image_transport's ``<base>/image_raw`` or ``<base>/image_raw/compressed`` with
+    ``<base>/camera_info`` a stream of ours through a CameraPublisher, ``<base>/cloud`` a cloud stream with its info
+    record; ``channel_key``, ``rosbag_streams``) back onto Zenoh, below
     ``prefix``, at ``rate`` times the recorded pace, ``loop``-ing if asked; ``keys``: only channels whose Zenoh key
     matches one of these patterns (fnmatch); ``cuda_device``: image streams also in a CUDA ring on that device.
     :meth:`run` blocks until the end (or :meth:`end`); :meth:`pause` and :meth:`resume` hold it (the recorded pace
@@ -1357,7 +1492,7 @@ class Player(Paced):
             raise ValueError("pace clock needs the key of its clock (clock), and only it takes one")
         self.clock = topics.check_name(clock) if clock is not None else None
         self.session = session
-        self.files = [Path(f) for f in files]
+        self.files = [p for f in files for p in rosbag_files(f)]
         self.prefix = topics.check_name(prefix) if prefix else ""
         self.loop = loop
         self.keys = list(keys)
@@ -1374,6 +1509,7 @@ class Player(Paced):
         self._publishers: dict[str, zenoh.Publisher] = {}
         self._ros: dict[str, ros.RosPublisher] = {}  # in ROS 2: the ROS publisher of a key (ros.mirror, /tf)
         self._cameras: dict[str, CameraPublisher] = {}  # recorded stream base -> its publisher
+        self._raw_streams: set[str] = set()  # bases whose frames are a rosbag2's sensor_msgs/Image on image_raw
         self._queryables: list = []
         self._encodings: dict[str, str] = {}  # key -> its Zenoh encoding
         self._static: dict[str, bytes] = {}  # tf_static key -> its last payload
@@ -1471,7 +1607,9 @@ class Player(Paced):
 
     def _loop_length(self) -> int:
         """ns a pass moves the stamps on by: from the first message to the last, and the mean period of the slowest
-        channel (one message: none), so that each channel keeps its pace from one pass to the next."""
+        channel (one message: none), so that each channel keeps its pace from one pass to the next. A tf_static has no
+        pace: published once, also when a file holds it twice (ros2 bag record of a transient-local /tf_static), it
+        would make the gap between two passes as long as the recording."""
         start = end = None
         counts: dict[str, int] = {}
         for path, summary in self._summaries():
@@ -1481,8 +1619,8 @@ class Player(Paced):
             start = stats.message_start_time if start is None else min(start, stats.message_start_time)
             end = stats.message_end_time if end is None else max(end, stats.message_end_time)
             for channel_id, n in stats.channel_message_counts.items():
-                key = summary.channels[channel_id].metadata["zenoh_key"]
-                if self._wanted(key):
+                key = key_of(summary.channels[channel_id])
+                if key is not None and self._wanted(key) and not key.endswith(topics.TF_STATIC):
                     counts[key] = counts.get(key, 0) + n
         span = end - start
         periods = [span // (n - 1) for n in counts.values() if n > 1]
@@ -1493,16 +1631,23 @@ class Player(Paced):
     def _wanted(self, key: str) -> bool:
         return not self.keys or any(fnmatch.fnmatchcase(key, k) for k in self.keys)
 
-    def _first_frames(self, bases: set[str]) -> dict[str, tuple[CompressedImage | None, CameraInfo | None]]:
-        """The first compressed frame (its codec) and camera_info of each image stream, from the files; a stream without
-        camera_info (label images) none, looked for until FIRST_INFO_S recorded seconds after the last first frame."""
-        first = {b: [None, None] for b in bases}
+    def _first_frames(self, bases: set[str], raw: set[str] = frozenset(),
+                      clouds: set[str] = frozenset()) -> dict[str, tuple]:
+        """The first compressed frame (its codec; for a base in ``raw`` the first sensor_msgs/Image on
+        ``image_raw``, a rosbag2's) and camera_info of each image stream, from the files; a stream without camera_info
+        (label images) none, looked for until FIRST_INFO_S recorded seconds after the last first frame. And the first
+        cloud of each key in ``clouds`` (a rosbag2's, for its info record), as ``(cloud, None)``."""
+        first = {b: [None, None] for b in bases} | {k: [None, None] for k in clouds}
         framed_at = None  # log time all streams had a frame
         for log_time, key, payload in self._messages():
             if framed_at is not None and log_time - framed_at > FIRST_INFO_S * 1e9:
                 break
-            if key.endswith("/" + topics.COMPRESSED):
+            if key in clouds:
+                base, i, kind = key, 0, PointCloud2
+            elif key.endswith("/" + topics.COMPRESSED) and key[: -len(topics.COMPRESSED) - 1] not in raw:
                 base, i, kind = key[: -len(topics.COMPRESSED) - 1], 0, CompressedImage
+            elif key.endswith("/" + topics.IMAGE_RAW) and key[: -len(topics.IMAGE_RAW) - 1] in raw:
+                base, i, kind = key[: -len(topics.IMAGE_RAW) - 1], 0, Image
             elif key.endswith("/" + topics.CAMERA_INFO):
                 base, i, kind = key[: -len(topics.CAMERA_INFO) - 1], 1, CameraInfo
             else:
@@ -1511,7 +1656,7 @@ class Player(Paced):
                 first[base][i] = kind.deserialize(payload)
             if framed_at is None and all(f[0] is not None for f in first.values()):
                 framed_at = log_time
-            if all(f[0] is not None and f[1] is not None for f in first.values()):
+            if all(f[0] is not None and (f[1] is not None or b in clouds) for b, f in first.items()):
                 break
         return {b: tuple(f) for b, f in first.items()}
 
@@ -1521,12 +1666,20 @@ class Player(Paced):
         types = message_types()
         channels = [(c, summary.schemas.get(c.schema_id)) for _, summary in self._summaries()
                     for c in summary.channels.values()]
+        # a rosbag2's image streams (ros2 bag record's): <base>/image_raw, else <base>/image_raw/compressed, as a
+        # camera of ours, so that every reader takes them as it takes a camera's (rosbag_streams)
+        raw, compressed = rosbag_streams(channels, self._wanted)
+        rosbag_clouds = set()
+        for base in sorted(raw & compressed):
+            log.info(f"{base}: the rosbag2 has its image_raw and its image_raw/compressed; playing image_raw, "
+                     "which the camera of the playback compresses for its compressed readers")
         for channel, schema in channels:
-            key, encoding = channel.metadata.get("zenoh_key"), channel.metadata.get("zenoh_encoding")
-            if key is None or encoding is None:
-                raise ValueError(f"channel {channel.topic}: no zenoh_key/zenoh_encoding (not xblick record's)")
-            if not self._wanted(key) or key in self._publishers or key in self._types:
+            key, encoding = channel_key(channel, schema)
+            if key is None or not self._wanted(key) or key in self._publishers or key in self._types:
                 continue
+            rosbag = "zenoh_key" not in channel.metadata
+            if rosbag and key.endswith("/" + topics.COMPRESSED) and key[: -len(topics.COMPRESSED) - 1] in raw:
+                continue  # its stream plays from image_raw
             if not key.endswith(topics.TF_STATIC):
                 if channel.message_encoding == "json":
                     self._types[key] = None
@@ -1539,6 +1692,12 @@ class Player(Paced):
             if key.endswith("/" + topics.COMPRESSED) and info is not None:
                 streams[key[: -len(topics.COMPRESSED) - 1]] = json.loads(info)
                 continue
+            if rosbag and (key[: -len(topics.COMPRESSED) - 1] in compressed and key.endswith("/" + topics.COMPRESSED)
+                           or key[: -len(topics.IMAGE_RAW) - 1] in raw and key.endswith("/" + topics.IMAGE_RAW)):
+                self._encodings[key] = encoding
+                continue  # played by its stream's CameraPublisher
+            if rosbag and encoding == CDR + PointCloud2.TYPE and key.endswith("/" + topics.CLOUD):
+                rosbag_clouds.add(key)  # its info record from its first cloud, below
             self._encodings[key] = encoding
             out = self._out(key)
             if key.endswith(topics.TF_STATIC):
@@ -1565,19 +1724,40 @@ class Player(Paced):
         if self.loop:
             self._movable("looped")
             self._pass_ns = self._loop_length()
-        for base, (frame, camera_info) in self._first_frames(set(streams)).items():
+        for base, (frame, camera_info) in self._first_frames(set(streams) | raw | compressed, raw,
+                                                             rosbag_clouds).items():
             if frame is None:
                 continue  # no frame recorded
-            record = streams[base]
-            _, codec = parse_format(frame.format)
+            if base in rosbag_clouds:
+                self._serve_cloud_info(base, frame)
+                continue
+            if base in raw:  # a rosbag2's sensor_msgs/Image: the camera compresses as a live one
+                self._raw_streams.add(base)
+                encoding, codec, record = frame.encoding, raw_codec(frame.encoding), {"source": "play"}
+            elif base in compressed and base not in streams:  # a rosbag2's compressed frames only
+                original, codec = parse_format(frame.format)
+                encoding, record = original or decompress(frame)[1], {"source": "play"}
+            else:
+                record = streams[base]
+                encoding, (_, codec) = record["encoding"], parse_format(frame.format)
             self._cameras[base] = CameraPublisher(
-                self.session, self._out(base), encoding=record["encoding"], frame_id=frame.header.frame_id,
+                self.session, self._out(base), encoding=encoding, frame_id=frame.header.frame_id,
                 camera_info=camera_info, source=record.get("source", ""), codec=codec, cuda_device=self.cuda_device,
                 labels=bool(record.get("labels")), blocking=self.pace != "wall")
         for key in [k for k in self._encodings if k.endswith("/" + topics.CAMERA_INFO)]:
             if key[: -len(topics.CAMERA_INFO) - 1] not in self._cameras:  # camera_info of a stream not played
                 self._publishers[key] = self.session.declare_publisher(
                     self._out(key), encoding=zenoh.Encoding(self._encodings[key]), congestion_control=self._congestion)
+
+    def _serve_cloud_info(self, key: str, cloud):
+        """The info record of a rosbag2's point cloud ``<base>/cloud``, from its first cloud: raw only."""
+        base = key[: -len(topics.CLOUD) - 1]
+        record = {"v": INFO_VERSION, "kind": "points", "xblick": _core.__version__, "host": self._host,
+                  "transports": ["raw"], "fields": [f.name for f in cloud.fields], "frame_id": cloud.header.frame_id,
+                  "source": "play", "cuda_device_uuid": None}
+        payload = json.dumps(record, separators=(",", ":"))
+        self._queryables.append(self.session.declare_queryable(
+            self._out(topics.info(base)), lambda q, p=payload, b=base: q.reply(self._out(topics.info(b)), p)))
 
     def _ros_publisher(self, out: str, encoding: str):
         """In ROS 2: ROS's publisher of a played key: a camera's, robot's or world's tf on /tf, a camera's tf_static
@@ -1618,6 +1798,12 @@ class Player(Paced):
             message = moved if moved is not None else CompressedImage.deserialize(payload)
             self._cameras[key[: -len(topics.COMPRESSED) - 1]].publish_compressed(message)
             return
+        if key.endswith("/" + topics.IMAGE_RAW) and key[: -len(topics.IMAGE_RAW) - 1] in self._raw_streams:
+            message = moved if moved is not None else Image.deserialize(payload)
+            camera = self._cameras[key[: -len(topics.IMAGE_RAW) - 1]]
+            camera.frame_id = message.header.frame_id
+            camera.publish(image_to_numpy(message), message.header.stamp.to_ns())
+            return
         if key.endswith("/" + topics.CAMERA_INFO) and key[: -len(topics.CAMERA_INFO) - 1] in self._cameras:
             message = moved if moved is not None else CameraInfo.deserialize(payload)
             self._cameras[key[: -len(topics.CAMERA_INFO) - 1]].camera_info = message
@@ -1641,8 +1827,8 @@ class Player(Paced):
             with open(path, "rb") as stream:
                 for _, channel, message in self.mcap.reader.make_reader(stream).iter_messages(
                         log_time_order=True, **({"starting_at": from_ns} if from_ns is not None else {})):
-                    key = channel.metadata["zenoh_key"]
-                    if self._wanted(key):
+                    key = key_of(channel)
+                    if key is not None and self._wanted(key):
                         yield message.log_time, key, message.data
 
     def run(self):

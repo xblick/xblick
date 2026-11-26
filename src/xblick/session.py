@@ -20,6 +20,7 @@ import socket
 import sys
 import threading
 import time
+import weakref
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
@@ -133,7 +134,20 @@ def open_session(connect: Sequence[str] = (), listen: Sequence[str] = (), mode: 
                 declared.close()
             close(opened)
             raise
-    return Session(opened, across_pcs(connect, listen, mode, config_file), declared, taking_part)
+    wrapper = Session(opened, across_pcs(connect, listen, mode, config_file), declared, taking_part)
+    if taking_part is not None:
+        # ROS's daemon threads hold the Zenoh session, which a dropped Session would otherwise keep open until the
+        # program ends; without ROS nothing holds it, and Zenoh closes it when it is collected. Not at exit: what ends
+        # a program is not changed here
+        finalizer = weakref.finalize(wrapper, _release, opened, declared, taking_part)
+        finalizer.atexit = False
+        object.__setattr__(wrapper, "_finalizer", finalizer)
+    return wrapper
+
+
+def _release(raw: zenoh.Session, declared, taking_part):
+    """A Session in ROS 2 that its program dropped without closing it, closed as ``close`` closes one."""
+    _close_parts(raw, declared, taking_part, CLOSE_TIMEOUT_S)
 
 
 class OpenError(zenoh.ZError):
@@ -937,7 +951,13 @@ def close(session, timeout: float = CLOSE_TIMEOUT_S) -> bool:
         declared, taking_part = session.declaration, session.ros
         object.__setattr__(session, "declaration", None)
         object.__setattr__(session, "ros", None)
+        if session._finalizer is not None:
+            session._finalizer.detach()
+    return _close_parts(raw, declared, taking_part, timeout)
 
+
+def _close_parts(raw: zenoh.Session, declared, taking_part, timeout: float) -> bool:
+    """``close`` of a Zenoh session with its declaration and its part in ROS 2 (either may be None)."""
     def end():
         try:
             if taking_part is not None:  # its tokens gone first, so that ROS's graph drops the node at once
@@ -963,15 +983,18 @@ class Session:
     at most CLOSE_TIMEOUT_S (``close``). Everything else is the session's own: attributes go to it, and
     ``isinstance(s, zenoh.Session)`` holds (zenoh.Session cannot be subclassed). ``across_pcs``: the endpoints of
     ``across_pcs`` for its options, or none; ``declaration``: its program's (declaration.py), None when it does not
-    declare; ``ros``: its part in ROS 2 (ros.Ros, ``--ros``), None when it takes none."""
+    declare; ``ros``: its part in ROS 2 (ros.Ros, ``--ros``), None when it takes none. A Session in ROS 2 that its
+    program drops without closing it is closed when it is collected, as Zenoh closes a dropped session without ROS
+    (``_finalizer``; not at the program's exit)."""
 
-    __slots__ = ("_session", "across_pcs", "declaration", "ros")
+    __slots__ = ("_session", "across_pcs", "declaration", "ros", "_finalizer", "__weakref__")
 
     def __init__(self, session: zenoh.Session, across_pcs: Sequence[str] = (), declaration=None, ros=None):
         object.__setattr__(self, "_session", session)
         object.__setattr__(self, "across_pcs", list(across_pcs))
         object.__setattr__(self, "declaration", declaration)
         object.__setattr__(self, "ros", ros)
+        object.__setattr__(self, "_finalizer", None)
 
     def __getattr__(self, name):
         return getattr(self._session, name)

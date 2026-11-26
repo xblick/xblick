@@ -609,7 +609,122 @@ class _Polled:
         self.declared.undeclare()
 
 
+# ------------------------------------------------------------------------------------ ROS cameras as ROS names them
+
+COMPRESSED = "compressed"  # image_transport's compressed transport: the topic <image topic>/compressed
+CAMERA_INFO = "camera_info"  # image_transport's camera_info: the topic camera_info beside the image topic
+IMAGE_TYPE, COMPRESSED_TYPE = "sensor_msgs/msg/Image", "sensor_msgs/msg/CompressedImage"
+CLOUD_TYPE, CAMERA_INFO_TYPE = "sensor_msgs/msg/PointCloud2", "sensor_msgs/msg/CameraInfo"
+CAMERA_TYPES = (IMAGE_TYPE, COMPRESSED_TYPE, CLOUD_TYPE, CAMERA_INFO_TYPE)  # what xblick list shows of ROS's topics
+
+
+def is_topic(name: str) -> bool:
+    """True for a ROS topic as ROS's tools write it (``/image_raw``, ``/resize/image``): a name with a leading ``/``.
+    A name without one is one of our stream bases (``test/camera/color``)."""
+    return str(name).startswith("/")
+
+
+def compressed_topic(image_topic: str) -> str:
+    """image_transport's compressed topic of an image topic: ``/cam/image_raw`` -> ``/cam/image_raw/compressed``."""
+    return f"{image_topic}/{COMPRESSED}"
+
+
+def camera_info_topic(image_topic: str) -> str:
+    """image_transport's camera_info topic of an image topic: ``camera_info`` in the image topic's namespace
+    (``/cam/image_raw`` -> ``/cam/camera_info``, ``/image_raw`` -> ``/camera_info``, ``/resize/image`` ->
+    ``/resize/camera_info``)."""
+    return f"{image_topic.rpartition('/')[0]}/{CAMERA_INFO}"
+
+
+def publisher_pattern(domain: int, topic: str | None = None) -> str:
+    """The liveliness key expression of the publishers' tokens on ``domain``, of one ``topic`` or of all."""
+    return "/".join([ADMIN_SPACE, str(domain), "*", "*", "*", PUBLISHER, "*", "*", "*"]
+                    + ([mangle(topic), "**"] if topic is not None else ["**"]))
+
+
+def publishers(session, timeout: float = 1.0, topic: str | None = None) -> list[Token]:
+    """The publishers in ROS's graph (their tokens) on the domain of ``session`` (one in ROS 2), of ``topic`` or of
+    every topic, asked once (a session just opened knows none yet: ``ask``'s loop is the caller's)."""
+    from .session import replies
+    found = []
+    for reply in replies(session, publisher_pattern(session.ros.domain, topic), timeout, liveliness=True):
+        if reply.ok is not None:
+            try:
+                found.append(parse_token(str(reply.ok.key_expr)))
+            except RosError:
+                continue
+    return found
+
+
+class Graph:
+    """The publishers in ROS's graph on a session's domain, as a liveliness subscriber with history keeps their tokens
+    (made at its first use, ``Ros.graph``, closed with the session's part in ROS). ``listen(callback)``: called in its
+    thread when a publisher came or went. ``by_xblick(zid)``: whether a publisher's session is a program of ours (its
+    declaration, declaration.py), asked once per session: the ROS topics such a program publishes are the copies of
+    its own keys."""
+
+    def __init__(self, ros_: Ros):
+        self._ros = ros_
+        self._lock = threading.Lock()
+        self._tokens: dict[str, Token] = {}
+        self._listeners: list[Callable] = []
+        self._xblick: dict[str, bool] = {}
+        self._subscriber = _Polled(_raw(ros_.session).liveliness().declare_subscriber(
+            publisher_pattern(ros_.domain), history=True), self._seen, f"ros graph {ros_.domain}")
+
+    def _seen(self, sample):
+        key = str(sample.key_expr)
+        with self._lock:
+            if sample.kind == zenoh.SampleKind.PUT:
+                try:
+                    self._tokens[key] = parse_token(key)
+                except RosError:
+                    return
+            elif self._tokens.pop(key, None) is None:
+                return
+            listeners = list(self._listeners)
+        for callback in listeners:
+            callback()
+
+    def listen(self, callback: Callable):
+        with self._lock:
+            self._listeners.append(callback)
+
+    def unlisten(self, callback: Callable):
+        with self._lock:
+            if callback in self._listeners:
+                self._listeners.remove(callback)
+
+    def publishers(self, topic: str | None = None) -> list[Token]:
+        """The publishers known now, of ``topic`` or of all, this session's own left out."""
+        with self._lock:
+            return [t for t in self._tokens.values() if (topic is None or t.topic == topic) and t.zid != self._ros.zid]
+
+    def by_xblick(self, zid: str) -> bool:
+        """True when the session ``zid`` declares a program of ours (its declaration's token; a liveliness query, kept
+        per session). A program declares itself before it takes part in ROS (session.open_session), so its declaration
+        is known wherever its ROS tokens are."""
+        with self._lock:
+            known = self._xblick.get(zid)
+        if known is not None:
+            return known
+        from . import declaration
+        from .session import replies
+        found = any(r.ok is not None for r in replies(_raw(self._ros.session), declaration.key(zid), 1.0,
+                                                       liveliness=True))
+        with self._lock:
+            self._xblick[zid] = found
+        return found
+
+    def close(self):
+        self._subscriber.undeclare()
+        with self._lock:
+            self._listeners = []
+
+
 CLOCK_TOPIC = "/clock"  # ROS's global clock, which a node with use_sim_time reads
+TF_STATIC_TOPIC = "/tf_static"  # ROS's global static transforms (tf2's static broadcaster and listener)
+CLOCK_WAIT_S = 1.0  # --ros-clock: a program that has made no publisher of its clock key by then is told (C++ too)
 TF_TOLERANCE = 1e-6     # m and quaternion units: two static transforms of one frame that differ less are the same
 
 
@@ -667,10 +782,18 @@ class Ros:
         self._duplicates = None
         self._duplicates_said: set[str] = set()
         self._no_parameters = None
+        self._closed = False
+        self._graph: Graph | None = None
+        self._clock_published = False
+        self._clock_check = None
         self.node = self.add_node(node, namespace)
         self._watch_duplicates()
         from .parameters import Parameters
         self._no_parameters = Parameters.none_on(self.node)  # until the program's first Parameters
+        if self.clock is not None:
+            self._clock_check = threading.Timer(CLOCK_WAIT_S, self._check_clock)
+            self._clock_check.name, self._clock_check.daemon = f"ros clock {self.clock}", True
+            self._clock_check.start()
 
     def next_id(self) -> str:
         with self._lock:
@@ -727,18 +850,59 @@ class Ros:
         return self.node, False
 
     def release_parameters(self):
-        """The node's parameters closed: the next Parameters serve on it again."""
+        """The node's parameters closed: the next Parameters serve on it again, and until then its six services
+        without parameters (Parameters.none_on), so that ROS's parameter tools still get an answer. Not after
+        ``close``."""
+        from .parameters import Parameters
         with self._lock:
             self._parameters_taken = False
+            if self._closed or self._no_parameters is not None:
+                return
+        try:
+            none = Parameters.none_on(self.node)
+        except zenoh.ZError:  # its session closed already
+            return
+        with self._lock:
+            if self._closed or self._parameters_taken or self._no_parameters is not None:
+                taken = True
+            else:
+                self._no_parameters, taken = none, False
+        if taken:  # closed, or the next Parameters came meanwhile
+            none.close()
 
     def own(self, gid_: bytes):
         with self._lock:
             self._own_gids.add(gid_)
 
+    def _check_clock(self):
+        """``--ros-clock``: one warning line when the program has made no publisher of the clock key within
+        CLOCK_WAIT_S (``mirror`` notes it). A warning, not an error: a program may make it later (a simulation that
+        loads its scene first), and ROS nodes with use_sim_time wait for /clock meanwhile."""
+        if not self._clock_published and not self._closed:
+            log.warning(f"--ros-clock {self.clock}: this program has published no {self.clock} within "
+                        f"{CLOCK_WAIT_S:g} s, so ROS's /clock stays empty until it does (ROS nodes with use_sim_time "
+                        "wait for it); check the key")
+
+    @property
+    def graph(self) -> Graph:
+        """ROS's publishers on the domain (Graph), made at the first use: a program that reads no ROS topic keeps
+        none."""
+        with self._lock:
+            if self._graph is None:
+                self._graph = Graph(self)
+            return self._graph
+
     def close(self):
-        if self._no_parameters is not None:
-            self._no_parameters.close()
-            self._no_parameters = None
+        if self._clock_check is not None:
+            self._clock_check.cancel()
+        with self._lock:
+            self._closed = True
+            graph, self._graph = self._graph, None
+            no_parameters, self._no_parameters = self._no_parameters, None
+        if graph is not None:
+            graph.close()
+        if no_parameters is not None:
+            no_parameters.close()
         if self._duplicates is not None:
             self._duplicates.undeclare()
             self._duplicates = None
@@ -837,6 +1001,7 @@ def mirror(session, key: str, encoding, topic: str | None = None, qos: Qos = STR
         if type_name != "rosgraph_msgs/msg/Clock":
             raise RosError(f"--ros-clock {key}: its type is {type_name or str(encoding)}, not rosgraph_msgs/msg/Clock")
         topic = CLOCK_TOPIC
+        taking_part._clock_published = True
     if not type_name or "@" in type_name or type_name not in TYPE_HASHES:
         log.warning(f"{key}: not offered to ROS ({type_name or str(encoding)} has no ROS type hash here)")
         return None

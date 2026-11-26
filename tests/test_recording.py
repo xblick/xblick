@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import multiprocessing as mp
 import threading
@@ -111,6 +112,14 @@ def test_record_and_play(sessions, tmp_path):  # noqa: F811
     assert color.message_encoding == "cdr" and json.loads(color.metadata["xblick_info"])["encoding"] == "rgb8"
     assert channels[f"/{CAMERA}/gem_x/bodies"].message_encoding == "json"
     assert channels[f"/{CAMERA}/gem_x/bodies"].schema_id == 0
+    # the camera's tf_static also on ROS's /tf_static, transient local for ros2 bag play; our playback leaves it out
+    assert keys.count("tf_static") == 1
+    copy = channels["/tf_static"]
+    assert copy.metadata[recording.ROS_COPY] == "/tf_static" and "transient_local" in copy.metadata[
+        "offered_qos_profiles"]
+    copied = [m for k, m in messages if k == "tf_static"][0]
+    assert TFMessage.deserialize(copied.data).transforms[0].child_frame_id == "depth"
+    messages = [(k, m) for k, m in messages if k != "tf_static"]
 
     # played back below a prefix: found and read as the camera was (on this host from shared memory, decoded once)
     player = recording.Player(a, [path], prefix="replay", rate=1.0)
@@ -406,3 +415,168 @@ def test_playback_controls_as_parameters(sessions, tmp_path):  # noqa: F811
         client.close()
         for c in (player_node, recorder, scene):
             c.close()
+
+
+def write_rosbag(path, frames=5, compressed_too=False, static_twice=False):
+    """An MCAP file as ros2 bag record writes it (profile ros2, ros2msg schemas, channels on ROS topics without our
+    metadata): a colour camera's image_raw and camera_info, a depth camera's compressed frames only, /tf_static, a
+    point cloud, and an image topic outside image_transport's names. Frames 100 ms apart, stamped 1 s, 2 s, ..."""
+    from xblick.codecs import compress
+    from xblick.encodings import numpy_to_image
+    from xblick.msg import PointCloud2, PointField
+
+    mcap = recording.import_mcap()
+    with open(path, "wb") as stream:
+        writer = mcap.writer.Writer(stream)
+        writer.start(profile="ros2", library="rosbag2")
+        schemas = {name: writer.register_schema(name, "ros2msg", MSGDEFS[name].encode())
+                   for name in ("sensor_msgs/msg/Image", "sensor_msgs/msg/CameraInfo",
+                                "sensor_msgs/msg/CompressedImage", "tf2_msgs/msg/TFMessage",
+                                "sensor_msgs/msg/PointCloud2")}
+        topics = {"/rb/cam/color/image_raw": "sensor_msgs/msg/Image",
+                  "/rb/cam/color/camera_info": "sensor_msgs/msg/CameraInfo",
+                  "/rb/cam/depth/image_raw/compressed": "sensor_msgs/msg/CompressedImage",
+                  "/tf_static": "tf2_msgs/msg/TFMessage", "/rb/lidar/cloud": "sensor_msgs/msg/PointCloud2",
+                  "/other/image": "sensor_msgs/msg/Image"}
+        if compressed_too:
+            topics["/rb/cam/color/image_raw/compressed"] = "sensor_msgs/msg/CompressedImage"
+        channels = {t: writer.register_channel(t, "cdr", schemas[n], {"offered_qos_profiles": ""})
+                    for t, n in topics.items()}
+        info = CameraInfo.pinhole(6, 4, 5.0, 5.0, 2.5, 1.5, frame_id="rb_cam")
+        fields = [PointField(n, 4 * i, PointField.FLOAT32) for i, n in enumerate("xyz")]
+        for k in range(frames):
+            stamp = 1_000_000_000 * (k + 1)
+            header = Header(Time.from_ns(stamp), "rb_cam")
+            image = np.full((4, 6, 3), k, np.uint8)
+            payloads = {"/rb/cam/color/image_raw": numpy_to_image(image, "rgb8", header),
+                        "/rb/cam/color/camera_info": dataclasses.replace(info, header=header),
+                        "/rb/cam/depth/image_raw/compressed": compress(np.full((4, 6), 1000 + k, np.uint16),
+                                                                         "16UC1", PNG, header=header),
+                        "/rb/lidar/cloud": PointCloud2(Header(Time.from_ns(stamp), "rb_lidar"), 1, 2, fields,
+                                                       False, 12, 24, np.full(6, k, "<f4").tobytes(), True),
+                        "/other/image": numpy_to_image(image, "rgb8", header)}
+            if compressed_too:
+                payloads["/rb/cam/color/image_raw/compressed"] = compress(image, "rgb8", header=header)
+            if k == 0 or (static_twice and k == frames - 1):  # ros2 bag record can hold a /tf_static twice
+                payloads["/tf_static"] = TFMessage([transform("rb_base", "rb_cam", 0.1)])
+            for topic, message in payloads.items():
+                log_ns = 100_000_000 * k + 1
+                writer.add_message(channels[topic], log_time=log_ns, data=bytes(message.serialize()),
+                                   publish_time=log_ns)
+        writer.finish()
+
+
+def test_a_rosbag2_plays_its_cameras_as_ours(sessions, tmp_path):  # noqa: F811
+    """A rosbag2 MCAP file: image_transport's topics become streams of ours (raw frames, compressed-only frames), a
+    cloud a stream with its info record, every other topic the key live reading maps it to (/a/b -> a/b)."""
+    from xblick.points import PointCloudSubscriber
+
+    a, b = sessions
+    path = tmp_path / "bag_0.mcap"
+    write_rosbag(path)
+    player = recording.Player(a, [path])
+    color = ImageSubscriber(b, "rb/cam/color", transport="auto", camera_info=True)
+    compressed = ImageSubscriber(b, "rb/cam/color", transport="compressed")
+    depth = ImageSubscriber(b, "rb/cam/depth", transport="auto")
+    clouds = PointCloudSubscriber(b, "rb/lidar")
+    other = []
+    plain = b.declare_subscriber("other/image", lambda s: other.append(str(s.encoding)))
+    time.sleep(0.5)
+    thread = threading.Thread(target=player.run)
+    thread.start()
+    try:
+        frame = color.latest(timeout=5.0)
+        assert frame is not None and frame.encoding == "rgb8" and frame.header.frame_id == "rb_cam"
+        assert color.describe().startswith("shm") and frame.image[0, 0, 0] == frame.stamp_ns // 10**9 - 1
+        wait_until(lambda: color.camera_info is not None)
+        assert color.camera_info.k[0] == 5.0
+        assert compressed.latest(timeout=5.0) is not None  # the playback camera compresses the raw frames
+        d = depth.latest(timeout=5.0)
+        assert d is not None and d.encoding == "16UC1" and d.image[0, 0] in range(1000, 1005)
+        cloud = clouds.latest(timeout=5.0)
+        assert cloud is not None and cloud.header.frame_id == "rb_lidar" and cloud.points.shape == (1, 2)
+        thread.join()
+        assert other and other[0] == "application/cdr;sensor_msgs/msg/Image"
+        answers = [r.ok for r in replies(b, "tf_static", 1.0) if r.ok is not None]  # the bag's /tf_static: tf_static
+        assert len(answers) == 1
+        assert TFMessage.deserialize(answers[0].payload.to_bytes()).transforms[0].child_frame_id == "rb_cam"
+        assert player.error is None
+    finally:
+        plain.undeclare()
+        thread.join()
+        for c in (color, compressed, depth, clouds, player):
+            c.close()
+
+
+def test_a_rosbag2_with_raw_and_compressed_plays_the_raw_frames(sessions, tmp_path, caplog):  # noqa: F811
+    a, _ = sessions
+    path = tmp_path / "both.mcap"
+    write_rosbag(path, frames=2, compressed_too=True)
+    with caplog.at_level("INFO", logger="xblick"):
+        player = recording.Player(a, [path])
+    try:
+        assert "rb/cam/color" in player._raw_streams and "rb/cam/color/image_raw/compressed" not in player._publishers
+        assert any("playing image_raw" in r.getMessage() for r in caplog.records)
+    finally:
+        player.close()
+
+
+def test_rosbag2_directories_and_the_sqlite3_storage(tmp_path):
+    bag = tmp_path / "bag"
+    bag.mkdir()
+    (bag / "metadata.yaml").write_text("rosbag2_bagfile_information:\n  storage_identifier: mcap\n")
+    for name in ("bag_1.mcap", "bag_0.mcap"):
+        write_rosbag(bag / name, frames=1)
+    assert recording.rosbag_files(bag) == [bag / "bag_0.mcap", bag / "bag_1.mcap"]
+    old = tmp_path / "old"
+    old.mkdir()
+    (old / "metadata.yaml").write_text("rosbag2_bagfile_information:\n  storage_identifier: sqlite3\n")
+    (old / "old_0.db3").write_bytes(recording.SQLITE_MAGIC + b"\0" * 84)
+    for given in (old, old / "old_0.db3"):
+        with pytest.raises(recording.RosbagError, match="sqlite3 storage; xblick play reads rosbag2's MCAP"):
+            recording.rosbag_files(given)
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    (empty / "metadata.yaml").write_text("")
+    with pytest.raises(recording.RosbagError, match="without MCAP files"):
+        recording.rosbag_files(empty)
+
+
+def test_the_ros_copy_of_tf_static_holds_every_camera_and_is_not_played(sessions, tmp_path):  # noqa: F811
+    """Two cameras' tf_static: each message of the /tf_static copy holds the static transforms of both so far (the
+    last one all of them, as tf2's static broadcaster sends them). Playback serves each camera's key and its ROS copy
+    on /tf_static once, never the file's copy as well."""
+    a, b = sessions
+    one = StaticTransformPublisher(a, "robot/cam1", [transform("base", "cam1", 0.1)])
+    two = StaticTransformPublisher(a, "robot/cam2", [transform("base", "cam2", 0.2)])
+    recorder = recording.Recorder(b, tmp_path, name="static_rec", split=0, look_every=0.5)
+    recorder.record(keys=["robot/*/tf_static"])
+    time.sleep(1.0)
+    recorder.stop()
+    (path,) = recorder.files
+    for c in (one, two):
+        c.close()
+    _, messages = read(path)
+    copies = [TFMessage.deserialize(m.data) for k, m in messages if k == "tf_static"]
+    assert sorted(k for k, _ in messages if k != "tf_static") == ["robot/cam1/tf_static", "robot/cam2/tf_static"]
+    assert {t.child_frame_id for t in copies[-1].transforms} == {"cam1", "cam2"}
+    player = recording.Player(a, [path])
+    try:
+        assert "tf_static" not in player._publishers and set(player._publishers) == set(player._ros)
+        assert sum(p.topic == "/tf_static" for p in player._ros.values()) == 2  # one per camera's key, no third
+    finally:
+        player.close()
+        recorder.close()
+
+
+def test_a_rosbag2_loops_without_a_gap_for_its_tf_static(sessions, tmp_path):  # noqa: F811
+    """A /tf_static recorded twice has no pace: a pass is the recording's length and one period of the frames (100 ms),
+    not twice its length."""
+    a, _ = sessions
+    path = tmp_path / "loop.mcap"
+    write_rosbag(path, frames=5, static_twice=True)
+    player = recording.Player(a, [path], loop=True)
+    try:
+        assert player._pass_ns == 400_000_000 + 100_000_000
+    finally:
+        player.close()

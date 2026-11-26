@@ -46,7 +46,7 @@ accepts these options. [Durchblick and ROS 2](../integrations/ros2.md) explains 
 | `--ros-domain ID` | The ROS domain id. The default is `ROS_DOMAIN_ID`, else 0. |
 | `--ros-node NAME` | The program's ROS node, as `NAME` or `/namespace/NAME`. The default is the name of the program's parameters, such as `/test/camera/yolox`. A program without parameters takes its own name in the namespace of its `--camera`, such as `/test/camera/xblick_test_camera`. Every character other than a letter, digit or `_` is written as `_`. |
 | `--ros-params-writable` | ROS clients may set the program's parameters. Without it the ROS parameter services answer reads only and refuse sets. A ROS set is unchecked and uncounted: two nodes of one name both execute it, and the ROS client shows one success. |
-| `--ros-clock KEY` | The program's clock key `KEY` (`rosgraph_msgs/Clock`, such as `sim/clock`) goes to ROS's global `/clock` instead of `/KEY`. ROS nodes with `use_sim_time` read it. The default is no key. |
+| `--ros-clock KEY` | The program's clock key `KEY` (`rosgraph_msgs/Clock`, such as `sim/clock`) goes to ROS's global `/clock` instead of `/KEY`. ROS nodes with `use_sim_time` read it. The default is no key. A program that has made no publisher of `KEY` after 1 s prints one warning line and goes on. |
 
 | Variable | Meaning |
 | --- | --- |
@@ -80,7 +80,9 @@ address (`--listen tcp/127.0.0.1:PORT`) the start line says that other PCs canno
 ### `xblick list [prefix]`
 
 Lists every stream with its encoding or fields, its transports, its host and its Durchblick version. The command
-queries the info records and subscribes to nothing.
+queries the info records and subscribes to nothing. In ROS 2 it then lists the ROS topics of the types Image,
+CompressedImage, PointCloud2 and CameraInfo, with `ros` in the transports column and the publishing nodes. It leaves
+out the ROS copies of our own streams, which are listed already.
 
 | Option | Meaning |
 | --- | --- |
@@ -91,16 +93,19 @@ queries the info records and subscribes to nothing.
 ### `xblick hz <stream>`
 
 Subscribes to an image or point cloud stream. Prints the rate, the age at send and at receive, and the missing
-frames.
+frames. A `<stream>` with a leading `/` is a ROS 2 topic of any name, such as `/image_raw` or `/resize/image`. Its
+type in ROS's graph decides between images and point clouds. A stream of ours that only a ROS node publishes is read
+from ROS with `auto`, as the subscribers do.
 
 | Option | Meaning |
 | --- | --- |
-| `--transport auto\|compressed\|raw\|shm\|ros` | the transport to measure. `ros` reads the ROS 2 topic `/<stream>/image_raw` of a ROS camera. |
+| `--transport auto\|compressed\|raw\|shm\|ros` | the transport to measure. `ros` reads the ROS 2 topic `/<stream>/image_raw` of a ROS camera. For a ROS topic `/T`: `auto` reads `/T`, or `/T/compressed` when only that is published. `ros` and `raw` read `/T`, `compressed` reads `/T/compressed`. |
 | `--seconds S` | stop after this time |
 
 ### `xblick snapshot <stream> <file>`
 
-Saves one frame as an image file. PNG keeps 16-bit depth. Options: `--transport`, `--timeout`.
+Saves one frame as an image file. PNG keeps 16-bit depth. Options: `--transport`, `--timeout`. A `<stream>` with a
+leading `/` is a ROS 2 image topic, as for `xblick hz`.
 
 ### `xblick diagnostics [prefix]`
 
@@ -248,8 +253,9 @@ Sends commands to a running recorder. `xblick recorder --help` lists them.
 
 ### `xblick play <files ...>`
 
-Plays MCAP files of `xblick record` one after another. Files that are not MCAP are played as videos or image
-sequences, one stream each, on one clock.
+Plays MCAP files of `xblick record` one after another. It also plays rosbag2 bags in the MCAP storage: a bag's
+directory or its `.mcap` files ([recording guide](../guides/recording.md#files-of-ros2-bag-record)). Files that are
+not MCAP are played as videos or image sequences, one stream each, on one clock.
 
 | Option | Meaning |
 | --- | --- |

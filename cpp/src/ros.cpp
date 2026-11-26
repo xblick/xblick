@@ -6,6 +6,7 @@
 #include <cmath>
 #include <charconv>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -771,10 +772,32 @@ namespace xblick::ros
                 }
             },
             [] {}, std::move(options));
+        if (not options_.clock.empty() and not clock_check_.joinable())
+        {
+            // one line when the clock key has no publisher by then (Python's Ros._check_clock): a key the program
+            // never publishes would leave /clock empty without a word
+            clock_check_ = std::jthread([this](const std::stop_token& stop) {
+                std::mutex m;
+                std::condition_variable_any woken;
+                std::unique_lock lock(m);
+                woken.wait_for(lock, stop, std::chrono::seconds(kClockWaitS), [] { return false; });
+                if (not stop.stop_requested() and not clock_published_.load())
+                {
+                    say("--ros-clock " + options_.clock + ": this program has published no " +
+                        options_.clock + " within " + std::to_string(kClockWaitS) + " s, so ROS's /clock stays " +
+                        "empty until it does (ROS nodes with use_sim_time wait for it); check the key");
+                }
+            });
+        }
     }
 
     void Ros::detach()
     {
+        clock_check_.request_stop();  // not joined under the mutex: it takes none, and ends at once
+        if (clock_check_.joinable() and clock_check_.get_id() != std::this_thread::get_id())
+        {
+            clock_check_.join();
+        }
         std::lock_guard lock(graph_mutex_);
         node_token_.reset();  // a token may go while the session closes (it did before, take_part)
         attached_ = false;
@@ -1396,6 +1419,7 @@ namespace xblick::ros
                                ", not rosgraph_msgs/msg/Clock");
             }
             topic = std::string(kClockTopic);
+            ros->clock_published();
         }
         if (type.version != 0 or not type_hashes().contains(type_name))
         {
