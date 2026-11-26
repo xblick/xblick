@@ -11,6 +11,18 @@ Each version below is a heading with its release notes: one summary sentence, th
 (and Known limit), one line on compatibility. `tools/release_notes.sh <version>` prints a version's notes for its
 GitHub release. The rule is in [Development](docs/project/development.md#release-notes).
 
+## 0.5.18
+
+A script that ends without closing what it opened no longer aborts now and then at its end.
+
+### Fixed
+
+- The threads of a `FrameHistory`, an `Overlay`, a node's `Parameters`, a `CommandSubscriber`, a `StaticTransformSubscriber`, a recorder and the Rerun bridge, and the readers of queries still open, are stopped and waited for when a script ends without closing them, within the same 5 s as its sessions. One of them inside a Zenoh call or a ring read when Python finalised aborted the program now and then ("FATAL: exception not rethrown", "terminate called without an active exception").
+- A `FrameHistory` left open no longer ends the program with a nanobind leak report, and a `StaticTransformSubscriber` left open no longer with a traceback ("session closed").
+- `xblick test-camera` ends with exit code 0 also when SIGTERM or Ctrl-C comes while it starts (it ended by SIGINT).
+
+Compatible with 0.5.17: nothing on the wire changes.
+
 ## 0.5.17
 
 A script that ends without closing what it opened now exits. 0.5.16 was not released.
