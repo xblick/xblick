@@ -994,8 +994,9 @@ def build_parser(prog: str = "xblick") -> argparse.ArgumentParser:
     p = commands.add_parser("play", help="the record and play node, playing MCAP recordings (needs "
                                          "xblick[record]) or videos (xblick[video]) at its start; runs until "
                                          "Ctrl-C or SIGTERM, as xblick record")
-    p.add_argument("files", nargs="+", help="xblick record's files, played one after another; or videos (any "
-                                            "file that is not MCAP, an image directory or glob), played at once")
+    p.add_argument("files", nargs="+", help="xblick record's files or rosbag2 MCAP bags (a bag's directory or its "
+                                            ".mcap files), played one after another; or videos (any file that is not "
+                                            "MCAP, an image directory or glob), played at once")
     p.add_argument("--dir", default=None, help="the node's directory: where it records to and finds files given "
                                                "over Zenoh (default: the first file's)")
     p.add_argument("--prefix", default="", help="publish below this prefix (default: on the recorded topics)")

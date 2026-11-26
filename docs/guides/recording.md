@@ -161,6 +161,24 @@ unchanged. Time therefore goes on as with a camera, and nodes that accept only n
 `play` refuses `--loop` for a channel whose type it does not know. In a test, NeMO started on a playback and
 tracked the objects at 10 frames per second, as on the live simulation.
 
+### Files of `ros2 bag record`
+
+`play` also plays rosbag2 files in the MCAP storage, which `ros2 bag record` uses by default. Give the bag's
+directory, which holds `metadata.yaml`, or its `.mcap` files. `play` maps each ROS topic to a key by the rule
+of live reading: the topic `/a/b` becomes the key `a/b`.
+
+| Topics in the bag | What `play` publishes |
+| --- | --- |
+| `/<base>/image_raw` (`sensor_msgs/Image`) and `/<base>/camera_info` | the stream `<base>` with all its forms, as a camera does. Its compressed form is JPEG for 8-bit images and RVL for 16-bit depth. |
+| `/<base>/image_raw/compressed` without `image_raw` | the stream `<base>` from the recorded JPEG or PNG |
+| `/<base>/cloud` (`sensor_msgs/PointCloud2`) | the point cloud stream `<base>`, raw, with its info record |
+| any other topic, such as `/tf`, `/tf_static` or `/resize/image` | the key without the leading `/`, as recorded |
+
+A bag with both `image_raw` and `image_raw/compressed` of one stream plays `image_raw`. `play` says so in one line.
+In ROS 2 the playback offers its streams to ROS as every publisher does, so `/tf` and `/tf_static` reach ROS's
+global topics again. rosbag2's sqlite3 storage (`.db3` files) is refused with a message. Convert such a bag with
+`ros2 bag convert` to the storage `mcap`.
+
 ### Step by step
 
 `--pace` selects what drives the playback.

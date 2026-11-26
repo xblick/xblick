@@ -253,8 +253,9 @@ Sends commands to a running recorder. `xblick recorder --help` lists them.
 
 ### `xblick play <files ...>`
 
-Plays MCAP files of `xblick record` one after another. Files that are not MCAP are played as videos or image
-sequences, one stream each, on one clock.
+Plays MCAP files of `xblick record` one after another. It also plays rosbag2 bags in the MCAP storage: a bag's
+directory or its `.mcap` files ([recording guide](../guides/recording.md#files-of-ros2-bag-record)). Files that are
+not MCAP are played as videos or image sequences, one stream each, on one clock.
 
 | Option | Meaning |
 | --- | --- |
