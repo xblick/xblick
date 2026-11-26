@@ -122,6 +122,7 @@ from .msg import (CameraInfo, Classification, CompressedImage, Detection2DArray,
                   TFMessage)
 from .points import PointCloudSubscriber, unpack_rgb
 from .poses import _TfSubscriber, rotation_from_quaternion
+from .session import close_at_exit, forget_at_exit
 
 
 def rotation_of(q) -> np.ndarray:
@@ -398,6 +399,7 @@ class RerunBridge:
             self._layout_thread = threading.Thread(target=self._send_layout_once, args=(layout_after,),
                                                    name="xblick-rerun layout", daemon=True)
             self._layout_thread.start()
+        close_at_exit(self, "the Rerun bridge")  # its threads call Rerun and Zenoh: stopped at the end
 
     def _send_layout_once(self, after: float):
         if self._closed.wait(after):
@@ -1159,6 +1161,7 @@ class RerunBridge:
             reader.check()
 
     def close(self):
+        forget_at_exit(self)
         self._closed.set()
         for thread in (self._stale_thread, self._layout_thread):
             if thread is not None:

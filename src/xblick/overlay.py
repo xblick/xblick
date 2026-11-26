@@ -28,6 +28,7 @@ import threading
 import numpy as np
 
 from .camera import CameraPublisher
+from .session import close_at_exit, forget_at_exit
 
 OVERLAY = "overlay"  # the stream's last part: <camera>/<node>/overlay
 DEPTH_NEAR_MM, DEPTH_FAR_MM = 300, 5000  # the depth colours' fixed range (depth_colours)
@@ -57,6 +58,7 @@ class Overlay:
         self._cond = threading.Condition()
         self._thread = threading.Thread(target=self._run, name=f"overlay {camera}/{node}", daemon=True)
         self._thread.start()
+        close_at_exit(self, f"the overlay {camera}/{node}")  # its thread publishes: stopped at the end
 
     @property
     def base(self) -> str:
@@ -96,6 +98,7 @@ class Overlay:
             raise RuntimeError(f"the overlay failed: {type(self._error).__name__}: {self._error}") from self._error
 
     def close(self):
+        forget_at_exit(self)
         with self._cond:
             self._stop = True
             self._cond.notify()

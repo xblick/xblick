@@ -154,10 +154,12 @@ ends the program with exit code 1 and one line on stderr that names what did not
 `zenoh.open` call needs the same wrap in `session.Session(...)`.
 
 A session that the program drops without closing it, its last reference gone, is not kept until the end: its program's
-declaration is undeclared at once, and Zenoh closes the session. A daemon thread that is still inside a Zenoh call when
-Python finalises aborts the process with "FATAL: exception not rethrown"; the declaration's thread was such a thread
-when it outlived its session. Close what you open, and end your own daemon threads that call Zenoh before the program
-ends.
+declaration is undeclared at once, and Zenoh closes the session. A daemon thread that is still inside a Zenoh call, or
+inside a ring read of the C++ core, when Python finalises aborts the process with "FATAL: exception not rethrown" or
+"terminate called without an active exception". The threads of xblick are therefore stopped and waited for in the same
+close at the end, within the same 5 s: those of a history (`FrameHistory`), an overlay, a node's parameters, a
+`CommandSubscriber`, a `StaticTransformSubscriber`, a recorder, the Rerun bridge, and the readers of queries still open.
+Close what you open, and end your own daemon threads that call Zenoh before the program ends.
 
 ## Related pages
 
