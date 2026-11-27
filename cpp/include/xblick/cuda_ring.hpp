@@ -161,4 +161,7 @@ namespace xblick
 
     // A device buffer of its own (e.g. for a driver that uploads frames, or tests).
     std::shared_ptr<DeviceBuffer> make_device_buffer(int device, std::uint64_t nbytes);
+    // A memory pool on a device for the buffers of a reader other than CudaRingReader (ros_cuda.hpp's Receiver): its
+    // DeviceBuffers come from it, ordered on the stream they are made with (of the device's primary context).
+    std::shared_ptr<DevicePool> make_device_pool(int device);
 }  // namespace xblick
