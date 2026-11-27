@@ -571,6 +571,59 @@ def test_a_keyboard_interrupt_before_the_command_takes_it_ends_a_long_running_co
     assert ("KeyboardInterrupt" in done.stderr) == (status != 0), done.stderr
 
 
+SIGNALLED = """
+import os
+import signal
+import sys
+
+import xblick.cli as cli
+
+
+def signalled(*args, **kwargs):
+    try:
+        os.kill(os.getpid(), getattr(signal, sys.argv[1]))  # inside the command, after main() took the signals
+        raise AssertionError("the signal raised nothing")
+    finally:
+        print("xblick-test: cleaned up")  # not flushed: main() writes it out before the signal ends the process
+
+
+name = sys.argv[2]
+if name == "router":
+    cli.router.serve = signalled
+else:
+    setattr(cli, {"test-camera": "_test_camera", "list": "_list", "param": "_param"}[name], signalled)
+sys.exit(cli.main(sys.argv[2:]))
+"""
+
+
+@pytest.mark.parametrize("command, sig, status", [
+    (["list"], "SIGTERM", -signal.SIGTERM), (["param", "--nodes"], "SIGTERM", -signal.SIGTERM),
+    (["list"], "SIGINT", -signal.SIGINT), (["router"], "SIGTERM", 0), (["router"], "SIGINT", 0),
+    (["test-camera"], "SIGTERM", 0)])
+def test_a_later_sigterm_ends_a_one_shot_command_by_sigterm(command, sig, status):
+    """A signal while the command runs, after its start: a one-shot command (cli.ONE_SHOT) ends by SIGTERM after its
+    cleanup, its output written and without a traceback (143 in a shell; it ended as on Ctrl-C before, by SIGINT with a
+    traceback); Ctrl-C keeps that end. A long-running command ends with exit code 0 on either signal."""
+    done = subprocess.run([sys.executable, "-c", SIGNALLED, sig, *command], stdin=subprocess.DEVNULL,
+                          capture_output=True, text=True, timeout=60, env=ENV)
+    assert done.returncode == status, (done.returncode, done.stdout, done.stderr)
+    assert done.stdout == "xblick-test: cleaned up\n", done.stdout
+    assert ("Traceback" in done.stderr) == (status == -signal.SIGINT), done.stderr
+
+
+def test_sigterm_ends_xblick_hz_by_sigterm(camera):
+    """xblick hz measuring a stream (past its start: its first frame came) ends by SIGTERM, without a traceback."""
+    hz = start("hz", "test/camera/color", "--seconds", "60", "--connect", camera)
+    try:
+        line = hz.stdout.readline()  # its first frame came
+        assert line.startswith("transport: "), line + (hz.stdout.read() if hz.poll() is not None else "")
+    finally:
+        if hz.poll() is None:
+            hz.send_signal(signal.SIGTERM)
+        out, _ = hz.communicate(timeout=30)
+    assert hz.returncode == -signal.SIGTERM and "Traceback" not in out, (hz.returncode, out)
+
+
 def test_every_command_is_one_shot_or_long_running():
     """cli.ONE_SHOT names commands of the parser, and every other command but relay serves until it is stopped: a new
     command needs its place in that set."""

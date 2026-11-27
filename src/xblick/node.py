@@ -115,14 +115,20 @@ def _subscriptions(watched) -> list:
 _UNSET = object()
 
 
+class Terminated(KeyboardInterrupt):
+    """The KeyboardInterrupt that SIGTERM raises (``end_on_signals``): code that ends on Ctrl-C ends on it alike, and
+    a program that wants to tell the two apart can (the one-shot ``xblick`` commands end by SIGTERM on it)."""
+
+
 def end_on_signals():
-    """SIGINT and SIGTERM end the program as Ctrl-C does (KeyboardInterrupt), through its cleanup. SIGTERM (kill, a
+    """SIGINT and SIGTERM end the program as Ctrl-C does (KeyboardInterrupt; SIGTERM's is a ``Terminated``), through
+    its cleanup. SIGTERM (kill, a
     service manager) would otherwise end it in the middle of its cleanup (xblick rerun --save lost what Rerun still
     buffered). SIGINT also ends it when it was started as a background job of a script: a non-interactive shell starts
     those with SIGINT ignored, and Python then never installs its handler, so ``kill -INT`` and Ctrl-C on the script
     did nothing. ``node.start`` and every ``xblick`` command call it."""
     def interrupt(signum, frame):
-        raise KeyboardInterrupt
+        raise Terminated
 
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGINT, signal.default_int_handler)

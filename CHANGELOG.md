@@ -53,6 +53,7 @@ streams, transforms and parameters, and it reads theirs.
 - After its parameters close, a program's ROS node serves the six parameter services without parameters again, so `ros2 param list` keeps answering.
 - `xblick list` takes ROS's topics from the session's ROS graph (`cli.ros_camera_topics` lost its `timeout`).
 - C++: a ROS-only subscriber now counts in `CameraPublisher::subscribed()`, `needs_pixels()` and `ImuPublisher::subscribed()`, so frames render for it; a ROS reader of camera_info alone counts in `subscribed()`, not in `needs_pixels()`.
+- `xblick list`, `hz`, `snapshot`, `param`, `recorder` and `clean` end by SIGTERM on a SIGTERM (exit status 143 in a shell), after their cleanup and without a traceback; they ended as on Ctrl-C, with a traceback and 130. Ctrl-C is unchanged. `end_on_signals` raises `node.Terminated`, a KeyboardInterrupt, on SIGTERM.
 
 ### Fixed
 

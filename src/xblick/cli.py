@@ -45,7 +45,7 @@ from . import session as zsession
 from ._signals import SCRIPTS, held, interface_command, relay_command
 from .camera import (CameraPublisher, ImageSubscriber, ProtocolError, StaticTransformPublisher, find_streams,
                      wait_for_info)
-from .node import end_on_signals
+from .node import Terminated, end_on_signals
 from .paths import expand_path
 from .points import PointCloudSubscriber
 
@@ -1095,10 +1095,12 @@ def main(argv=None) -> int:
         if held:  # a signal while it started (_signals.hold): it ends before it begins
             return _ended_while_starting(args.command, held[0])
         return args.run(args)
-    except KeyboardInterrupt:
-        if args.command in ONE_SHOT:
-            raise  # as before: a traceback, and Python ends by SIGINT
-        return 0  # Ctrl-C or SIGTERM is a long-running command's normal end, also before its own handler
+    except KeyboardInterrupt as interrupt:
+        if args.command not in ONE_SHOT:
+            return 0  # Ctrl-C or SIGTERM is a long-running command's normal end, also before its own handler
+        if isinstance(interrupt, Terminated):  # SIGTERM, after the command's own cleanup: by SIGTERM, no traceback
+            _end_by(signal.SIGTERM)
+        raise  # Ctrl-C as before: a traceback, and Python ends by SIGINT
     except (TimeoutError, zsession.NoAnswer) as error:  # did not answer, or a command sent once: one line
         print(f"{prog} {args.command}: {error}", file=sys.stderr)
         return 1
@@ -1116,10 +1118,10 @@ def main(argv=None) -> int:
 
 GIVEN: list[str] = []  # main()'s arguments, the command first
 
-# The commands that end on their own (a list, a measurement, a frame, a message to a node): Ctrl-C or SIGTERM
-# interrupts them (KeyboardInterrupt: a traceback, and Python ends by SIGINT, 130 in a shell); while they start, by
-# that signal (143 or 130). Every other command except relay serves until it is stopped, and that is its normal end:
-# exit code 0, also while it starts.
+# The commands that end on their own (a list, a measurement, a frame, a message to a node): Ctrl-C interrupts them
+# (KeyboardInterrupt: a traceback, and Python ends by SIGINT, 130 in a shell), SIGTERM ends them by SIGTERM (143,
+# without a traceback) after their cleanup; while they start, either ends them by that signal (143 or 130). Every
+# other command except relay serves until it is stopped, and that is its normal end: exit code 0, also while it starts.
 ONE_SHOT = frozenset({"list", "hz", "snapshot", "param", "recorder", "clean"})
 
 
@@ -1128,6 +1130,13 @@ def _ended_while_starting(command: str, signum: int) -> int:
     exit code 0, as on a later signal; a one-shot one (ONE_SHOT) ends by that signal, as an interrupted one does."""
     if command not in ONE_SHOT:
         return 0
+    _end_by(signum)
+
+
+def _end_by(signum: int):
+    """Ends the process by the signal ``signum`` itself (its default action: 143 for SIGTERM, 130 for SIGINT in a
+    shell, -15 or -2 in subprocess), its output written out first. Python's own end after a KeyboardInterrupt does
+    the same with SIGINT."""
     sys.stdout.flush()
     sys.stderr.flush()
     signal.signal(signum, signal.SIG_DFL)
