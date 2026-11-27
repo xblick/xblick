@@ -1,4 +1,5 @@
-// The test pattern of cuda_check.cpp, checked on the GPU: byte i = (i * 13 + seed) & 0xFF.
+// The test pattern of cuda_check.cpp and cuda_pattern_pub.cpp, checked or filled on the GPU: byte i =
+// (i * 13 + seed) & 0xFF.
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -12,6 +13,21 @@ __global__ void pattern_check_kernel(const uint8_t* p, size_t n, uint32_t seed, 
         local += p[i] != static_cast<uint8_t>((i * 13u + seed) & 0xFFu);
     }
     atomicAdd(bad, local);
+}
+
+__global__ void pattern_fill_kernel(uint8_t* p, size_t n, uint32_t seed)
+{
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x)
+    {
+        p[i] = static_cast<uint8_t>((i * 13u + seed) & 0xFFu);
+    }
+}
+
+// enqueued on s, not waited for (the publisher's write event follows it)
+cudaError_t pattern_fill(void* p, size_t n, uint32_t seed, cudaStream_t s)
+{
+    pattern_fill_kernel<<<256, 256, 0, s>>>(static_cast<uint8_t*>(p), n, seed);
+    return cudaGetLastError();
 }
 
 cudaError_t pattern_check(const void* p, size_t n, uint32_t seed, cudaStream_t s, unsigned long long* bad)
