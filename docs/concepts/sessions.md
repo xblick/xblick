@@ -158,8 +158,10 @@ declaration and its part in ROS 2 are closed at once, and Zenoh closes the sessi
 a Zenoh call, or inside a ring read of the C++ core, when Python finalises aborts the process with "FATAL: exception not
 rethrown" or "terminate called without an active exception". The threads of xblick are therefore stopped and waited for
 in the same close at the end, within the same 5 s: those of a history (`FrameHistory`), an overlay, a node's parameters,
-a `CommandSubscriber`, a `StaticTransformSubscriber`, a recorder, the Rerun bridge, and the readers of queries still
-open. Close what you open, and end your own daemon threads that call Zenoh before the program ends.
+a `CommandSubscriber`, a `StaticTransformSubscriber`, a recorder, the Rerun bridge, the GPU link of a `CameraPublisher`
+to ROS readers, and the readers of queries still open; those of a session's part in ROS 2 (ROS's graph, its ROS
+subscribers, the GPU receiver of a ROS topic) end with its session. Close what you open, and end your own daemon threads
+that call Zenoh before the program ends.
 
 ## Related pages
 

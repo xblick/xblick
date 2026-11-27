@@ -51,6 +51,7 @@ import logging
 import threading
 
 from . import _core, ros
+from .session import close_at_exit, forget_at_exit
 
 log = logging.getLogger("xblick")
 
@@ -112,6 +113,9 @@ class GpuLink:
                             ros.mangle(publisher.topic), ros.dds_type(publisher.type_name), token.type_hash, "**"])
         self._tokens = ros._Polled(publisher._raw.liveliness().declare_subscriber(pattern, history=True),
                                    self._on_token, f"ros gpu {publisher.topic}")
+        # its thread calls Zenoh and the core, and the pool serves its readers on a socket: closed at the end, before
+        # the session, also when the publisher is left open (its pool's files then go too)
+        close_at_exit(self, f"the GPU link of {publisher.topic}")
 
     def _on_token(self, sample):
         key = str(sample.key_expr)
@@ -189,7 +193,12 @@ class GpuLink:
         return self._link.stats()
 
     def close(self):
-        self._tokens.undeclare()
+        """Ends the tokens' thread, the buffer keys and the pool (again: nothing)."""
+        forget_at_exit(self)
+        tokens, self._tokens = self._tokens, None
+        if tokens is None:
+            return
+        tokens.undeclare()
         with self._lock:
             outs, self._outs = list(self._outs.values()), {}
         for out in outs:

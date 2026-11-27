@@ -23,6 +23,8 @@ import pytest
 from test_camera import free_port
 from test_view import read_frame
 
+from xblick import _core
+
 try:
     import av
 
@@ -322,10 +324,33 @@ elif kind == "recorder":  # its writer, discovery and status threads, its parame
 
     recorder = Recorder(s, os.environ["XBLICK_TEST_DIR"], look_every=0.2)
     recorder.record()
+elif kind == "ros":  # XBLICK_ROS=1: the node's threads, ROS's graph, the /tf and /tf_static readers, parameters
+    from xblick import poses
+    from xblick.camera import StaticTransformPublisher, TransformSubscriber
+    from xblick.parameters import Parameters
+
+    graph = s.ros.graph
+    tf = TransformSubscriber(s, "", lambda message: None, ros=True)
+    static = StaticTransformSubscriber(s, "", lambda message: None, ros=True)
+    # its first message on ROS's /tf_static starts the program's own /tf_static reader (a daemon thread)
+    sender = StaticTransformPublisher(s, "exit/camera", poses.fixed_camera_transforms(
+        "exit_body", poses.pose_from(0, 0, 1, 0, 0, 0), time.time_ns()))
+    parameters = Parameters(s, "exit", "xblick_test")  # at the end its close gives the node its services back
+    parameters.declare("value", 1.0)
+elif kind == "gpu link":  # XBLICK_ROS=1: the GPU link's thread of a CameraPublisher on a GPU
+    from xblick.camera import CameraPublisher
+
+    publisher = CameraPublisher(s, "exit/gpu/color", encoding="rgb8", frame_id="exit_gpu", cuda_device=0)
+    assert publisher._ros_gpu is not None
+elif kind == "gpu receiver":  # XBLICK_ROS=1: the GPU receiver's thread of a ROS topic read on a GPU
+    reader = ImageSubscriber(s, "/exit/gpu/image_raw", transport="ros", device=0)
 time.sleep(0.3)
 print("xblick-test-left-open: ends", flush=True)
 """
-LEFT_OPEN_KINDS = ["history", "static transforms", "query", "parameters", "overlay", "commands"]
+LEFT_OPEN_KINDS = ["history", "static transforms", "query", "parameters", "overlay", "commands", "ros"]
+if _core.cuda_device_count() > 0:
+    LEFT_OPEN_KINDS += ["gpu link", "gpu receiver"]
+ROS_KINDS = {"ros", "gpu link", "gpu receiver"}  # in ROS 2: the others leave it out (ENV)
 FAULTS = ("FATAL", "terminate called", "Fatal Python error", "Traceback", "Exception in thread", "nanobind: leaked")
 try:
     import mcap  # noqa: F401 - the extra xblick[record]
@@ -342,12 +367,15 @@ def test_threads_of_what_a_script_left_open_end_before_python_finalises(camera, 
     ("FATAL: exception not rethrown", "terminate called without an active exception"), a history's left a nanobind
     leak report, and the transforms' asking thread a traceback once its session was closed. stderr is checked for
     these faults only: zenoh's own runtime threads panic now and then at the very end of a process ("static_init ...
-    AccessError"), with exit code 0 and with or without xblick's threads."""
+    AccessError"), with exit code 0 and with or without xblick's threads. The kinds in ROS 2 (ROS_KINDS): the threads of
+    the program's part in ROS 2 and of the GPU link and receiver, whose sockets and registry go to ``tmp_path``."""
     failed = []
     for kind in LEFT_OPEN_KINDS:
+        ros_env = ({"XBLICK_ROS": "1", "XBLICK_ROS_CUDA_SOCKETS": str(tmp_path), "XBLICK_ROS_CUDA_SHM": str(tmp_path)}
+                   if kind in ROS_KINDS else {})
         done = subprocess.run([sys.executable, "-c", LEFT_OPEN, kind, camera], stdin=subprocess.DEVNULL,
                               capture_output=True, text=True, timeout=60, check=False,
-                              env={**ENV, "XBLICK_TEST_DIR": str(tmp_path)})
+                              env={**ENV, "XBLICK_TEST_DIR": str(tmp_path), **ros_env})
         left = [line for line in done.stdout.splitlines() if line.startswith("left: ")]
         if (done.returncode != 0 or "xblick-test-left-open: ends" not in done.stdout
                 or left != ["left: "] or any(fault in done.stderr for fault in FAULTS)):
