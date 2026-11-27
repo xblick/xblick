@@ -582,6 +582,7 @@ namespace xblick
                 case Transport::Ros: return p::kPointCloud2Type;
                 case Transport::Shm: return p::kShmPointCloud2Type;
                 case Transport::RosCompressed: break;
+                case Transport::RosCompressedDepth: break;
                 case Transport::Cuda: return p::kCudaPointCloud2Type;
                 case Transport::Compressed: return p::kCompressedPointCloud2Type;
                 case Transport::Auto: break;
@@ -597,6 +598,7 @@ namespace xblick
                 case Transport::Ros: return p::kCloud;
                 case Transport::Shm: return p::kCloudShm;
                 case Transport::RosCompressed: break;
+                case Transport::RosCompressedDepth: break;
                 case Transport::Cuda: return p::kCloudCuda;
                 case Transport::Compressed: return p::kCloudCompressed;
                 case Transport::Auto: break;

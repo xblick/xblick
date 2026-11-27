@@ -33,6 +33,10 @@ The transforms of a camera (`tf_static`, `tf`) come with its streams and results
 `--no-transforms <camera>` leaves them out. The terminal interface builds such a command line from the entries that
 you mark in its [Rerun tab](tui.md#rerun).
 
+A ROS topic with its leading `/` names a camera that exists only in ROS 2: `xblick rerun /resize/image` or
+`--points /velodyne_points`. Without a selection the command shows such cameras too, marked `(ROS)` in its lines.
+They have no transforms in the viewer ([ROS cameras](../integrations/ros2.md#show-and-record-a-ros-camera)).
+
 ## Common calls
 
 ```bash

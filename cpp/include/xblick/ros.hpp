@@ -390,6 +390,8 @@ namespace xblick::ros
     // ------------------------------------------------------------------------- ROS cameras as ROS names them
 
     inline constexpr std::string_view kCompressedTopic = "compressed";   // image_transport's <image topic>/compressed
+    // image_transport's <image topic>/compressedDepth (ROS's compressedDepth plugin)
+    inline constexpr std::string_view kCompressedDepthTopic = "compressedDepth";
     inline constexpr std::string_view kCameraInfoTopic = "camera_info";  // image_transport's, beside the image topic
     // What reading a ROS topic needs (Python's ros.NEEDS_ROS).
     inline constexpr const char* kNeedsRos =
@@ -400,14 +402,19 @@ namespace xblick::ros
     bool is_topic(const std::string& name);
     // /cam/image_raw -> /cam/image_raw/compressed
     std::string compressed_topic(const std::string& image_topic);
+    // /cam/depth -> /cam/depth/compressedDepth
+    std::string compressed_depth_topic(const std::string& image_topic);
     // camera_info in the image topic's namespace: /cam/image_raw -> /cam/camera_info, /image_raw -> /camera_info.
     std::string camera_info_topic(const std::string& image_topic);
 
     // The publishers in ROS's graph on a domain, as a liveliness subscriber with history keeps their tokens (Python's
     // ros.Graph; here one per subscription that reads or looks for a ROS form). `changed` is called in Zenoh's thread
-    // when a publisher came or went. by_xblick(zid): whether a publisher's session declares a program of ours (its
-    // declaration's token, a liveliness query kept per session): the ROS topics such a program publishes are copies
-    // of its own keys.
+    // when a publisher came or went, or a program of ours appeared. by_xblick(zid): whether a publisher's session
+    // declared a program of ours: the ROS topics such a program publishes are copies of its own keys. Known from a
+    // second liveliness subscriber with history, of every program's declaration token, declared before the
+    // publishers' (not from a query per session, which, ended by its timeout under load, said "not ours" for good): a
+    // program declares itself before it takes part in ROS, its tokens arrive in that order, and Zenoh calls the
+    // callbacks of one link one after the other. A zid once declared stays ours.
     class Graph
     {
     public:
@@ -417,12 +424,13 @@ namespace xblick::ros
         Graph& operator=(const Graph&) = delete;
         // The publishers known now, of `topic` or of all, this session's own left out.
         std::vector<Token> publishers(const std::optional<std::string>& topic = std::nullopt) const;
-        bool by_xblick(const std::string& zid);
+        bool by_xblick(const std::string& zid) const;
 
     private:
         struct State;
         zenoh::Session& session_;
         std::shared_ptr<State> state_;
+        std::optional<zenoh::Subscriber<void>> declarations_;  // declared first, undeclared last
         std::optional<zenoh::Subscriber<void>> subscriber_;
     };
 

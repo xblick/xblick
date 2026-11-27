@@ -12,13 +12,16 @@ Zenoh session that shows what runs, for any node: nothing in it knows of a parti
 * **Graph**: the sessions as boxes and the data between them as arrows (tui_graph.py); a session selected (arrow
   keys, a click) or the mouse over an edge names the keys, how they are taken and what the session reports.
 * **Rerun**: everything ``xblick rerun`` can show, an entry each, as a tree by camera and node (``rerun_entries``:
-  info records and the admin space); the marked entries are its selection, a camera's transforms marked with its
+  info records and the admin space; the cameras that exist only as ROS topics by their namespace, marked ROS, from
+  the session's ROS graph, never our programs' ROS copies); the marked entries are its selection, a camera's transforms marked with its
   first entry (``toggle_mark``), a marked entry whose publisher ended shown as gone. Options and marks as presets
   with a name; launched as a child process (stopped with SIGTERM, as its Ctrl-C) on the interface's connection.
   While it runs its options are fixed and the marks go to its live parameters (``xblick/<name>``).
 
 The routers' admin space (``survey.query_network``) has the sessions and their declarations; without a router (only
-peers) the interface says so and shows what the streams' info records and the traffic tell.
+peers) the interface says so and shows what the streams' info records and the traffic tell. In a session in ROS 2
+(the default) the Graph also titles a session that declares no program of ours but publishes camera topics in ROS's
+graph (a ROS camera driver) by its ROS nodes, marked ROS, with those topics in its box (``Discovery.ros_publishers``).
 """
 
 from __future__ import annotations
@@ -55,7 +58,7 @@ from textual.widgets import (Button, DataTable, Footer, Header, Input, Label, Ra
                              Static, TabbedContent, TabPane, Tree)
 from textual.worker import get_current_worker
 
-from . import declaration, diagnostics, parameters, survey, topics, tui_nodes
+from . import declaration, diagnostics, parameters, ros, survey, topics, tui_nodes
 from . import session as zsession
 from .camera import find_streams
 from .paths import config_dir, expand_path
@@ -78,6 +81,7 @@ TRANSFORMS = "transforms"
 PLACED_KINDS = ("bases", "clouds", "detections", "segmentations", "bodies")  # rerun_bridge.PLACED_KINDS
 ENTRY_ORDER = {"bases": 0, "clouds": 1, TRANSFORMS: 2, "imu": 3, "diagnostics": 4, "segmentations": 5,
                "detections": 6, "bodies": 7, "trajectories": 8}  # within a branch of the tree
+ROS_MARK = " (ROS)"  # after the branch of a ROS camera (its topics' namespace) and a ROS node's name in the Graph
 
 
 def _short(zid: str) -> str:
@@ -518,22 +522,35 @@ class RerunEntry:
 
 
 def rerun_entry(kind: str, key: str, note: str = "") -> RerunEntry:
-    """An entry of a kind and key, placed by its key: ``<namespace>/<camera>``, then a node's part, then the name."""
+    """An entry of a kind and key, placed by its key: ``<namespace>/<camera>``, then a node's part, then the name. A
+    ROS topic (a leading /) below its namespace, marked ROS (``ROS_MARK``): ``/rgbd/color/image_raw`` is
+    ``image_raw`` of ``/rgbd/color (ROS)``."""
     from .rerun_bridge import camera_of_entry
 
     if kind == TRANSFORMS:
         return RerunEntry(kind, key, key, "", "tf, tf_static", note)
+    if ros.is_topic(key):
+        namespace, _, label = key.rpartition("/")
+        return RerunEntry(kind, key, (namespace or "/") + ROS_MARK, "", label, note)
     camera = camera_of_entry(kind, key) if kind != "trajectories" else "/".join(key.split("/")[:2])
     rest = key[len(camera) + 1:].split("/")
     label = rest[-1] + (" (path)" if kind == "trajectories" else "")
     return RerunEntry(kind, key, camera, "/".join(rest[:-1]), label, note)
 
 
-def rerun_entries(streams: list[tuple[str, dict]], network: survey.Network | None) -> list[RerunEntry]:
+def placed(kind: str, key: str) -> bool:
+    """An entry a camera's transforms place: of PLACED_KINDS, not a ROS topic (a ROS camera has no transforms of ours
+    in the bridge)."""
+    return kind in PLACED_KINDS and not ros.is_topic(key)
+
+
+def rerun_entries(streams: list[tuple[str, dict]], network: survey.Network | None,
+                  ros_cameras: dict[str, list[str]] | None = None) -> list[RerunEntry]:
     """Everything ``xblick rerun`` can show of what was found: from the info records (``streams``: image and point
     cloud streams, label images, detections) and from the routers' admin space (``network``: bodies, IMU, diagnostics,
-    poses, the cameras' transforms); a camera's transforms for every camera with something they place. A note says
-    what the viewer makes of each, as far as the records tell (an image's frame, a detection's type)."""
+    poses, the cameras' transforms); a camera's transforms for every camera with something they place; the cameras
+    that exist only as ROS topics (``ros_cameras``, ros.camera_streams: their image and PointCloud2 topics). A note
+    says what the viewer makes of each, as far as the records tell (an image's frame, a detection's type)."""
     from .cli import _bridged
 
     by_base = dict(streams)
@@ -571,7 +588,11 @@ def rerun_entries(streams: list[tuple[str, dict]], network: survey.Network | Non
         elif last == topics.DIAGNOSTICS:
             entries.append(rerun_entry("diagnostics", key, "a text log and time series"))
     entries += [rerun_entry("trajectories", k, "poses as a path in the world") for k in pose_topics(network)]
-    cameras = sorted({e.camera for e in entries if e.kind in PLACED_KINDS})
+    ros_cameras = ros_cameras or {}
+    entries += [rerun_entry("bases", t, "a ROS topic, no transforms") for t in ros_cameras.get("images", [])]
+    entries += [rerun_entry("clouds", t, "points in 3D, a ROS topic, no transforms")
+                for t in ros_cameras.get("clouds", [])]
+    cameras = sorted({e.camera for e in entries if placed(e.kind, e.key)})
     for camera in cameras:
         with_any = {topics.tf_static(camera), topics.tf(camera)} & (published | answered)
         entries.append(rerun_entry(TRANSFORMS, camera, "places the camera in 3D" + (
@@ -599,14 +620,14 @@ def toggle_mark(marks: set[str], entry: RerunEntry, entries: list[RerunEntry]) -
     """The marks after Space on ``entry``: marked or not; a camera's transforms come with the first entry of that
     camera they place and go with its last, and can be unmarked themselves."""
     marks = set(marks)
-    placed = {e.id for e in entries if e.camera == entry.camera and e.kind in PLACED_KINDS}
+    by_camera = {e.id for e in entries if e.camera == entry.camera and placed(e.kind, e.key)}
     transforms = rerun_entry(TRANSFORMS, entry.camera).id
     if entry.id in marks:
         marks.discard(entry.id)
-        if entry.kind in PLACED_KINDS and not (marks & placed):
+        if placed(entry.kind, entry.key) and not (marks & by_camera):
             marks.discard(transforms)
     else:
-        if entry.kind in PLACED_KINDS and not (marks & placed):
+        if placed(entry.kind, entry.key) and not (marks & by_camera):
             marks.add(transforms)
         marks.add(entry.id)
     return marks
@@ -616,8 +637,8 @@ def marks_of(selection: RerunSelection) -> set[str]:
     """The marks of a selection (a preset): its entries, and the transforms of every camera of what they place but
     those left out."""
     marks = {f"{kind}\t{key}" for kind, keys in selection.selected().items() for key in keys}
-    cameras = {rerun_entry(kind, key).camera for kind, keys in selection.selected().items() if kind in PLACED_KINDS
-               for key in keys}
+    cameras = {rerun_entry(kind, key).camera for kind, keys in selection.selected().items() for key in keys
+               if placed(kind, key)}
     return marks | {rerun_entry(TRANSFORMS, c).id for c in cameras if c not in selection.no_transforms}
 
 
@@ -631,7 +652,8 @@ def selected_of(marks: set[str]) -> tuple[dict[str, list[str]], list[str]]:
             transforms.add(key)
         else:
             chosen[kind].append(key)
-    cameras = sorted({rerun_entry(kind, key).camera for kind in PLACED_KINDS for key in chosen[kind]})
+    cameras = sorted({rerun_entry(kind, key).camera for kind in PLACED_KINDS for key in chosen[kind]
+                      if placed(kind, key)})
     return chosen, [c for c in cameras if c not in transforms]
 
 
@@ -660,6 +682,10 @@ class Discovery:
     origins: list[str] = dataclasses.field(default_factory=list)  # the routers this interface is linked to (zids)
     took_s: float = 0.0  # how long this look took
     drawn_over: dict[str, list[str]] | None = None  # the running xblick rerun's: result -> its images (None: unknown)
+    # in a session in ROS 2: the cameras that exist only as ROS topics (ros.camera_streams), and the ROS publishers of
+    # camera topics (ros.CAMERA_TYPES) of sessions that are no programs of ours (ROS camera drivers)
+    ros_cameras: dict[str, list[str]] = dataclasses.field(default_factory=dict)
+    ros_publishers: list[ros.Token] = dataclasses.field(default_factory=list)
 
 
 def statuses(session: zenoh.Session, timeout: float = 0.5) -> dict[str, dict]:
@@ -1002,6 +1028,11 @@ class XblickApp(App):
                 found.origins = sorted(str(z) for z in session.info.routers_zid())
                 found.unreachable = self._unreachable(session, found.network, missing_since)
                 found.drawn_over = self._rerun_drawn_over(session)
+                if getattr(session, "ros", None) is not None:  # its graph made at the first look, filled after
+                    graph = session.ros.graph
+                    found.ros_cameras = ros.camera_streams(graph)
+                    found.ros_publishers = [t for t in graph.publishers() if t.type_name in ros.CAMERA_TYPES
+                                            and not graph.by_xblick(t.zid)]
                 found.took_s = time.monotonic() - started
             except Exception as error:  # noqa: BLE001 - shown; discovery goes on
                 if worker.is_cancelled:
@@ -1446,10 +1477,13 @@ class XblickApp(App):
                 topics_of.setdefault((pub, sub, topic), []).append((key, taken))
         nodes = []
         titles = {}
+        ros_nodes, ros_topics = self._ros_parts()
         for zid in network.nodes:
             name = tui_nodes.name_of(network, zid)
             program = network.program(zid)
-            titles[zid] = name if name != tui_nodes.DASH else (program.program if program else _short(zid))
+            titles[zid] = name if name != tui_nodes.DASH else (
+                program.program if program else ", ".join(ros_nodes[zid]) + ROS_MARK if zid in ros_nodes
+                else _short(zid))
         short = short_names(titles)
         groups = []
         for router, members in network.groups(self.discovery.origins, leave_out=[own]):
@@ -1464,6 +1498,10 @@ class XblickApp(App):
             program = network.program(n.zid)
             name = names[n.zid]
             lines = [program.program if program is not None else "program –"] if name != tui_nodes.DASH else []
+            if name == tui_nodes.DASH and program is None and n.zid in ros_topics:  # a ROS node: its camera topics
+                shown_ros = ros_topics[n.zid]
+                lines += [f"▷ {t}" for t in shown_ros[:4]] + ([f"▷ {len(shown_ros) - 4} more ROS topics"]
+                                                             if len(shown_ros) > 4 else [])
             taken = {topic for (pub, _sub, topic) in topics_of if pub == n.zid}
             unread = [k for k in sorted(n.publishes) if not declaration.zid_of(k)
                       and k.rsplit("/", 1)[-1] not in tui_nodes.LEFT_OUT
@@ -1490,6 +1528,16 @@ class XblickApp(App):
             self._graph_edge_keys.append(pairs)
         links = sorted(tuple(sorted(link)) for link in network.links() if link <= set(network.routers))
         return nodes, edges, keys, groups, links
+
+    def _ros_parts(self) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+        """Of the ROS publishers of camera topics that are no programs of ours (``Discovery.ros_publishers``): per
+        session (zid) its ROS nodes and its topics, sorted."""
+        nodes: dict[str, set[str]] = {}
+        topics_: dict[str, set[str]] = {}
+        for t in self.discovery.ros_publishers:
+            nodes.setdefault(t.zid, set()).add(t.fully_qualified_node)
+            topics_.setdefault(t.zid, set()).add(t.topic)
+        return ({z: sorted(n) for z, n in nodes.items()}, {z: sorted(t) for z, t in topics_.items()})
 
     def _show_graph(self):
         nodes, edges, self._graph_keys, groups, links = self._graph_parts()
@@ -1560,7 +1608,7 @@ class XblickApp(App):
     def _show_rerun_streams(self):
         """The tree of what was found, and the marked entries that were not (gone, or a preset's not running); kept
         as it is (cursor, folds) while nothing in it changed."""
-        found = rerun_entries(self.discovery.streams, self.discovery.network)
+        found = rerun_entries(self.discovery.streams, self.discovery.network, self.discovery.ros_cameras)
         now = time.time()
         for e in found:
             self._rerun_seen[e.id] = now

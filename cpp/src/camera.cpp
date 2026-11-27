@@ -1316,6 +1316,7 @@ namespace xblick
             case Transport::Cuda: return "cuda";
             case Transport::Ros: return "ros";
             case Transport::RosCompressed: return "ros_compressed";
+            case Transport::RosCompressedDepth: return "ros_compressed_depth";
         }
         return "?";
     }
@@ -1330,6 +1331,7 @@ namespace xblick
                 case Transport::Raw: return p::kImageType;
                 case Transport::Ros: return p::kImageType;
                 case Transport::RosCompressed: return p::kCompressedImageType;
+                case Transport::RosCompressedDepth: return p::kCompressedImageType;
                 case Transport::Shm: return p::kShmImageType;
                 case Transport::Cuda: return p::kCudaImageType;
                 case Transport::Auto: break;
@@ -1347,9 +1349,10 @@ namespace xblick
                 case Transport::RosCompressed: return p::kCompressed;
                 case Transport::Shm: return p::kShm;
                 case Transport::Cuda: return p::kCuda;
+                case Transport::RosCompressedDepth: break;  // a ROS form only: the subscription takes its topic
                 case Transport::Auto: break;
             }
-            throw std::logic_error("no topic for auto");
+            throw std::logic_error(std::string("no key of ours for transport ") + to_string(t));
         }
     }  // namespace
 
@@ -1979,7 +1982,7 @@ namespace xblick
         f.publish_ns = meta.publish_ns;
         f.source = meta.source;
 
-        if (t == Transport::Compressed or t == Transport::RosCompressed)
+        if (t == Transport::Compressed or t == Transport::RosCompressed or t == Transport::RosCompressedDepth)
         {
             const CompressedImage message = CompressedImage::deserialize(item.payload);
             DecodedImage d = decompress(message);

@@ -44,6 +44,11 @@ channel is transient local, as `ros2 bag record` writes it. `ros2 bag play` ther
 also a tf2 listener that starts later. `xblick play` leaves this copy out, because each camera's `tf_static` reaches
 `/tf_static` by itself.
 
+**ROS cameras.** A camera that exists only as ROS topics goes into the file under its ROS topic names, as `ros2 bag
+record` writes them: of an image topic its compressed form where one is published, else its compressedDepth form,
+else the image topic, and its camera_info. `xblick play` plays these channels as a rosbag2's ([ROS
+cameras](../integrations/ros2.md#show-and-record-a-ros-camera)).
+
 It stores each message as it arrived. ROS messages are CDR with the definition of their type, and bodies are JSON.
 Each channel keeps its Zenoh key, its encoding and the info record of its publisher. `play` can therefore serve the
 channel in the same way as the original publisher.
@@ -177,6 +182,7 @@ of live reading: the topic `/a/b` becomes the key `a/b`.
 | --- | --- |
 | `/<base>/image_raw` (`sensor_msgs/Image`) and `/<base>/camera_info` | the stream `<base>` with all its forms, as a camera does. Its compressed form is JPEG for 8-bit images and RVL for 16-bit depth. |
 | `/<base>/image_raw/compressed` without `image_raw` | the stream `<base>` from the recorded JPEG or PNG |
+| `/<base>/image_raw/compressedDepth` alone | the stream `<base>` from the decoded depth, compressed again as a camera does |
 | `/<base>/cloud` (`sensor_msgs/PointCloud2`) | the point cloud stream `<base>`, raw, with its info record |
 | any other topic, such as `/tf`, `/tf_static` or `/resize/image` | the key without the leading `/`, as recorded |
 

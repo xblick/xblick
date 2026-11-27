@@ -91,9 +91,9 @@ frame = images.latest(timeout=1.0)
 `latest()` returns the newest frame, or `None` after the timeout.
 
 With `transport="auto"` the subscriber waits for a publisher of its stream. In a session in ROS 2, a ROS node that
-publishes the stream's ROS form also counts: `/<stream>/image_raw`, else `/<stream>/image_raw/compressed`, and a
-point cloud's `/<stream>/cloud`. The subscriber then reads that topic, and `transport` is `"ros"` or
-`"ros_compressed"`. A publisher of ours has priority, and the subscriber moves to it when it appears. The ROS copies
+publishes the stream's ROS form also counts: `/<stream>/image_raw`, else `/<stream>/image_raw/compressed`, else
+`/<stream>/image_raw/compressedDepth`, and a point cloud's `/<stream>/cloud`. The subscriber then reads that topic,
+and `transport` is `"ros"`, `"ros_compressed"` or `"ros_compressed_depth"`. A publisher of ours has priority, and the subscriber moves to it when it appears. The ROS copies
 that our own programs publish are never read in place of a stream's own forms. After 5 s without a publisher the
 subscriber logs a single line: the camera may not have started yet, or the name may be wrong. When nobody publishes the stream but the name
 before its last part answers as a stream, `latest()` raises `camera.StreamGivenAsCamera`. This happens to a node that

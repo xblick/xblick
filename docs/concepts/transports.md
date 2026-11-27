@@ -105,7 +105,9 @@ The point cloud node passes the rays of its depth camera to its publisher
 ([point clouds](../guides/point-clouds.md#read-a-cloud)). In C++ the rays are `CloudPublisherOptions::rays`.
 
 An RVL message is the message that ROS's `compressedDepth` plugin writes for a `16UC1` image with its format `rvl`:
-the `format` field is `16UC1; compressedDepth rvl`. Durchblick reads nothing else of that plugin. A Durchblick older
+the `format` field is `16UC1; compressedDepth rvl`. A stream of ours takes no other form of that plugin. Its readers
+decode every message of it that a ROS camera publishes ([ROS 2](../integrations/ros2.md#read-a-ros-camera)). A
+Durchblick older
 than 0.3.62 does not read RVL and stops with an error on such a stream.
 
 ## How `auto` chooses

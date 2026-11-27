@@ -510,6 +510,10 @@ namespace xblick
         // image_transport's compressed topic (<image topic>/compressed) of a ROS name (Transport::Compressed of a
         // base with a leading '/'), or the one Auto takes when a ROS publisher offers only that. Not to be asked for.
         RosCompressed,
+        // image_transport's compressedDepth topic (<image topic>/compressedDepth: ROS's compressedDepth plugin, 16-bit
+        // or 32FC1 depth, image.hpp), the one Auto takes when a ROS publisher offers neither the image topic nor its
+        // compressed one. Not to be asked for.
+        RosCompressedDepth,
     };
 
     const char* to_string(Transport transport);

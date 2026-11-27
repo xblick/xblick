@@ -13,10 +13,18 @@ import numpy as np
 import pytest
 
 from xblick import ros, session
-from xblick.camera import ROS, ROS_COMPRESSED, ImageSubscriber
+from xblick.camera import ROS, ROS_COMPRESSED, ROS_COMPRESSED_DEPTH, ImageSubscriber
 from xblick.codecs import compress
 from xblick.encodings import numpy_to_image
-from xblick.msg import CameraInfo, Header, Image, PointCloud2, PointField, Time
+from xblick.msg import (
+    CameraInfo,
+    CompressedImage,
+    Header,
+    Image,
+    PointCloud2,
+    PointField,
+    Time,
+)
 from xblick.points import PointCloudSubscriber
 
 DOMAIN = 93
@@ -28,16 +36,31 @@ def free_port():
         return s.getsockname()[1]
 
 
+def ros_compressed_depth(depth: np.ndarray, header: Header) -> CompressedImage:
+    """A 16UC1 image as ROS's compressedDepth plugin writes it with its format png: its 12-byte ConfigHeader (zeros
+    for 16-bit), then the PNG."""
+    import io
+
+    from PIL import Image as PILImage
+
+    buffer = io.BytesIO()
+    PILImage.fromarray(depth).save(buffer, format="PNG")
+    return CompressedImage(header=header, format="16UC1; compressedDepth png", data=bytes(12) + buffer.getvalue())
+
+
 class RosCamera:
     """A stand-in for a ROS camera driver: ROS publishers of the given (topic, type) pairs in a session that declares
-    no program of ours, publishing a 4 x 6 mono8 image (or its JPEG) and a CameraInfo every 50 ms until ``close``."""
+    no program of ours, publishing a 4 x 6 mono8 image (or its PNG; on a ``.../compressedDepth`` topic a 16UC1 image
+    as ROS's compressedDepth plugin writes it) and a CameraInfo every 50 ms until ``close``."""
 
-    def __init__(self, endpoint: str, **topics_):
+    def __init__(self, endpoint: str, domain: int = DOMAIN, **topics_):
         self.session = session.open_session(connect=[endpoint], declare=False,
-                                            ros_options=session.RosOptions(DOMAIN, "ros_camera"))
+                                            ros_options=session.RosOptions(domain, "ros_camera"))
+        self.topics = dict(topics_)
         self.publishers = {name: self.session.ros.node.publisher(topic, kind)
                            for name, (topic, kind) in topics_.items()}
         self.image = np.arange(24, dtype=np.uint8).reshape(4, 6)
+        self.depth = (np.arange(24, dtype=np.uint16).reshape(4, 6) * 1000 + 7).astype(np.uint16)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -48,6 +71,9 @@ class RosCamera:
             for name, publisher in self.publishers.items():
                 if publisher.type_name == Image.TYPE:
                     payload = numpy_to_image(self.image, "mono8", header).serialize()
+                elif publisher.type_name == ros.COMPRESSED_TYPE and self.topics[name][0].endswith(
+                        "/" + ros.COMPRESSED_DEPTH):
+                    payload = ros_compressed_depth(self.depth, header).serialize()
                 elif publisher.type_name == ros.COMPRESSED_TYPE:
                     payload = compress(self.image, "mono8", "png", header=header).serialize()
                 elif publisher.type_name == CameraInfo.TYPE:
@@ -345,3 +371,169 @@ def test_rgbd_inputs_pair_a_ros_only_colour_and_depth_camera(network):
     finally:
         inputs.close()
         camera.close()
+
+
+# ------------------------------------------------------------------------- compressedDepth, the tools (issue #39)
+
+
+def test_compressed_depth_by_image_transports_convention(network, monkeypatch):
+    """auto takes <topic>/compressedDepth where a publisher offers neither the topic nor its compressed one, and
+    decodes ROS's header and PNG; transport ros on that topic names the transport that reads it."""
+    monkeypatch.setattr("xblick.camera.WAIT_HINT_S", 1.0)
+    endpoint, reader = network
+    camera = RosCamera(endpoint, depth=("/cam/depth/image_rect_raw/compressedDepth", ros.COMPRESSED_TYPE))
+    auto = ImageSubscriber(reader, "/cam/depth/image_rect_raw", transport="auto")
+    wrong = ImageSubscriber(reader, "/cam/depth/image_rect_raw/compressedDepth", transport="ros")
+    try:
+        frame = first_frame(auto)
+        assert frame is not None and frame.encoding == "16UC1" and np.array_equal(frame.image, camera.depth)
+        assert auto.transport == ROS_COMPRESSED_DEPTH and ros.compressed_depth_topic("/a") == "/a/compressedDepth"
+        time.sleep(1.2)
+        with pytest.raises(RuntimeError, match="compressedDepth topic of /cam/depth/image_rect_raw, which auto reads"):
+            wrong.latest(timeout=0.1)
+    finally:
+        auto.close()
+        wrong.close()
+        camera.close()
+
+
+def test_the_graph_knows_a_program_of_ours_before_its_ros_tokens(network):
+    """Graph.by_xblick from the declarations' subscriber: whenever a publisher of a program of ours is in the graph,
+    the program is known as ours (no query that a timeout can end); a ROS node's is not."""
+    endpoint, reader = network
+    graph = reader.ros.graph
+    camera = RosCamera(endpoint, image=("/foreign/image_raw", Image.TYPE))
+    try:
+        for k in range(8):
+            ours = session.open_session(connect=[endpoint], ros_options=session.RosOptions(DOMAIN, f"ours_{k}"))
+            publisher = ours.ros.node.publisher(f"/ours_{k}/image_raw", Image.TYPE)
+            zid = str(ours.info.zid())
+            end = time.monotonic() + 5.0
+            while not graph.publishers(f"/ours_{k}/image_raw") and time.monotonic() < end:
+                time.sleep(0.005)
+            assert graph.publishers(f"/ours_{k}/image_raw") and graph.by_xblick(zid)
+            publisher.close()
+            ours.close()
+        foreign = graph.publishers("/foreign/image_raw")
+        assert foreign and not graph.by_xblick(foreign[0].zid)
+    finally:
+        camera.close()
+
+
+def wait_for(get, expected, timeout=5.0):
+    end = time.monotonic() + timeout
+    got = get()
+    while got != expected and time.monotonic() < end:
+        time.sleep(0.05)
+        got = get()
+    return got
+
+
+def test_ros_cameras_named_as_their_readers_take_them(network):
+    """ros.camera_streams: an Image topic as it is; the image topic of a compressed or compressedDepth topic alone;
+    PointCloud2 topics; not a CompressedImage topic of another name, not the ROS copies of our programs."""
+    from xblick.camera import CameraPublisher
+
+    endpoint, reader = network
+    camera = RosCamera(endpoint, raw=("/a/image_raw", Image.TYPE),
+                       compressed=("/b/image_raw/compressed", ros.COMPRESSED_TYPE),
+                       depth=("/c/depth/compressedDepth", ros.COMPRESSED_TYPE),
+                       cloud=("/points", PointCloud2.TYPE), odd=("/odd", ros.COMPRESSED_TYPE),
+                       info=("/a/camera_info", CameraInfo.TYPE))
+    xblick = session.open_session(connect=[endpoint], ros_options=session.RosOptions(DOMAIN, "xblick_camera"))
+    ours = CameraPublisher(xblick, "mine/color", encoding="mono8", frame_id="mine")
+    try:
+        expected = {"images": ["/a/image_raw", "/b/image_raw", "/c/depth"], "clouds": ["/points"]}
+        assert wait_for(lambda: ros.camera_streams(reader.ros.graph), expected) == expected
+        assert ros.camera_streams(reader.ros.graph, "c") == {"images": ["/c/depth"], "clouds": []}
+    finally:
+        ours.close()
+        xblick.close()
+        camera.close()
+
+
+def test_xblick_rerun_bridges_a_ros_camera(network):
+    """A ROS camera's image topic in the bridge: decoded frames at the topic's entity, its camera_info as the pinhole,
+    no transforms; in discovery it comes with what the info records found, marked ROS in the lines."""
+    from test_rerun_bridge import FakeRerun, of
+
+    from xblick.cli import _marked, _with_ros
+    from xblick.rerun_bridge import RerunBridge
+
+    endpoint, reader = network
+    camera = RosCamera(endpoint, image=("/rgbd/color/image_raw", Image.TYPE),
+                       info=("/rgbd/color/camera_info", CameraInfo.TYPE),
+                       depth=("/rgbd/depth/image_raw/compressedDepth", ros.COMPRESSED_TYPE))
+    empty = {"bases": [], "clouds": [], "detections": [], "segmentations": []}
+    found = wait_for(lambda: _with_ros(empty, reader.ros.graph, "")["bases"],
+                     ["/rgbd/color/image_raw", "/rgbd/depth/image_raw"])
+    assert found == ["/rgbd/color/image_raw", "/rgbd/depth/image_raw"]
+    assert _marked(["a/b", "/c/d"]) == "a/b, /c/d (ROS)"
+    rr = FakeRerun()
+    bridge = RerunBridge(reader, rr, found)
+    try:
+        end = time.monotonic() + 8.0
+        while not (of(rr, "Image") and of(rr, "DepthImage") and of(rr, "Pinhole")) and time.monotonic() < end:
+            time.sleep(0.05)
+        bridge.check()
+        entity, _, fields, _ = of(rr, "Image")[0]
+        assert entity == "/rgbd/color/image_raw" and fields["color_model"] == "L"
+        assert np.array_equal(fields["image"], camera.image)
+        entity, _, fields, _ = of(rr, "DepthImage")[0]
+        assert entity == "/rgbd/depth/image_raw" and fields["meter"] == 1000.0
+        assert np.array_equal(fields["image"], camera.depth)
+        assert of(rr, "Pinhole")[0][0] == "/rgbd/color/image_raw" and bridge.cameras == []
+        assert not of(rr, "Transform3D")
+    finally:
+        bridge.close()
+        camera.close()
+
+
+def test_a_ros_camera_is_recorded_under_its_topics_and_plays_as_a_stream(network, tmp_path):
+    """xblick record in ROS 2: a ROS camera's topics under their ROS names, as ros2 bag record writes them (the
+    compressed form first, else compressedDepth, else the image topic; its camera_info); xblick play makes streams
+    of ours of image_transport's names, a compressedDepth-only camera's frames decoded."""
+    from test_recording import mcap_reader
+
+    from xblick import recording
+
+    endpoint, reader = network
+    camera = RosCamera(endpoint, image=("/roscam/color/image_raw", Image.TYPE),
+                       compressed=("/roscam/color/image_raw/compressed", ros.COMPRESSED_TYPE),
+                       info=("/roscam/color/camera_info", CameraInfo.TYPE),
+                       depth=("/roscam/depth/image_raw/compressedDepth", ros.COMPRESSED_TYPE),
+                       depth_info=("/roscam/depth/camera_info", CameraInfo.TYPE))
+    recorder = recording.Recorder(reader, tmp_path, look_every=0.5)
+    try:
+        recorder.record()
+        end = time.monotonic() + 10.0
+        while recorder.status()["messages"] < 40 and time.monotonic() < end:
+            time.sleep(0.1)
+        result = recorder.stop()
+    finally:
+        camera.close()
+    path = result["recording"]["files"][0]
+    with open(path, "rb") as stream:
+        channels = {c.topic: c.metadata for c in mcap_reader.make_reader(stream).get_summary().channels.values()}
+    assert {"/roscam/color/image_raw/compressed", "/roscam/color/camera_info", "/roscam/depth/image_raw/compressedDepth",
+            "/roscam/depth/camera_info"} <= set(channels), channels
+    assert "/roscam/color/image_raw" not in channels  # the compressed form first
+    assert all("zenoh_key" not in channels[t] for t in channels if t.startswith("/roscam/"))
+    played = session.open_session(connect=[endpoint], ros_options=False)
+    player = recording.Player(played, [path], loop=True)
+    color = ImageSubscriber(reader, "roscam/color", transport="auto", camera_info=True)
+    depth = ImageSubscriber(reader, "roscam/depth", transport="auto")
+    thread = threading.Thread(target=player.run)
+    thread.start()
+    try:
+        frame = first_frame(color, 8.0)
+        assert frame is not None and np.array_equal(frame.image, camera.image) and color.transport == "shm"
+        d = first_frame(depth, 8.0)
+        assert d is not None and d.encoding == "16UC1" and np.array_equal(d.image, camera.depth)
+        assert player.error is None
+    finally:
+        player.end()
+        thread.join()
+        for c in (color, depth, player, recorder):
+            c.close()
+        played.close()

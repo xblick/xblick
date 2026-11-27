@@ -103,10 +103,59 @@ def test_rvl_refuses_what_it_cannot_hold_or_read():
                         (bytes(12) + b"\xff" * 8 + bytes(message.data)[20:], "no image")):
         with pytest.raises(EncodingError, match=match):
             decompress(CompressedImage(format=message.format, data=data))
-    for fmt in ("16UC1; compressedDepth png", "16UC1; compressedDepth", "rgb8; compressedDepth rvl",
-                "32FC1; compressedDepth rvl"):
-        with pytest.raises(EncodingError, match="only rvl of a 16-bit image"):
+    for fmt, match in (("rgb8; compressedDepth rvl", "carries mono16, 16UC1, 32FC1 images, not 'rgb8'"),
+                       ("16UC1; compressedDepth jpeg", "codec 'jpeg', not png or rvl"),
+                       ("16UC1; compressedDepth png rvl", "codec 'png rvl'")):
+        with pytest.raises(EncodingError, match=match):
             decompress(CompressedImage(format=fmt, data=bytes(message.data)))
+    with pytest.raises(EncodingError, match="no PNG after ROS's header"):
+        decompress(CompressedImage(format="16UC1; compressedDepth png", data=bytes(message.data)))
+    with pytest.raises(EncodingError, match="12-byte header"):
+        decompress(CompressedImage(format="16UC1; compressedDepth png", data=bytes(12)))
+
+
+def _ros_compressed_depth(pixels: np.ndarray, encoding: str, codec: str, a: float = 0.0, b: float = 0.0):
+    """A message as ROS's compressedDepth plugin writes it: its ConfigHeader, then a 16-bit PNG or the RVL bytes."""
+    import io
+    import struct
+
+    from PIL import Image as PILImage
+
+    header = struct.pack("<iff", 0, a, b)
+    if codec == "rvl":
+        data = header + bytes(compress(pixels, "16UC1", "rvl").data)[12:]
+    else:
+        buffer = io.BytesIO()
+        PILImage.fromarray(pixels).save(buffer, format="PNG")
+        data = header + buffer.getvalue()
+    suffix = "" if codec == "" else f" {codec}"
+    return CompressedImage(format=f"{encoding}; compressedDepth{suffix}", data=data)
+
+
+@pytest.mark.parametrize("codec", ["png", "rvl", ""])
+def test_ros_compressed_depth_of_16_bit_images(codec):
+    """image_transport's compressedDepth of a 16-bit image: ROS's header, then the image as it is (no codec word:
+    PNG, as older versions of the plugin write it)."""
+    array = (RNG.random((21, 34)) * 65535).astype(np.uint16)
+    array[3:5] = 0
+    for encoding in ("16UC1", "mono16"):
+        back, back_encoding = decompress(_ros_compressed_depth(array, encoding, codec))
+        assert back_encoding == encoding and back.dtype == np.uint16 and np.array_equal(back, array)
+
+
+@pytest.mark.parametrize("codec", ["png", "rvl"])
+def test_ros_compressed_depth_of_32fc1_is_inverse_depth(codec):
+    """32FC1 depth comes as quantised inverse depth q: depth = a / (q - b), NaN where q is 0 (ROS's decoder)."""
+    z0, depth_max = 100.0, 10.0  # the plugin's defaults depth_quantization, depth_max
+    a = np.float32(z0 * (z0 + 1.0))
+    b = np.float32(1.0 - a / depth_max)
+    depth = np.array([[0.5, 1.0, 2.0], [3.25, 9.0, 0.0]], np.float32)
+    q = np.where(depth > 0, a / np.where(depth > 0, depth, 1) + b, 0).astype(np.uint16)
+    back, encoding = decompress(_ros_compressed_depth(q, "32FC1", codec, float(a), float(b)))
+    assert encoding == "32FC1" and back.dtype == np.float32 and back.shape == depth.shape
+    expected = np.where(q > 0, a / (q.astype(np.float32) - b), np.nan)
+    assert np.isnan(back[1, 2]) and np.allclose(back[q > 0], expected[q > 0])
+    assert np.allclose(back[q > 0], depth[q > 0], rtol=0.01)
 
 
 def test_jpeg_refuses_depth():
@@ -118,5 +167,5 @@ def test_format_strings():
     assert parse_format("rgb8; jpeg compressed bgr8") == ("rgb8", "jpeg")
     assert parse_format("jpeg") == (None, "jpeg")
     assert parse_format("16UC1; png compressed 16UC1") == ("16UC1", "png")
-    with pytest.raises(EncodingError):
+    with pytest.raises(EncodingError, match="only rvl of a 16-bit image is a stream's compressed form"):
         parse_format("16UC1; compressedDepth png")

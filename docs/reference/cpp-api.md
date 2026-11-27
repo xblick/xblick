@@ -201,8 +201,9 @@ client is there. Its first `Parameters` serve their services on that node, and a
 `ImageSubscriber` and `PointCloudSubscriber` read a stream's ROS topic with `Transport::Ros`, and a ROS topic of any
 name with a base that starts with `/`. `Transport::Auto` takes a stream's ROS topic when only a ROS node of another
 program publishes it ([Read a ROS camera](../integrations/ros2.md#read-a-ros-camera)).
-`SubscriberOptions::camera_info_topic` names a ROS camera_info topic, and `Transport::RosCompressed` is
-image_transport's compressed topic. A `CameraPublisher` with `cuda_device` gives ROS readers that accept CUDA
+`SubscriberOptions::camera_info_topic` names a ROS camera_info topic, `Transport::RosCompressed` is
+image_transport's compressed topic and `Transport::RosCompressedDepth` its compressedDepth topic, whose frames
+`decompress()` reads (`compressed_depth()` parses the format). A `CameraPublisher` with `cuda_device` gives ROS readers that accept CUDA
 buffers its GPU frames as such (`ros::GpuLink`), and `CameraPublisher::ros_gpu_stats()` gives its counters
 ([GPU frames for ROS readers](../integrations/ros2.md#gpu-frames-for-ros-readers)).
 `xblick::ros::of(session)` is the session's part in ROS 2, null for a session without one. `xblick/ros.hpp` also has

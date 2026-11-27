@@ -551,6 +551,19 @@ def test_cpp_reads_image_transports_compressed_topic(ros_hub):
         camera.close()
 
 
+def test_cpp_reads_image_transports_compressed_depth_topic(ros_hub):
+    """auto takes <topic>/compressedDepth where a publisher offers only that (Transport::RosCompressedDepth), and
+    decodes ROS's header and PNG to the 16UC1 image."""
+    camera = RosCamera(f"tcp/127.0.0.1:{ros_hub}", depth=("/cam/depth/image_raw/compressedDepth", ros.COMPRESSED_TYPE))
+    try:
+        code, lines, err = probe_ros(ros_hub, "/cam/depth/image_raw", "--transport", "auto")
+        assert code == 0, err
+        assert {(line["transport"], line["encoding"], line["height"], line["width"]) for line in lines} == {
+            ("ros_compressed_depth", "16UC1", 4, 6)}
+    finally:
+        camera.close()
+
+
 def test_cpp_reads_a_point_cloud_topic_of_any_name(ros_hub):
     camera = RosCamera(f"tcp/127.0.0.1:{ros_hub}", cloud=("/velodyne_points", PointCloud2.TYPE))
     try:

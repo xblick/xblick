@@ -90,6 +90,9 @@ example `zenohd`, the host is the first address it listens on that names a host,
 
 ![The Graph tab with SAM 3 selected](../media/tui/graph.png)
 
+A session that declares no program of ours but publishes camera topics in ROS 2, such as a ROS camera driver, has
+the name of its ROS node and the mark `(ROS)` on its box, and its camera topics in it.
+
 The graph draws one band per router. A line with the router's id and host heads each band, and the lines on the
 left join the bands of linked routers. A node that takes data from another stands in a column to the right of it,
 also across bands. Each line is one topic from its publisher to one reader, and it enters the reader's box on a row
@@ -147,7 +150,8 @@ are read-only and apply at the next start. The node's README names its live para
 ![The Rerun tab: the entries found by camera and node, the options, and the command line it builds](../media/tui/rerun.png)
 
 The left side lists what `xblick rerun` can show. Each entry is a topic of its own: a camera's streams, its
-transforms, IMU and diagnostics, and below each node its results. The note beside an entry says what the viewer
+transforms, IMU and diagnostics, and below each node its results. A camera that exists only as ROS topics stands
+below the namespace of its topics, marked `(ROS)`, without transforms ([ROS cameras](../integrations/ros2.md#show-and-record-a-ros-camera)). The note beside an entry says what the viewer
 makes of it, for example "drawn over color". The header counts the entries and says when the list was updated. The
 list updates itself every few seconds, and `r` or "Update list now" updates it at once. A new topic appears at the
 next update, and an entry whose publisher ended disappears then.

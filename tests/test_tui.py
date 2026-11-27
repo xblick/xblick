@@ -948,3 +948,52 @@ def test_nodes_tab_by_router_with_links_details_and_graph(tmp_path):
         run_app(app, test)
     finally:
         m.close()
+
+
+def test_rerun_entries_of_ros_cameras():
+    """The cameras that exist only as ROS topics: below their namespace, marked ROS; no transforms of theirs, so
+    marking one marks nothing else and leaves no --no-transforms."""
+    streams, network = kinect_network()
+    entries = tui.rerun_entries(streams, network, {"images": ["/rgbd/color/image_raw", "/image_raw"],
+                                                   "clouds": ["/velodyne_points"]})
+    groups = tui.rerun_groups(entries)
+    assert [(e.label, e.note) for e in groups["/rgbd/color (ROS)"][""]] == [("image_raw", "a ROS topic, no transforms")]
+    assert [e.label for e in groups["/ (ROS)"][""]] == ["image_raw", "velodyne_points"]
+    assert not any(e.kind == tui.TRANSFORMS and "ROS" in e.camera for e in entries)
+    by = {e.id: e for e in entries}
+    marks = tui.toggle_mark(set(), by["bases\t/rgbd/color/image_raw"], entries)
+    assert marks == {"bases\t/rgbd/color/image_raw"}
+    chosen, no_transforms = tui.selected_of(marks)
+    assert chosen["bases"] == ["/rgbd/color/image_raw"] and no_transforms == []
+    selection = tui.RerunSelection(**chosen, no_transforms=no_transforms)
+    assert selection.check() == ["--spawn", "/rgbd/color/image_raw"] and tui.marks_of(selection) == marks
+
+
+def test_app_shows_a_ros_camera_in_the_rerun_tree_and_the_graph(fake, tmp_path):
+    """A ROS camera driver (a session in ROS that declares no program of ours) attached to the router: its image
+    topic in the Rerun tab's tree, marked ROS; its box in the Graph titled by its ROS node, marked ROS, with its
+    topics. The fake camera's ROS copies appear in neither."""
+    from test_ros_readers import RosCamera
+
+    from xblick import ros
+    from xblick.msg import Image
+
+    ros_camera = RosCamera(fake.endpoint, domain=ros.domain_from(None), image=("/usb_cam/image_raw", Image.TYPE),
+                           info=("/usb_cam/camera_info", CameraInfo.TYPE))
+    app = tui.XblickApp(fake.connection(), tui.Presets(tmp_path / "presets.json"), discover_every=0.5)
+    zid = str(ros_camera.session.info.zid())
+
+    async def test(pilot):
+        await until(pilot, lambda: any(e.key == "/usb_cam/image_raw" for e in app._rerun_entries))
+        entry = next(e for e in app._rerun_entries if e.key == "/usb_cam/image_raw")
+        assert entry.camera == "/usb_cam (ROS)" and entry.label == "image_raw"
+        assert not any(e.key.startswith(f"/{CAMERA}") for e in app._rerun_entries)  # the fake camera's ROS copies
+        graph = app.query_one("#graph")
+        await until(pilot, lambda: any(n.id == zid for n in graph.nodes))
+        box = next(n for n in graph.nodes if n.id == zid)
+        assert box.title == "/ros_camera (ROS)" and box.lines == ["▷ /usb_cam/camera_info", "▷ /usb_cam/image_raw"]
+
+    try:
+        run_app(app, test)
+    finally:
+        ros_camera.close()

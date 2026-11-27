@@ -1236,6 +1236,11 @@ namespace xblick::ros
         return image_topic + "/" + std::string(kCompressedTopic);
     }
 
+    std::string compressed_depth_topic(const std::string& image_topic)
+    {
+        return image_topic + "/" + std::string(kCompressedDepthTopic);
+    }
+
     std::string camera_info_topic(const std::string& image_topic)
     {
         return image_topic.substr(0, image_topic.rfind('/')) + "/" + std::string(kCameraInfoTopic);
@@ -1245,7 +1250,7 @@ namespace xblick::ros
     {
         mutable std::mutex mutex;
         std::map<std::string, Token> tokens;
-        std::map<std::string, bool> xblick;  // a session's zid -> it declares a program of ours
+        std::set<std::string> xblick;  // the zids of the sessions that declared a program of ours
         std::function<void()> changed;
         std::string own_zid;
         std::atomic<bool> closed{false};
@@ -1256,6 +1261,38 @@ namespace xblick::ros
     {
         state_->changed = std::move(changed);
         state_->own_zid = session.get_zid().to_string();
+        // the declarations first (the class's comment in ros.hpp): Zenoh calls the callbacks of one link's samples
+        // one after the other, and a program's declaration comes before its ROS tokens
+        const std::string all = declaration_key("*");
+        const std::size_t before = all.find('*'), after = all.size() - before - 1;
+        zenoh::Session::LivelinessSubscriberOptions declared;
+        declared.history = true;
+        declarations_.emplace(session.liveliness_declare_subscriber(
+            zenoh::KeyExpr(all),
+            [state = state_, before, after](const zenoh::Sample& sample) {
+                if (state->closed.load() or sample.get_kind() != Z_SAMPLE_KIND_PUT)
+                {
+                    return;  // a zid once declared stays ours: the tokens of a program that ends go in no fixed order
+                }
+                const std::string key(sample.get_keyexpr().as_string_view());
+                if (key.size() <= before + after)
+                {
+                    return;
+                }
+                const std::string zid = key.substr(before, key.size() - before - after);
+                {
+                    std::lock_guard lock(state->mutex);
+                    if (zid.find('/') != std::string::npos or not state->xblick.insert(zid).second)
+                    {
+                        return;
+                    }
+                }
+                if (state->changed)
+                {
+                    state->changed();
+                }
+            },
+            zenoh::closures::none, std::move(declared)));
         const std::string pattern = std::string(kAdminSpace) + "/" + std::to_string(domain) + "/*/*/*/" +
                                     std::string(kPublisher) + "/*/*/*/**";
         zenoh::Session::LivelinessSubscriberOptions options;
@@ -1298,6 +1335,7 @@ namespace xblick::ros
     {
         state_->closed.store(true);
         subscriber_.reset();
+        declarations_.reset();
     }
 
     std::vector<Token> Graph::publishers(const std::optional<std::string>& topic) const
@@ -1314,49 +1352,10 @@ namespace xblick::ros
         return out;
     }
 
-    bool Graph::by_xblick(const std::string& zid)
+    bool Graph::by_xblick(const std::string& zid) const
     {
-        {
-            std::lock_guard lock(state_->mutex);
-            const auto known = state_->xblick.find(zid);
-            if (known != state_->xblick.end())
-            {
-                return known->second;
-            }
-        }
-        // a liveliness query of its declaration: a program declares itself before it takes part in ROS
-        // (open_session), so its declaration is known wherever its ROS tokens are
-        struct Asked
-        {
-            std::mutex mutex;
-            std::condition_variable cv;
-            bool found = false, done = false;
-        };
-        auto asked = std::make_shared<Asked>();
-        zenoh::Session::LivelinessGetOptions options;
-        options.timeout_ms = 1000;
-        session_.liveliness_get(
-            zenoh::KeyExpr(declaration_key(zid)),
-            [asked](const zenoh::Reply& reply) {
-                std::lock_guard lock(asked->mutex);
-                asked->found = asked->found or reply.is_ok();
-            },
-            [asked] {
-                std::lock_guard lock(asked->mutex);
-                asked->done = true;
-                asked->cv.notify_all();
-            },
-            std::move(options));
-        bool found = false;
-        {
-            std::unique_lock lock(asked->mutex);
-            // Zenoh does not always finalize a query at its timeout (replies() in camera.hpp): at most 1 s more
-            asked->cv.wait_for(lock, std::chrono::milliseconds(2000), [&] { return asked->done; });
-            found = asked->found;
-        }
         std::lock_guard lock(state_->mutex);
-        state_->xblick[zid] = found;
-        return found;
+        return state_->xblick.count(zid) != 0;
     }
 
     // ------------------------------------------------------------------------------------------- GpuLink
