@@ -815,6 +815,7 @@ class StaticTransformSubscriber:
                                                                                         s.payload))
         self._query = threading.Thread(target=self._ask, args=(session, timeout), daemon=True)
         self._query.start()
+        close_at_exit(self, f"the subscriber of {self.key}")  # its thread asks over Zenoh: stopped at the end
 
     def _deliver_ros(self, payload: bytes, *_):
         if self._error is not None:
@@ -850,6 +851,7 @@ class StaticTransformSubscriber:
             raise self._error
 
     def close(self):
+        forget_at_exit(self)
         self._closed = True
         _undeclare(self._subscriber)
         if self._query is not None:

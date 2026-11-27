@@ -424,7 +424,8 @@ def collect(handler, what: str, timeout: float, cancel=None) -> list:
     CancellationToken: Session.close() waits for good for a query Zenoh did not finalize, seen in the tests), goes on
     with the replies that came, counts the query in ``not_finalized`` and logs it once per selector. The thread reads in
     Rust without the GIL, and no Python callback runs per reply: a query under GIL load costs what iterating the get
-    costs. Error replies (``r.ok`` None) are kept as they came."""
+    costs. Error replies (``r.ok`` None) are kept as they came. A reader still reading when the program ends (a query
+    asked in a daemon thread, or one Zenoh did not finalize) is waited for at its end (``join_at_exit``)."""
     got: list = []
 
     def drain():
@@ -433,10 +434,13 @@ def collect(handler, what: str, timeout: float, cancel=None) -> list:
 
     reader = threading.Thread(target=drain, name=f"replies {what}", daemon=True)
     reader.start()
+    join_at_exit(reader, f"the query {what}")
     reader.join(deadline_of(timeout))
     if reader.is_alive() and cancel is not None:
         cancel.cancel()  # the query ended by us: a query Zenoh did not finalize makes Session.close() wait for good
         reader.join(1.0)
+    if not reader.is_alive():
+        _exit_threads.pop(reader, None)
     if reader.is_alive() or (cancel is not None and cancel.is_cancelled):
         with _not_finalized_lock:
             not_finalized[what] = not_finalized.get(what, 0) + 1
@@ -942,8 +946,7 @@ def close(session, timeout: float = CLOSE_TIMEOUT_S) -> bool:
     closer.join(timeout)
     if closer.is_alive():
         what = f"the Zenoh session {raw.info.zid()}"
-        _still_closing[closer] = what
-        _watch()
+        join_at_exit(closer, what)
         log.warning(f"{what} did not close within {timeout:g} s: going on without waiting for it")
         return False
     return True
@@ -991,16 +994,34 @@ def _end(raw: zenoh.Session, declared, taking_part) -> None:
 
 def close_at_exit(thing, what: str) -> None:
     """``thing.close()`` is called when the program ends without having called it, before the sessions are closed
-    (``_close_open_sessions``); that close calls ``forget_at_exit(thing)``. For what a thread of its own keeps
-    alive, which is never freed otherwise (a Subscription's chooser). ``what`` names it in the line of a close at
-    exit that stalls (``the subscription of test/camera/color``)."""
+    (``_close_open_sessions``), the things registered last first; that close calls ``forget_at_exit(thing)``. For a
+    thing with a thread of its own that calls Zenoh or a ring (a Subscription's chooser, a history's reader, a node's
+    services): its close stops and joins that thread, so that it is not inside such a call when Python finalises, and
+    frees what the thread keeps alive. Held weakly: a thing nobody refers to is not kept for the end. ``what`` names it
+    in the line of a close at exit that stalls (``the subscription of test/camera/color``)."""
     _open_things[thing] = what
+    _watch()
+
+
+def join_at_exit(thread: threading.Thread, what: str) -> None:
+    """``thread`` is waited for when the program ends, after the sessions are closed (which ends its Zenoh call): a
+    thread that no object closes (a query's reader, a command's thread, a close that ``close`` gave up on). ``what``
+    names it in the line of a close at exit that stalls. Threads that ended are dropped from the list."""
+    for ended in [t for t in list(_exit_threads) if not t.is_alive()]:
+        _exit_threads.pop(ended, None)
+    _exit_threads[thread] = what
     _watch()
 
 
 def forget_at_exit(thing) -> None:
     """``thing`` is closed: the end of the program leaves it alone (``close_at_exit``)."""
     _open_things.pop(thing, None)
+
+
+def exit_began() -> bool:
+    """True once the close at the end of the program has begun (``_close_open_sessions``): no thread can be started
+    any more, and the sessions are closed right after the things being closed now."""
+    return _exit_began.is_set()
 
 
 def _zenoh_callback_thread(thread: threading.Thread) -> bool:
@@ -1016,35 +1037,49 @@ def _close_open_sessions() -> None:
     or queryable is undeclared: a program that did not close its session never ended. The program's own threads
     that are not daemons may still use the sessions: they are waited for first, as Python would.
 
-    Then, within EXIT_CLOSE_S in all: what was registered with ``close_at_exit``, the open sessions, and the closes
-    that ``close`` gave up on. A daemon thread that is still inside a Zenoh call when Python finalises can abort the
-    process with "FATAL: exception not rethrown" (seen with a declaration's thread that outlived its session, and with
-    plain zenoh; Python 3.12 ends such a thread with pthread_exit when it takes the GIL back, and that unwinding fails
-    in zenoh's Rust code), so those closes are waited for rather than left behind. No thread can be started any more
-    at this point (Python 3.12): the limit is kept by a thread started before (``_watch``), which ends the process
-    when it passes."""
+    Then, within EXIT_CLOSE_S in all: what was registered with ``close_at_exit`` (the last first), the open sessions,
+    and the threads of ``join_at_exit``. A daemon thread that is still inside a Zenoh call (or a call of the C++ core
+    that released the GIL: a ring read) when Python finalises can abort the process with "FATAL: exception not
+    rethrown" or "terminate called without an active exception" (seen with a declaration's thread that outlived its
+    session, with a query's reader, a history's reader and a command's thread, and with plain zenoh; Python 3.12 ends
+    such a thread with pthread_exit when it takes the GIL back, and that unwinding fails in Rust or C++ code), so those
+    threads are stopped and waited for rather than left behind. A close that raises does not keep the others from
+    closing; the first error is raised at the end. No thread can be started any more at this point (Python 3.12): the
+    limit is kept by a thread started before (``_watch``), which ends the process when it passes."""
     this = threading.current_thread()
     while waiting := [t for t in threading.enumerate()
                       if not t.daemon and t is not this and t.is_alive() and not _zenoh_callback_thread(t)]:
         for thread in waiting:
             thread.join()
     _exit_began.set()
+    errors: list[BaseException] = []
+
+    def attempt(close):
+        try:
+            close()
+        except BaseException as error:  # noqa: BLE001 - raised after the others closed
+            errors.append(error)
+
     try:
         things, sessions = list(_open_things.items()), list(_open)
-        closing = [(t, what) for t, what in _still_closing.items() if t.is_alive()]
-        _exit_left[:] = [what for _, what in things] + [_named(s) for s in sessions] + [what for _, what in closing]
-        for thing, what in things:
-            thing.close()
+        _exit_left[:] = [what for _, what in things] + [_named(s) for s in sessions]
+        for thing, what in reversed(things):  # a history before its subscriber, a recorder before its parameters
+            if thing in _open_things:  # else closed meanwhile by the close of another (a history its subscriber)
+                attempt(thing.close)
             _exit_left.remove(what)
         for s in sessions:
             what = _named(s)
-            _end(*_take(s))
+            attempt(lambda s=s: _end(*_take(s)))
             _exit_left.remove(what)
-        for thread, what in closing:
-            thread.join()
-            _exit_left.remove(what)
+        while threads := [(t, what) for t, what in list(_exit_threads.items()) if t.is_alive()]:
+            _exit_left[:] = [what for _, what in threads]
+            for thread, _ in threads:
+                thread.join()
+        _exit_left.clear()
     finally:
         _exit_ended.set()
+    if errors:
+        raise errors[0]
 
 
 def _named(session) -> str:
@@ -1085,7 +1120,9 @@ def _end_a_stalled_exit() -> None:
 # any more is closed by zenoh itself, and one that declares or takes part in ROS 2 closes those parts first (_drop).
 _open: weakref.WeakSet = weakref.WeakSet()
 _open_things: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()  # thing -> what it is
-_still_closing: dict[threading.Thread, str] = {}  # the closes that close() gave up on -> what they close
+# threads waited for at the end (join_at_exit) -> what they do; strong, but a thread holds what it uses anyway while
+# it runs, and an ended one (which holds nothing) is dropped at the next join_at_exit
+_exit_threads: dict[threading.Thread, str] = {}
 _exit_began, _exit_ended = threading.Event(), threading.Event()
 _exit_left: list[str] = []  # what the close at exit has not closed yet
 _watchdog: threading.Thread | None = None

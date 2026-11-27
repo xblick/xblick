@@ -31,6 +31,7 @@ import time
 from collections.abc import Callable
 
 from . import _core
+from .session import close_at_exit, forget_at_exit
 
 log = logging.getLogger("xblick")
 
@@ -92,6 +93,7 @@ class FrameHistory(StampedHistory):
         self._closed = threading.Event()
         self._thread = threading.Thread(target=self._run, name=f"frames {subscriber.base}", daemon=True)
         self._thread.start()
+        close_at_exit(self, f"the history of {subscriber.base}")  # its thread reads rings: stopped at the end
 
     def _run(self):
         try:
@@ -113,6 +115,7 @@ class FrameHistory(StampedHistory):
             raise self._error
 
     def close(self):
+        forget_at_exit(self)
         self._closed.set()
         self._thread.join()
         self.subscriber.close()

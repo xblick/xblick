@@ -60,7 +60,6 @@ streams, transforms and parameters, and it reads theirs.
 - C++: the option structs (`SessionOptions`, `PublisherOptions`, `SubscriberOptions`, the cloud options) give every field a default, so designated initializers that leave fields out compile without `-Wmissing-field-initializers`.
 - A Session in ROS 2 that a program drops without `close()` is released again when it is collected, as without ROS.
 - `xblick play --loop`: a `/tf_static` held twice in a file no longer adds a gap as long as the recording between passes.
-- `xblick test-camera` ends with exit code 0 also when SIGTERM or Ctrl-C comes while it starts (it ended by SIGINT).
 - An `xblick` command takes SIGTERM and SIGINT from the first line of the package on, before `_core`, numpy and the camera code are imported (a plain `import xblick` in a program, `xblick relay` and the terminal interface keep their signals): one that comes while it starts ends it before it begins (SIGTERM killed it, and SIGINT did nothing to a background job of a script). A command that serves until it is stopped then ends with exit code 0; `list`, `hz`, `snapshot`, `param`, `recorder` and `clean` end by that signal (exit status 143 for SIGTERM and 130 for SIGINT in a shell).
 - `xblick router`, `view` and `cam` end with exit code 0 also on a Ctrl-C or SIGTERM that comes before their own handler (they ended by SIGINT), as `xblick test-camera` does.
 - The ROS graph (`ros.Graph`, C++ `ros::Graph`) knows which sessions are programs of ours from their declaration tokens, which it follows with history, instead of a liveliness query per session: a query that ended by its timeout under load made a program's ROS copy count as a ROS camera for good (`auto`'s fallback, `xblick list`).
@@ -74,8 +73,20 @@ streams, transforms and parameters, and it reads theirs.
 - C++: ROS topics of any name and `auto`'s ROS form are not there yet; `Transport::Ros` reads `/<stream>/image_raw`.
 - A ROS publisher with the CUDA buffer backend decides once per subscriber: one that starts after our GPU subscriber and is on another GPU with the same CUDA ordinal sends buffers that the subscriber drops (one line says so).
 
-Compatible with 0.5.17: our own keys are unchanged, and with `--no-ros` no byte on the wire changes. New recordings
-hold one more channel, `/tf_static`, which 0.5.17 plays as the key `tf_static`.
+Compatible with 0.5.18: our own keys are unchanged, and with `--no-ros` no byte on the wire changes. New recordings
+hold one more channel, `/tf_static`, which 0.5.18 plays as the key `tf_static`.
+
+## 0.5.18
+
+A script that ends without closing what it opened no longer aborts now and then at its end.
+
+### Fixed
+
+- The threads of a `FrameHistory`, an `Overlay`, a node's `Parameters`, a `CommandSubscriber`, a `StaticTransformSubscriber`, a recorder and the Rerun bridge, and the readers of queries still open, are stopped and waited for when a script ends without closing them, within the same 5 s as its sessions. One of them inside a Zenoh call or a ring read when Python finalised aborted the program now and then ("FATAL: exception not rethrown", "terminate called without an active exception").
+- A `FrameHistory` left open no longer ends the program with a nanobind leak report, and a `StaticTransformSubscriber` left open no longer with a traceback ("session closed").
+- `xblick test-camera` ends with exit code 0 also when SIGTERM or Ctrl-C comes while it starts (it ended by SIGINT).
+
+Compatible with 0.5.17: nothing on the wire changes.
 
 ## 0.5.17
 

@@ -102,7 +102,8 @@ from .encodings import image_to_numpy
 from .msg import CameraInfo, Clock, CompressedImage, Image, Message, PointCloud2, TFMessage, Time
 from .msgdefs import MSGDEFS
 from .parameters import Parameters
-from .session import CommandQuery, CommandRefused, answer_attachment, node_id, one_node, refuse, replies
+from .session import (CommandQuery, CommandRefused, answer_attachment, close_at_exit, forget_at_exit, join_at_exit,
+                      node_id, one_node, refuse, replies)
 from .session import command as send_once
 from .stamps import header_stamp  # recording.header_stamp: its old home
 
@@ -500,6 +501,7 @@ class Recorder:
         p.declare("file", "", read_only=True, description="the file playing now",
                   read=lambda: self._player.file if self._player is not None else "")
         p.check_overrides()
+        close_at_exit(self, f"the recorder {name}")  # its threads write, publish and play: stopped at the end
 
     def _playing(self, what: str):
         player = self._player
@@ -574,10 +576,15 @@ class Recorder:
                 self.parameters.refresh()
 
     def _on_control(self, sample: zenoh.Sample):
-        threading.Thread(target=self._command, args=(sample.payload.to_bytes(),), daemon=True).start()
+        self._start(threading.Thread(target=self._command, args=(sample.payload.to_bytes(),), daemon=True))
 
     def _on_request(self, query: zenoh.Query):
-        threading.Thread(target=self._answer_request, args=(query,), daemon=True).start()
+        self._start(threading.Thread(target=self._answer_request, args=(query,), daemon=True))
+
+    def _start(self, thread: threading.Thread):
+        """A command's own thread, waited for at the end of the program (it replies over Zenoh)."""
+        thread.start()
+        join_at_exit(thread, f"a command of the recorder {self.name}")
 
     def _answer_request(self, query: zenoh.Query):
         """A command sent as a query: answered once it took effect (its result) or was refused, whatever the query
@@ -1034,6 +1041,7 @@ class Recorder:
         return player.status()
 
     def close(self):
+        forget_at_exit(self)
         try:
             self.stop()
         finally:

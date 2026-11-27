@@ -25,7 +25,7 @@ xblick list
 ```
 
 ```
-test/camera/color    rgb8    raw,compressed,shm    source 'test'    host 0a1b2c3d    xblick 0.5.17
+test/camera/color    rgb8    raw,compressed,shm    source 'test'    host 0a1b2c3d    xblick 0.5.18
 ```
 
 The line shows the encoding of the stream and the [transports](../concepts/transports.md) that the publisher

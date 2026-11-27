@@ -945,11 +945,13 @@ class Ros:
     def release_parameters(self):
         """The node's parameters closed: the next Parameters serve on it again, and until then its six services
         without parameters (Parameters.none_on), so that ROS's parameter tools still get an answer. Not after
-        ``close``."""
+        ``close``, and not at the end of the program (session.exit_began: no thread can be started then, and the node
+        closes with its session right after)."""
         from .parameters import Parameters
+        from .session import exit_began
         with self._lock:
             self._parameters_taken = False
-            if self._closed or self._no_parameters is not None:
+            if self._closed or self._no_parameters is not None or exit_began():
                 return
         try:
             none = Parameters.none_on(self.node)

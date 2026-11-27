@@ -54,6 +54,7 @@ from .msg import (DiagnosticArray, DiagnosticStatus, Float64MultiArray, Header, 
                   Transform, TransformStamped, Vector3, Wrench, WrenchStamped)
 from .parameters import ParameterClient
 from .robot import RobotStatePublisher, RobotStateSubscriber
+from .session import close_at_exit, forget_at_exit
 
 
 MAX_COMMAND_AGE = 0.25  # s: a command stamped further off the controller's clock is refused
@@ -153,6 +154,7 @@ class CommandSubscriber:
         self._subscriber = session.declare_subscriber(topics.controller_command(robot, controller), self._on_sample)
         self._thread = threading.Thread(target=self._run, name="xblick-commands", daemon=True)
         self._thread.start()
+        close_at_exit(self, f"the command subscriber of {robot}/{controller}")  # its thread runs the callback
 
     def check(self):
         if self._error is not None:
@@ -204,6 +206,7 @@ class CommandSubscriber:
                     return
 
     def close(self):
+        forget_at_exit(self)
         with self._lock:
             self._closed = True
             self._lock.notify_all()

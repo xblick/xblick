@@ -259,6 +259,102 @@ def test_a_close_at_exit_that_stalls_ends_the_program():
     assert 0.5 <= took < 3.0, took
 
 
+LEFT_OPEN = """
+import atexit
+import importlib.util
+import os
+import sys
+import threading
+import time
+
+import numpy as np
+import zenoh
+
+from xblick import session
+from xblick.camera import CountedPublisher, ImageSubscriber, StaticTransformSubscriber
+
+kind, router = sys.argv[1], sys.argv[2]
+
+
+@atexit.register
+def left():  # atexit runs after the close at exit: the threads still alive then
+    own = (threading.main_thread().name, session.EXIT_WATCHDOG, "own query")  # the watchdog may have ended already
+    print("left: " + ", ".join(sorted(t.name for t in threading.enumerate() if t.name not in own)), flush=True)
+
+
+s = session.open_session(connect=[router])
+if kind == "history":  # its thread reads the shm ring
+    from xblick.history import FrameHistory
+
+    history = FrameHistory(ImageSubscriber(s, "test/camera/color", transport="shm"), 4)
+    end = time.monotonic() + 20
+    while history.newest() is None and time.monotonic() < end:
+        time.sleep(0.05)
+    assert history.newest() is not None
+elif kind == "static transforms":  # its thread asks for 10 s, nobody answers
+    transforms = StaticTransformSubscriber(s, "nobody/camera", lambda message: None)
+elif kind == "query":  # a query in a daemon thread, open at the end: its reader is inside Zenoh
+    held = s.declare_queryable("held/query")  # never read: the query stays open
+    threading.Thread(target=lambda: session.replies(s, "held/query", 5.0), name="own query", daemon=True).start()
+elif kind == "parameters":  # the services' thread
+    from xblick.parameters import Parameters
+
+    parameters = Parameters(s, "exit", "xblick_test")
+    parameters.declare("value", 1.0)
+elif kind == "overlay":  # its thread draws and publishes
+    from xblick.overlay import Overlay
+
+    overlay = Overlay(s, "exit/camera", "node", draw=lambda rgb, results: rgb)
+    reader = ImageSubscriber(s, "exit/camera/node/overlay", transport="raw")
+    for _ in range(50):
+        overlay.put(time.time_ns(), "exit", np.zeros((120, 160, 3), np.uint8), None)
+        time.sleep(0.01)
+elif kind == "commands":  # its thread runs the callback, which publishes
+    from xblick.controller import CommandPublisher, CommandSubscriber
+
+    echo = CountedPublisher(s, "exit/echo", zenoh.Encoding.APPLICATION_OCTET_STREAM)
+    commands = CommandSubscriber(s, "exit", "arms", lambda command: [echo.put(b"x" * 1000) for _ in range(20)])
+    sender = CommandPublisher(s, "exit", "arms", "base")
+    for i in range(300):
+        sender.send(joints={"a": float(i)})
+elif kind == "recorder":  # its writer, discovery and status threads, its parameters
+    from xblick.recording import Recorder
+
+    recorder = Recorder(s, os.environ["XBLICK_TEST_DIR"], look_every=0.2)
+    recorder.record()
+time.sleep(0.3)
+print("xblick-test-left-open: ends", flush=True)
+"""
+LEFT_OPEN_KINDS = ["history", "static transforms", "query", "parameters", "overlay", "commands"]
+FAULTS = ("FATAL", "terminate called", "Fatal Python error", "Traceback", "Exception in thread", "nanobind: leaked")
+try:
+    import mcap  # noqa: F401 - the extra xblick[record]
+
+    LEFT_OPEN_KINDS.append("recorder")
+except ImportError:
+    pass
+
+
+def test_threads_of_what_a_script_left_open_end_before_python_finalises(camera, tmp_path):
+    """Per kind of thread: a script that leaves its session and the thing that runs the thread open ends with exit
+    code 0, and no thread of xblick but the exit watchdog is left when Python finalises. Before 0.5.18 these threads
+    were not waited for; one inside a Zenoh call or a ring read at that moment aborted the process now and then
+    ("FATAL: exception not rethrown", "terminate called without an active exception"), a history's left a nanobind
+    leak report, and the transforms' asking thread a traceback once its session was closed. stderr is checked for
+    these faults only: zenoh's own runtime threads panic now and then at the very end of a process ("static_init ...
+    AccessError"), with exit code 0 and with or without xblick's threads."""
+    failed = []
+    for kind in LEFT_OPEN_KINDS:
+        done = subprocess.run([sys.executable, "-c", LEFT_OPEN, kind, camera], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=60, check=False,
+                              env={**ENV, "XBLICK_TEST_DIR": str(tmp_path)})
+        left = [line for line in done.stdout.splitlines() if line.startswith("left: ")]
+        if (done.returncode != 0 or "xblick-test-left-open: ends" not in done.stdout
+                or left != ["left: "] or any(fault in done.stderr for fault in FAULTS)):
+            failed.append(f"{kind}: exit code {done.returncode}\n{done.stdout}{done.stderr}")
+    assert not failed, "\n".join(failed)
+
+
 def port_free(port: int) -> bool:
     """Nothing listens on the port (a connection attempt is refused); a bind test would also fail on connections
     of earlier tests that are still in TIME_WAIT."""

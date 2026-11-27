@@ -54,8 +54,8 @@ from .msg import (DescribeParametersRequest, DescribeParametersResponse, Floatin
                   SetParametersRequest, SetParametersResponse, SetParametersResult, Time)
 from .paths import expand_path
 from .ros import NEEDS_ROS, check_ros_name
-from .session import (ASK_PERIOD, CommandQuery, CommandRefused, answer_attachment, ask, checked, command, count, log,
-                      node_id, one_node, refuse, replies, timed_out)
+from .session import (ASK_PERIOD, CommandQuery, CommandRefused, answer_attachment, ask, checked, close_at_exit, command,
+                      count, forget_at_exit, log, node_id, one_node, refuse, replies, timed_out)
 
 P = _core.protocol
 SERVICES = {P.LIST_PARAMETERS: (ListParametersRequest, ListParametersResponse),
@@ -224,6 +224,7 @@ class Parameters:
             self._server = threading.Thread(target=self._serve, name=f"parameters {self.key}", daemon=True)
             self._server.start()
             self._token = session.liveliness().declare_token(f"{self.key}/{P.PARAMETERS_TOKEN}")
+            close_at_exit(self, f"the parameters of {self.key}")  # their thread answers queries: stopped at the end
 
     # ---------------------------------------------------------------------------------------------- at the start
 
@@ -664,8 +665,9 @@ class Parameters:
         return p
 
     def close(self):
-        """Ends the services (again: nothing). A node calls it at its end; without it the daemon thread ends with the
-        process."""
+        """Ends the services (again: nothing). A node calls it at its end; without it they are ended when the program
+        ends (session.close_at_exit)."""
+        forget_at_exit(self)
         if self._server is None:
             return
         if self._token is not None:
