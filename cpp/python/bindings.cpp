@@ -469,28 +469,46 @@ NB_MODULE(_core, m)
     m.attr("ROS_CUDA_SOCKET_DIR") = rc::kDefaultSocketDir;
     m.attr("ROS_CUDA_SHM_DIR") = rc::kDefaultShmDir;
     m.attr("ROS_CUDA_SUBSCRIPTION") = rc::kSubscription;
+    // a descriptor as a dict of its fields and back ("event": 64 bytes, all zero when left out)
+    const auto descriptor_of = [](const nb::dict& d) {
+        rc::Descriptor descriptor;
+        descriptor.size = nb::cast<std::uint64_t>(d["size"]);
+        descriptor.device_id = nb::cast<std::int32_t>(d["device_id"]);
+        descriptor.use_ipc = nb::cast<bool>(d["use_ipc"]);
+        descriptor.pid = nb::cast<std::int32_t>(d["pid"]);
+        descriptor.block_id = nb::cast<std::uint32_t>(d["block_id"]);
+        descriptor.block_size = nb::cast<std::uint64_t>(d["block_size"]);
+        descriptor.socket_path = nb::cast<std::string>(d["socket_path"]);
+        descriptor.uid = nb::cast<std::uint64_t>(d["uid"]);
+        if (d.contains("event"))  // an IPC event handle (64 bytes); without one all zero
+        {
+            const auto event = nb::cast<nb::bytes>(d["event"]);
+            if (event.size() != descriptor.event.size())
+            {
+                throw nb::value_error("an IPC event handle has 64 bytes");
+            }
+            std::memcpy(descriptor.event.data(), event.c_str(), event.size());
+        }
+        return descriptor;
+    };
+    const auto dict_of = [](const rc::Descriptor& d) {
+        nb::dict out;
+        out["size"] = d.size;
+        out["device_id"] = d.device_id;
+        out["use_ipc"] = d.use_ipc;
+        out["pid"] = d.pid;
+        out["block_id"] = d.block_id;
+        out["block_size"] = d.block_size;
+        out["socket_path"] = d.socket_path;
+        out["uid"] = d.uid;
+        out["event"] = nb::bytes(reinterpret_cast<const char*>(d.event.data()), d.event.size());
+        return out;
+    };
     m.def("ros_cuda_image_payload",
-          [](std::int32_t sec, std::uint32_t nanosec, const std::string& frame_id, std::uint32_t height,
-             std::uint32_t width, const std::string& encoding, std::uint8_t is_bigendian, std::uint32_t step,
-             const nb::dict& d) {
-              rc::Descriptor descriptor;
-              descriptor.size = nb::cast<std::uint64_t>(d["size"]);
-              descriptor.device_id = nb::cast<std::int32_t>(d["device_id"]);
-              descriptor.use_ipc = nb::cast<bool>(d["use_ipc"]);
-              descriptor.pid = nb::cast<std::int32_t>(d["pid"]);
-              descriptor.block_id = nb::cast<std::uint32_t>(d["block_id"]);
-              descriptor.block_size = nb::cast<std::uint64_t>(d["block_size"]);
-              descriptor.socket_path = nb::cast<std::string>(d["socket_path"]);
-              descriptor.uid = nb::cast<std::uint64_t>(d["uid"]);
-              if (d.contains("event"))  // an IPC event handle (64 bytes); without one all zero
-              {
-                  const auto event = nb::cast<nb::bytes>(d["event"]);
-                  if (event.size() != descriptor.event.size())
-                  {
-                      throw nb::value_error("an IPC event handle has 64 bytes");
-                  }
-                  std::memcpy(descriptor.event.data(), event.c_str(), event.size());
-              }
+          [descriptor_of](std::int32_t sec, std::uint32_t nanosec, const std::string& frame_id, std::uint32_t height,
+                          std::uint32_t width, const std::string& encoding, std::uint8_t is_bigendian,
+                          std::uint32_t step, const nb::dict& d) {
+              const rc::Descriptor descriptor = descriptor_of(d);
               const auto payload = rc::image_payload({sec, nanosec, frame_id, height, width, encoding, is_bigendian,
                                                       step}, descriptor);
               return nb::bytes(reinterpret_cast<const char*>(payload.data()), payload.size());
@@ -703,4 +721,86 @@ NB_MODULE(_core, m)
             "entry"_a, "(whether a reader of this registry entry can import our blocks, why not)")
         .def_prop_ro("socket_dir", &rc::Link::socket_dir)
         .def_prop_ro("shm_dir", &rc::Link::shm_dir);
+
+    // the link from ROS publishers (ros_cuda.hpp Receiver); the Zenoh part is ros_cuda.py's GpuReceiver
+    m.def(
+        "ros_cuda_parse_image",
+        [dict_of](const nb::bytes& payload) -> std::optional<nb::dict> {
+            const auto parsed = rc::parse_image_payload(reinterpret_cast<const std::uint8_t*>(payload.c_str()),
+                                                        payload.size());
+            if (not parsed)
+            {
+                return std::nullopt;
+            }
+            const rc::ImageHeader& h = parsed->header;
+            nb::dict out;
+            out["sec"] = h.sec;
+            out["nanosec"] = h.nanosec;
+            out["frame_id"] = h.frame_id;
+            out["height"] = h.height;
+            out["width"] = h.width;
+            out["encoding"] = h.encoding;
+            out["is_bigendian"] = h.is_bigendian;
+            out["step"] = h.step;
+            out["descriptor"] = dict_of(parsed->descriptor);
+            return out;
+        },
+        "payload"_a,
+        "a sensor_msgs/Image in CDR whose data is a CUDA buffer: its header fields and 'descriptor' (a dict); None for "
+        "the CPU form; RingError for another backend's buffer or no Image");
+    nb::class_<rc::Receiver>(m, "RosCudaReceiver")
+        .def(
+            "__init__",
+            [gid_of](rc::Receiver* self, std::string topic, int device, std::string shm_dir, const nb::bytes& gid) {
+                new (self) rc::Receiver(std::move(topic), device, std::move(shm_dir), gid_of(gid));
+            },
+            "topic"_a, "device"_a, "shm_dir"_a, "gid"_a)
+        .def(
+            "set_gid", [gid_of](rc::Receiver& r, const nb::bytes& gid) { r.set_gid(gid_of(gid)); }, "gid"_a,
+            "the subscription's token changed: the old entry inactive, the new one at refresh()")
+        .def(
+            "add_publisher",
+            [gid_of](rc::Receiver& r, const std::string& key, const nb::bytes& gid, const std::string& node) {
+                r.add_publisher(key, gid_of(gid), node);
+            },
+            "key"_a, "gid"_a, "node"_a, "a publisher's token came (again: decided anew)")
+        .def("remove_publisher", &rc::Receiver::remove_publisher, "key"_a,
+             "a publisher's token went: its blocks unmapped")
+        .def("enter", &rc::Receiver::enter, nb::call_guard<nb::gil_scoped_release>(),
+             "before the subscription's token: the publishers known now decided, the subscription entered in the "
+             "registry")
+        .def("refresh", &rc::Receiver::refresh, nb::call_guard<nb::gil_scoped_release>(),
+             "the undecided publishers looked up in the registry, the entry written if it is not yet, the decisions said")
+        .def(
+            "take",
+            [descriptor_of](rc::Receiver& r, const nb::dict& d) {
+                const rc::Descriptor descriptor = descriptor_of(d);
+                nb::gil_scoped_release release;
+                return r.take(descriptor);
+            },
+            "descriptor"_a, "the frame a descriptor names, a DeviceBuffer on this GPU; None when stale or refused")
+        .def(
+            "notes",
+            [](rc::Receiver& r) {
+                nb::list out;
+                for (const rc::Note& n : r.notes())
+                {
+                    out.append(nb::make_tuple(n.warning, n.text));
+                }
+                return out;
+            },
+            "the lines to say since the last call: [(warning, text)]")
+        .def("stats",
+             [](const rc::Receiver& r) {
+                 const rc::ReceiverStats s = r.stats();
+                 nb::dict out;
+                 out["copied"] = s.copied;
+                 out["stale"] = s.stale;
+                 out["refused"] = s.refused;
+                 out["blocks"] = s.blocks;
+                 out["registered"] = s.registered;
+                 return out;
+             })
+        .def_prop_ro("device", &rc::Receiver::device)
+        .def_prop_ro("shm_dir", &rc::Receiver::shm_dir);
 }

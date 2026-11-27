@@ -1,4 +1,5 @@
-# cuda_check for tests/test_ros_cuda_live.py, built by the test inside the image (colcon).
+# cuda_check (a stock CUDA reader) and cuda_pattern_pub (a stock CUDA publisher) for tests/test_ros_cuda_live.py,
+# built by the test inside the image (colcon).
 cmake_minimum_required(VERSION 3.20)
 project(xblick_cuda_check LANGUAGES CXX CUDA)
 
@@ -22,5 +23,8 @@ target_link_libraries(pattern PUBLIC CUDA::cudart)
 add_executable(cuda_check src/cuda_check.cpp)
 target_link_libraries(cuda_check pattern rclcpp::rclcpp ${sensor_msgs_TARGETS} cuda_buffer::cuda_buffer CUDA::cudart
                       CUDA::cuda_driver)  # cuda_buffer's headers call the driver API
-install(TARGETS cuda_check DESTINATION lib/${PROJECT_NAME})
+add_executable(cuda_pattern_pub src/cuda_pattern_pub.cpp)
+target_link_libraries(cuda_pattern_pub pattern rclcpp::rclcpp ${sensor_msgs_TARGETS} cuda_buffer::cuda_buffer
+                      CUDA::cudart CUDA::cuda_driver)
+install(TARGETS cuda_check cuda_pattern_pub DESTINATION lib/${PROJECT_NAME})
 ament_package()

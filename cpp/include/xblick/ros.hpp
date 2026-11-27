@@ -335,8 +335,10 @@ namespace xblick::ros
     // What a ROS entity is: its token, its data key, its gid.
     struct Entity
     {
+        // backends: the token's 14th part in place of backends_of's
         Entity(const Ros& ros, const NodeName& node, std::string_view kind, const std::string& name,
-               const std::string& type_name, const Qos& qos, std::string entity_id);
+               const std::string& type_name, const Qos& qos, std::string entity_id,
+               std::optional<std::string> backends = std::nullopt);
         // Its node renamed (Ros::parameters_node): its token, token key and gid of the node's new name.
         void rename(const NodeName& node);
         Token token;
@@ -478,19 +480,36 @@ namespace xblick::ros
     // `depth` samples of every publisher with a publication cache, those there at the start and those that come
     // later (zenoh-ext's AdvancedSubscriber's history; a sample can come twice). A buffer type (backends_of): also
     // <key>/_buf_cpu, where Lyrical's publishers send it.
+    //
+    // With a cuda_device (sensor_msgs/msg/Image, volatile; Python's RosSubscriber with cuda_device): it takes frames
+    // that ROS publishers have as CUDA buffers on that GPU without a copy through the CPU (ros_cuda.hpp Receiver): its
+    // token says kCudaBackends and it reads <key>/_buf/<its gid>; gpu_callback gets each sample with the receiver,
+    // which reads a sample in the buffer form (ros_cuda::parse_image_payload) when its frame is taken.
+    inline constexpr std::string_view kCudaBackends = "backends:cuda:";
     class Subscriber
     {
     public:
         using Callback = std::function<void(std::vector<std::uint8_t>&&, const Attachment&)>;
+        using GpuCallback = std::function<void(std::vector<std::uint8_t>&&, const Attachment&,
+                                               const std::shared_ptr<ros_cuda::Receiver>&)>;
         Subscriber(zenoh::Session& session, Ros& ros, const NodeName& node, const std::string& topic,
                    const std::string& type_name, Callback callback, const Qos& qos = kStreamQos);
+        // publishers: those of the topic known now (a Graph's): the subscription is entered in the backend's registry
+        // for them before its token is announced (ros_cuda::Receiver::enter). RosError for another type than
+        // sensor_msgs/msg/Image, a transient-local qos or a shm directory (ros_cuda::kShmEnv) that is none.
+        Subscriber(zenoh::Session& session, Ros& ros, const NodeName& node, const std::string& topic,
+                   const std::string& type_name, GpuCallback gpu_callback, int cuda_device,
+                   const std::vector<Token>& publishers = {}, const Qos& qos = kStreamQos);
         ~Subscriber();
         Subscriber(const Subscriber&) = delete;
         Subscriber& operator=(const Subscriber&) = delete;
         const std::string& key() const { return entity_.key; }
+        // The receiver of a subscription with a cuda_device, else null.
+        std::shared_ptr<ros_cuda::Receiver> receiver() const;
 
     private:
         struct State;
+        void declare(zenoh::Session& session, Ros& ros, const NodeName& node);
         Entity entity_;
         std::weak_ptr<Ros> ros_;
         std::uint64_t enrolled_ = 0;
@@ -498,7 +517,9 @@ namespace xblick::ros
         std::optional<zenoh::Subscriber<void>> subscriber_;
         std::optional<zenoh::Subscriber<void>> history_;  // transient local: the publishers' cache tokens
         std::optional<zenoh::Subscriber<void>> cpu_group_;  // a buffer type: <key>/_buf_cpu
-        std::optional<zenoh::LivelinessToken> token_;
+        std::optional<zenoh::Subscriber<void>> buffer_;     // cuda_device: <key>/_buf/<gid>
+        std::optional<zenoh::Subscriber<void>> publishers_;  // cuda_device: the topic's publisher tokens
+        // (the liveliness token is the State's: with a cuda_device it is announced again from Zenoh's threads)
     };
 
     // A ROS service: a queryable on ROS's key, declared complete (ROS clients ask with target ALL_COMPLETE), its

@@ -28,9 +28,22 @@ readers (ours among them), ``<key>/_buf/<gid>`` in CPU form for the other buffer
 backends part (ROS 2 Jazzy, older xblick) reads the key only: while one is there, every reader gets the CPU form on
 the key. A program that reads the key without a token (no ROS entity) gets nothing while the link is on.
 
-``XBLICK_ROS_CUDA=0`` turns the link off; ``XBLICK_ROS_CUDA_SOCKETS`` is where the sockets go (default ``/tmp``, the
-backend's; a reader in a container needs it at the same path, release 0.1.2 reads only the file form),
-``XBLICK_ROS_CUDA_SHM`` the reader's ``/dev/shm`` as this program sees it (default ``/dev/shm``)."""
+The other direction (``GpuReceiver``, the core's ``_core.RosCudaReceiver``): a subscription of ours that reads a ROS
+image topic and works on a GPU (``ros.RosSubscriber`` with ``cuda_device``; an ImageSubscriber of a ROS form with a
+``device``) takes the frames a ROS publisher has as CUDA buffers on that GPU without a copy through the CPU, as a
+device buffer of its own (the CUDA ring reader's copy). Its token says ``backends:cuda:``. A publisher decides once,
+when it discovers the subscription, by the backend's rule (the subscription's registry entry has its Linux user and
+CUDA ordinal and says "can import"), so the subscription enters the registry before its token (the only thing it
+writes there), from the publishers known then: "can import" with a publisher's ordinal when that publisher uses this
+GPU, as this Linux user, in a process seen from here, with this program's ``/dev/shm`` (CUDA's events of the buffers
+are there); "cannot import" when publishers are known and none does; with none known as a stock subscription enters
+itself (this program's ordinal). Every other publisher sends it the CPU form (one line each says why). A descriptor is
+read under the backend's hold (the count in the block's record, the uid compared before and after the copy): a frame
+whose block was rewritten before it was taken is stale.
+
+``XBLICK_ROS_CUDA=0`` turns the link off (both directions); ``XBLICK_ROS_CUDA_SOCKETS`` is where the sockets go
+(default ``/tmp``, the backend's; a reader in a container needs it at the same path, release 0.1.2 reads only the
+file form), ``XBLICK_ROS_CUDA_SHM`` the ROS nodes' ``/dev/shm`` as this program sees it (default ``/dev/shm``)."""
 
 from __future__ import annotations
 
@@ -182,3 +195,101 @@ class GpuLink:
         for out in outs:
             out.undeclare()
         self._link = None  # removes its pool's sockets, records and blocks
+
+
+class Received(bytes):
+    """The payload of a sample in the buffer form (a sensor_msgs/Image whose data is a CUDA buffer descriptor), from a
+    subscription with a GpuReceiver: ``parsed`` (``_core.ros_cuda_parse_image``: the header's fields and
+    ``descriptor``) and ``receiver``, which reads it (``GpuReceiver.take``) when the frame is taken."""
+
+    parsed: dict
+    receiver: GpuReceiver
+
+
+class GpuReceiver:
+    """The link from ROS publishers of one subscription (``ros.RosSubscriber`` with ``cuda_device``): the publisher
+    tokens of its topic into the core's receiver (decisions, registry entry, blocks), the samples in the buffer form
+    marked (``received``), and their frames copied onto the GPU (``take``)."""
+
+    def __init__(self, subscriber: ros.RosSubscriber, device: int, shm_dir: str | None = None):
+        if subscriber.type_name not in LINK_TYPES:
+            raise ros.RosError(f"{subscriber.type_name}: CUDA buffers come in {', '.join(LINK_TYPES)}")
+        self.subscriber = subscriber
+        self.device = device
+        try:
+            self._receiver = _core.RosCudaReceiver(subscriber.topic, device,
+                                                   shm_dir or _core.ros_cuda_shm_dir_from_environment(),
+                                                   subscriber.gid)
+        except ValueError as error:
+            raise ros.RosError(str(error)) from None
+        self.shm_dir = self._receiver.shm_dir
+        # entered in the registry for the publishers known now (ROS's graph), before the subscription's token: a
+        # publisher decides once, when it discovers the subscription
+        for known in subscriber.node.ros.graph.publishers(subscriber.topic):
+            if known.type_name == subscriber.type_name:
+                self._receiver.add_publisher(known.key(), ros.gid(known.key()), known.fully_qualified_node)
+        self._receiver.enter()
+        self._say()
+        token = subscriber.token
+        pattern = "/".join([ros.ADMIN_SPACE, str(token.domain), "*", "*", "*", ros.PUBLISHER, "*", "*", "*",
+                            ros.mangle(subscriber.topic), ros.dds_type(subscriber.type_name), token.type_hash, "**"])
+        self._tokens = ros._Polled(subscriber._raw.liveliness().declare_subscriber(pattern, history=True),
+                                   self._on_token, f"ros gpu from {subscriber.topic}")
+
+    def _on_token(self, sample):
+        key = str(sample.key_expr)
+        if self._receiver is None:
+            return
+        if sample.kind != ros.zenoh.SampleKind.PUT:
+            self._receiver.remove_publisher(key)
+            return
+        try:
+            token = ros.parse_token(key)
+        except ros.RosError:
+            return
+        self._receiver.add_publisher(key, ros.gid(key), token.fully_qualified_node)
+        self._refresh()
+
+    def _refresh(self):
+        self._receiver.refresh()
+        self._say()
+
+    def _say(self):
+        for warning, text in self._receiver.notes():
+            (log.warning if warning else log.info)(text)
+
+    def set_gid(self, gid: bytes):
+        """The subscription's token changes (its node renamed): entered anew with the new gid, before the new token."""
+        self._receiver.set_gid(gid)
+        self._say()
+
+    def received(self, payload: bytes) -> bytes:
+        """A sample's payload: as it is in the CPU form, a Received in the buffer form. The registry looked at again
+        (cheap once every publisher is decided). RingError for a buffer of another backend."""
+        if self._receiver is None:  # closed: a sample that Zenoh handed over meanwhile
+            return payload
+        self._refresh()
+        parsed = _core.ros_cuda_parse_image(payload)
+        if parsed is None:
+            return payload
+        received = Received(payload)
+        received.parsed, received.receiver = parsed, self
+        return received
+
+    def take(self, received: Received):
+        """The frame of a Received, copied onto this GPU (``_core.DeviceBuffer``, complete), or None when it is stale
+        (its block rewritten or gone before it was taken, or this receiver closed) or not read (said once)."""
+        receiver = self._receiver
+        if receiver is None:
+            return None
+        buffer = receiver.take(received.parsed["descriptor"])
+        self._say()
+        return buffer
+
+    def stats(self) -> dict:
+        """copied, stale, refused (descriptors), blocks (mapped now), registered (the entry is in the registry)."""
+        return self._receiver.stats()
+
+    def close(self):
+        self._tokens.undeclare()
+        self._receiver = None  # its registry entry inactive, its blocks unmapped

@@ -141,6 +141,24 @@ Measured on 2026-11-26 on an RTX PRO 6000 with a stock Lyrical reader in a conta
 twice 300 frames at 30 Hz per row. Both rows include the copy into the CUDA ring. Other jobs used the PC's CPUs at the
 time. The pool had 11 blocks, which take 66 MiB of GPU memory.
 
+## ROS 2 publishers
+
+A ROS 2 Lyrical publisher with the CUDA buffer backend sends the frames that it has as CUDA buffers as such to our
+subscribers that work on a GPU. [GPU frames from ROS publishers](../integrations/ros2.md#gpu-frames-from-ros-publishers)
+lists what the publisher needs. In short, it runs as the same Linux user on the same PC and GPU, and it shares our
+program's `/dev/shm`, process ids and network.
+
+1. The subscriber announces the backend in its liveliness token and enters itself in the backend's registry before
+   that. The publisher decides from that entry, once, whether it sends CUDA buffers or the bytes.
+2. When the subscriber takes a frame, it adds one to the count in the block's record and compares the block's uid
+   with the descriptor's. Another uid means that the publisher has rewritten the block, and the frame is stale.
+3. The subscriber fetches the block's file descriptor from the publisher once and maps the block on its GPU.
+4. Its copy waits for the publisher's CUDA event, which marks the end of the publisher's write into the block.
+5. After the copy, the subscriber compares the uid again and takes its count back. The publisher may then reuse the
+   block.
+
+The subscriber hands out its own copy, as from a CUDA ring, so the publisher's pool stays small.
+
 ## What follows for your node
 
 - Name your CUDA stream when you publish a device array.
@@ -160,6 +178,9 @@ time. The pool had 11 blocks, which take 66 MiB of GPU memory.
 - A ROS reader gets CUDA buffers only from a `CameraPublisher` with `cuda_device`, only on the publisher's GPU,
   and only through a backend whose wire format matches ours. The backend is experimental and has no version on the wire.
 - A ROS reader on another GPU gets the bytes. The backend's reader cannot copy between GPUs.
+- Our subscriber takes CUDA buffers only from a ROS publisher on its GPU, and gets the bytes from one on another GPU.
+  A ROS publisher that starts after our subscriber decides by its CUDA ordinal alone. On another GPU with the same
+  ordinal, its frames do not reach our subscriber.
 
 ## Related pages
 

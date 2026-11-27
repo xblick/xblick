@@ -526,7 +526,9 @@ namespace xblick
         Transport local = Transport::Auto;
         // The GPU this subscriber works on (an ordinal, as CUDA numbers them): the frames of a CUDA ring arrive on
         // it, copied from GPU to GPU if the ring is on another one. Unset: the CPU, so local Auto takes shared memory
-        // (a CUDA ring only for a subscriber that works on a GPU), and the frames of a CUDA ring stay on its GPU.
+        // (a CUDA ring only for a subscriber that works on a GPU), and the frames of a CUDA ring stay on its GPU. A ROS
+        // form's frames that a ROS publisher has as CUDA buffers on this GPU arrive on it as well (ros_cuda.hpp
+        // Receiver; ros_gpu_stats()), the others as bytes.
         std::optional<int> cuda_device{};
         Transport remote = Transport::Compressed;  // what Auto takes for a publisher on another host (or Raw)
         bool copy = true;                          // false: shm/cuda frames are views into the ring (check is_valid)
@@ -617,6 +619,9 @@ namespace xblick
         std::optional<Frame> at(std::int64_t stamp_ns, std::chrono::nanoseconds max_offset);
         std::vector<std::int64_t> recent_stamps() const;  // the samples kept, oldest first, not decoded
         std::uint64_t decoded() const;                     // frames decoded (or read from their ring) and handed out
+        // The counters of the CUDA buffers taken from ROS publishers (ros_cuda.hpp Receiver) while a ROS form is read
+        // with a cuda_device; none otherwise.
+        std::optional<ros_cuda::ReceiverStats> ros_gpu_stats() const;
 
     private:
         struct Impl;

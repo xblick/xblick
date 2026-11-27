@@ -26,6 +26,7 @@ streams, transforms and parameters, and it reads theirs.
 - Readers of ROS topics: transport `ros` for images and clouds (`xblick hz`, `xblick snapshot`), `DetectionSubscriber(ros_type=...)`, `TransformBuffer(ros=True)`.
 - ROS 2 Lyrical (`rmw_zenoh_cpp` 0.10.6 or newer): readers of images, compressed images and clouds also take them from Lyrical publishers, which send these types on keys of their own (Python and C++).
 - GPU frames to ROS 2 Lyrical readers that accept CUDA buffers (`cuda_buffer_backend`, experimental upstream), Isaac ROS nodes among them: a `CameraPublisher` with `cuda_device` (Python and C++) sends them a CUDA buffer on the same PC, user and GPU, the other readers get the bytes as before; `XBLICK_ROS_CUDA=0` turns it off.
+- GPU frames from ROS 2 Lyrical publishers that send CUDA buffers: an `ImageSubscriber` of a ROS topic with a `device` (C++: `cuda_device`) takes them on its GPU as a device array, on the same PC, user, GPU and `/dev/shm`; other publishers send it the bytes, with one line naming the reason; `ros_gpu_stats()` gives the counters (Python and C++), `xblick-cpp-probe --cuda-device`.
 - The C++ API and programs (`xblick-cpp-camera`, `xblick-cpp-probe`, `xblick-points`) take part the same way: the options in `Options::add_session_options`, `SessionOptions::ros`, `Transport::Ros`.
 - `--no-ros` and `XBLICK_ROS=0` (only 0 and 1 are taken) turn the part in ROS 2 off; `--ros-clock KEY` sends a clock key to ROS's `/clock` for `use_sim_time`.
 - A fixed frame that another program sends on `/tf_static` with another parent or transform is one error line; a second ROS node of the program's name is one warning line.
@@ -70,6 +71,7 @@ streams, transforms and parameters, and it reads theirs.
 - A Jazzy subscriber gets no images, compressed images or clouds from a Lyrical publisher, between ROS nodes as well.
 - C++: a ROS subscriber that starts late may get a `/tf_static` message twice (zenoh-c's standalone build has no advanced publisher).
 - C++: ROS topics of any name and `auto`'s ROS form are not there yet; `Transport::Ros` reads `/<stream>/image_raw`.
+- A ROS publisher with the CUDA buffer backend decides once per subscriber: one that starts after our GPU subscriber and is on another GPU with the same CUDA ordinal sends buffers that the subscriber drops (one line says so).
 
 Compatible with 0.5.17: our own keys are unchanged, and with `--no-ros` no byte on the wire changes. New recordings
 hold one more channel, `/tf_static`, which 0.5.17 plays as the key `tf_static`.

@@ -70,6 +70,10 @@ KEEP_LAST, KEEP_ALL = 1, 2
 
 CPU_BACKENDS = "backends:cpu:"  # the 14th token part of a subscription that takes buffer types as plain CDR
 CPU_GROUP = "_buf_cpu"          # below a buffer type's key: what Lyrical's publishers send to such subscriptions
+# the 14th token part of a subscription that takes CUDA buffers (ros_cuda.GpuReceiver), as a stock one with
+# acceptable_buffer_backends "any" says it; Lyrical's publishers send to it on <key>/_buf/<its gid>
+CUDA_BACKENDS = "backends:cuda:"
+BUFFER_GROUP = "_buf"
 
 NODE, PUBLISHER, SUBSCRIPTION, SERVICE, CLIENT = "NN", "MP", "MS", "SS", "SC"
 KINDS = (NODE, PUBLISHER, SUBSCRIPTION, SERVICE, CLIENT)
@@ -424,6 +428,11 @@ def backends_of(kind: str, type_name: str, qos: Qos) -> str | None:
 def cpu_group_key(key: str) -> str:
     """The key on which Lyrical's publishers send a buffer type to ``backends:cpu:`` subscriptions."""
     return f"{key}/{CPU_GROUP}"
+
+
+def buffer_key(key: str, gid: bytes) -> str:
+    """The key on which Lyrical's publishers send a buffer type to one other buffer-aware subscription (its gid)."""
+    return f"{key}/{BUFFER_GROUP}/{gid.hex()}"
 
 
 def hash_of(type_name: str) -> str:
@@ -1145,9 +1154,12 @@ class RosNode:
         for entity in entities:
             entity._rename()
 
-    def entity_token(self, kind: str, name: str, type_name: str, qos: Qos) -> Token:
+    def entity_token(self, kind: str, name: str, type_name: str, qos: Qos, backends: str | None = None) -> Token:
+        """An entity's token; ``backends``: its 14th part in place of ``backends_of``'s."""
+        default = backends_of(kind, type_name, qos)
         return Token(self.ros.domain, self.ros.zid, self.id, self.ros.next_id(), kind, "/", self.namespace, self.name,
-                     check_ros_name(name), type_name, hash_of(type_name), qos, backends_of(kind, type_name, qos))
+                     check_ros_name(name), type_name, hash_of(type_name), qos,
+                     backends if backends is not None else default)
 
     def _add(self, entity):
         with self._lock:
@@ -1166,8 +1178,8 @@ class RosNode:
         return self._add(RosPublisher(self, topic, type_name, qos))
 
     def subscriber(self, topic: str, type_name: str, callback: Callable, qos: Qos = STREAM_QOS,
-                   daemon: bool = False) -> RosSubscriber:
-        return self._add(RosSubscriber(self, topic, type_name, callback, qos, daemon))
+                   daemon: bool = False, cuda_device: int | None = None) -> RosSubscriber:
+        return self._add(RosSubscriber(self, topic, type_name, callback, qos, daemon, cuda_device))
 
     def service(self, name: str, type_name: str, qos: Qos = PARAMETERS_QOS) -> RosService:
         return self._add(RosService(self, name, type_name, qos))
@@ -1196,12 +1208,12 @@ def _congestion(qos: Qos) -> zenoh.CongestionControl:
 
 
 class _Entity:
-    def __init__(self, node: RosNode, kind: str, name: str, type_name: str, qos: Qos):
+    def __init__(self, node: RosNode, kind: str, name: str, type_name: str, qos: Qos, backends: str | None = None):
         self.node = node
         self.topic = name
         self.type_name = type_name
         self.qos = qos
-        self.token = node.entity_token(kind, name, type_name, qos)
+        self.token = node.entity_token(kind, name, type_name, qos, backends)
         self.key = data_key(node.ros.domain, name, type_name, self.token.type_hash)
         if not re.match(r"\d+/", self.key):  # a ROS key starts with the domain: no key of ours does (topics.check_name)
             raise RosError(f"{self.key!r} is no rmw_zenoh key")
@@ -1284,13 +1296,23 @@ class RosSubscriber(_Entity):
     AdvancedSubscriber, which asks publishers it detects for their cache. A buffer type (``backends_of``): also the
     key's ``_buf_cpu``, where Lyrical's publishers send it. ``daemon``: the samples in a daemon thread of its own
     instead (a subscription the program did not ask for, such as ``Ros``'s of ``/tf_static``: zenoh-python's callback
-    thread is no daemon and would keep a program alive that ends without closing its session)."""
+    thread is no daemon and would keep a program alive that ends without closing its session).
+
+    ``cuda_device`` (a CUDA ordinal; sensor_msgs/msg/Image, not transient local): it takes frames that ROS publishers
+    have as CUDA buffers on that GPU without a copy through the CPU (ros_cuda.GpuReceiver): its token says
+    ``backends:cuda:`` and it reads ``<key>/_buf/<its gid>``; the payload of a sample in the buffer form is a
+    ``ros_cuda.Received`` (bytes with the parsed descriptor and the receiver that reads it)."""
 
     def __init__(self, node: RosNode, topic: str, type_name: str, callback: Callable, qos: Qos = STREAM_QOS,
-                 daemon: bool = False):
-        super().__init__(node, SUBSCRIPTION, topic, type_name, qos)
+                 daemon: bool = False, cuda_device: int | None = None):
+        if cuda_device is not None and (daemon or qos.durability == TRANSIENT_LOCAL):
+            raise RosError(f"{topic}: CUDA buffers come to volatile subscriptions in the program's own threads only")
+        super().__init__(node, SUBSCRIPTION, topic, type_name, qos,
+                         CUDA_BACKENDS if cuda_device is not None else None)
         self._callback = callback
         self._warned = False
+        self._gpu = None
+        self._buffer = None  # <key>/_buf/<gid>, with cuda_device
         handler = None if daemon else self._on_sample  # None: zenoh's channel, read by _Polled
         if qos.durability == TRANSIENT_LOCAL:
             import zenoh.ext as ext
@@ -1308,13 +1330,45 @@ class RosSubscriber(_Entity):
             self._declared = _Polled(self._declared, self._on_sample, f"ros {topic}")
             if self._cpu_group is not None:
                 self._cpu_group = _Polled(self._cpu_group, self._on_sample, f"ros {topic} cpu")
+        if cuda_device is not None:
+            from . import ros_cuda
+            # entered in the backend's registry before the token (a publisher decides when it discovers it)
+            self._gpu = ros_cuda.GpuReceiver(self, cuda_device)
+            self._buffer = self._raw.declare_subscriber(buffer_key(self.key, self.gid), self._on_sample)
         self._announce()
+
+    def _rename(self):
+        if self._gpu is None:
+            super()._rename()
+            return
+        # the gid follows the token: the registry entry (before the new token) and the buffer key too
+        node = self.node
+        self.token = dataclasses.replace(self.token, namespace=node.namespace, node=node.name)
+        self.gid = gid(self.token.key())
+        node.ros.own(self.gid)
+        self._gpu.set_gid(self.gid)
+        old, self._buffer = self._buffer, self._raw.declare_subscriber(buffer_key(self.key, self.gid),
+                                                                      self._on_sample)
+        old.undeclare()
+        if self._live is not None:
+            self._live.undeclare()
+            self._announce()
+
+    @property
+    def gpu(self):
+        """The ros_cuda.GpuReceiver of a subscription with cuda_device, else None."""
+        return self._gpu
 
     def close(self):
         super().close()
         if self._cpu_group is not None:
             self._cpu_group.undeclare()
             self._cpu_group = None
+        if self._buffer is not None:
+            self._buffer.undeclare()
+            self._buffer = None
+        if self._gpu is not None:
+            self._gpu.close()
 
     def _on_sample(self, sample: zenoh.Sample):
         try:
@@ -1325,7 +1379,10 @@ class RosSubscriber(_Entity):
                 log.warning(f"{self.topic}: a sample dropped, as ROS drops it: {error}")
             return
         try:
-            self._callback(sample.payload.to_bytes(), seq, stamp, publisher)
+            payload = sample.payload.to_bytes()
+            if self._gpu is not None:
+                payload = self._gpu.received(payload)
+            self._callback(payload, seq, stamp, publisher)
         except Exception:  # noqa: BLE001 - a bad sample must not end the subscription
             log.exception(f"{self.topic}: a sample its reader could not take")
 

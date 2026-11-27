@@ -3,7 +3,7 @@
 //
 //   xblick-cpp-probe --connect host:7447 --base test/camera/color --transport auto|raw|compressed|shm|cuda|ros
 //                        [--view] [--frames 10] [--timeout 10] [--camera-info] [--camera-info-topic TOPIC]
-//                        [--points [--local cuda]] [--max-hz 5]
+//                        [--points [--local cuda]] [--max-hz 5] [--cuda-device N] [--check-pattern]
 //   xblick-cpp-probe --connect host:7447 --params <namespace>/<name> [--set NAME:=VALUE]
 //   xblick-cpp-probe --connect host:7447 --tf-static <camera> [--via-ros] [--timeout 10]
 //
@@ -12,7 +12,9 @@
 // additional_constraints).
 // --points: a point cloud stream (points.hpp); a line per cloud with its fields instead of the encoding.
 // A --base with a leading / is a ROS 2 topic (ImageSubscriber, PointCloudSubscriber); --camera-info-topic reads the
-// CameraInfo of a ROS form from that topic (SubscriberOptions::camera_info_topic).
+// CameraInfo of a ROS form from that topic (SubscriberOptions::camera_info_topic). --cuda-device: the subscriber works
+// on that GPU (SubscriberOptions::cuda_device; a ROS publisher's CUDA buffers come there, their counters on stderr at
+// the end); --check-pattern: each frame's mismatches against the tests' pattern (frame_id "xb:<seed>").
 // --connect, --listen, --zenoh-mode peer|client: the Zenoh session (SessionOptions); none of them: the PC's router.
 #include <chrono>
 #include <csignal>
@@ -351,6 +353,11 @@ int main(int argc, char** argv)
         options.camera_info = args.flag("camera-info");
         options.camera_info_topic = args.get("camera-info-topic", "");
         options.max_hz = std::stod(args.get("max-hz", "0"));
+        if (args.flag("cuda-device"))
+        {
+            options.cuda_device = std::stoi(args.get("cuda-device", "0"));
+        }
+        const bool check_pattern = args.flag("check-pattern");
         ImageSubscriber images(session, args.get("base", "test/camera/color"), options);
         const int frames = std::stoi(args.get("frames", "10"));
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(std::stod(args.get("timeout", "10")));
@@ -375,9 +382,33 @@ int main(int argc, char** argv)
                            ",\"model\":" + ::quoted(ci->distortion_model) + "}";
                 }
             }
+            std::string pattern = "null";
+            if (check_pattern)  // byte i = (i * 13 + seed) & 0xFF, seed in frame_id "xb:<seed>" (the tests' pattern)
+            {
+                const std::string& id = frame->header.frame_id;
+                const std::uint32_t seed = id.rfind("xb:", 0) == 0 ? std::stoul(id.substr(3)) : 0;
+                std::vector<std::uint8_t> bytes;
+                const std::uint8_t* p = frame->data();
+                const std::size_t n = static_cast<std::size_t>(row) * frame->height;
+                if (frame->device_ptr != 0)
+                {
+                    auto buffer = std::static_pointer_cast<const DeviceBuffer>(frame->owner);
+                    bytes.resize(buffer->nbytes());
+                    buffer->download(bytes.data());
+                    p = bytes.data();
+                }
+                std::uint64_t bad = 0;
+                for (std::size_t i = 0; i < n; ++i)
+                {
+                    bad += p[i] != static_cast<std::uint8_t>((i * 13u + seed) & 0xFFu);
+                }
+                pattern = std::to_string(bad);
+            }
             const auto t = images.transport();
             std::cout << "{\"seq\":" << frame->seq.value_or(-1) << ",\"encoding\":\"" << frame->encoding
-                      << "\",\"height\":" << frame->height << ",\"width\":" << frame->width
+                      << "\",\"frame_id\":" << ::quoted(frame->header.frame_id) << ",\"device\":" << frame->device
+                      << ",\"mismatches\":" << pattern
+                      << ",\"height\":" << frame->height << ",\"width\":" << frame->width
                       << ",\"transport\":\"" << (t ? to_string(*t) : "?") << "\",\"checksum\":" << sum
                       << ",\"source\":\"" << frame->source << "\",\"stamp_ns\":" << frame->stamp_ns()
                       << ",\"age_at_send_ns\":"
@@ -385,6 +416,12 @@ int main(int argc, char** argv)
                       << ",\"valid\":" << (frame->is_valid() ? "true" : "false") << ",\"camera_info\":" << info
                       << ",\"reason\":" << ::quoted(images.transport_reason()) << "}"
                       << std::endl;
+        }
+        if (const auto gpu = images.ros_gpu_stats())
+        {
+            std::cerr << "xblick-cpp-probe: ros gpu {\"copied\":" << gpu->copied << ",\"stale\":" << gpu->stale
+                      << ",\"refused\":" << gpu->refused << ",\"blocks\":" << gpu->blocks
+                      << ",\"registered\":" << (gpu->registered ? "true" : "false") << "}" << std::endl;
         }
         std::cerr << "xblick-cpp-probe: " << got << " frames, stale " << images.stale() << ", skipped for max-hz "
                   << images.skipped_max_hz() << std::endl;

@@ -361,6 +361,11 @@ namespace xblick
         return buffer;
     }
 
+    std::shared_ptr<DevicePool> make_device_pool(int device)
+    {
+        return std::make_shared<DevicePool>(device);
+    }
+
     void DeviceBuffer::download(void* dst) const
     {
         ContextGuard guard(pool_->primary.context);

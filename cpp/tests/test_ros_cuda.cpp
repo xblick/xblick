@@ -110,6 +110,44 @@ int main()
         return 1;
     }
     made.reset();
+
+    // the other direction: the stock message parsed back, the CPU form is none; a receiver writes nothing before a
+    // publisher is decided, and refuses a descriptor of a process it did not decide
+    const auto parsed = rc::parse_image_payload(stock.data(), stock.size());
+    if (not parsed or parsed->header.frame_id != "s0:16" or parsed->header.step != 192 or
+        parsed->descriptor.pid != d.pid or parsed->descriptor.block_size != d.block_size or
+        parsed->descriptor.socket_path != d.socket_path or parsed->descriptor.uid != d.uid or
+        parsed->descriptor.event != d.event)
+    {
+        std::printf("FAIL: the stock descriptor message parsed\n");
+        return 1;
+    }
+    const std::vector<std::uint8_t> cpu_form = from_hex("0001000001000000020000000200000066000000010000000200000006"
+                                                        "0000006d6f6e6f38000000020000000200000061620000");
+    if (rc::parse_image_payload(cpu_form.data(), cpu_form.size()))
+    {
+        std::printf("FAIL: the CPU form parsed as a buffer\n");
+        return 1;
+    }
+    try
+    {
+        rc::Receiver missing("/t/image_raw", 0, "/nonexistent-xblick-test", {});
+        std::printf("FAIL: a receiver with a shm directory that is none\n");
+        return 1;
+    }
+    catch (const std::invalid_argument&)
+    {
+    }
+    {
+        rc::Receiver receiver("/t/image_raw", 0, empty, {3});
+        receiver.add_publisher("pub", {4}, "/pub");
+        receiver.refresh();  // not in a registry: undecided, no entry
+        if (receiver.stats().registered or receiver.take(parsed->descriptor) or receiver.stats().refused != 1)
+        {
+            std::printf("FAIL: a receiver without a decided publisher\n");
+            return 1;
+        }
+    }
     ::rmdir(empty);
     std::printf("ok\n");
     return 0;

@@ -25,6 +25,7 @@
 #include "xblick/protocol.hpp"
 #include "xblick/ring.hpp"
 #include "xblick/ros.hpp"
+#include "xblick/ros_cuda.hpp"
 
 namespace xblick::detail
 {
@@ -72,6 +73,8 @@ namespace xblick::detail
         std::string encoding;
         std::int64_t receive_ns = 0;
         Transport transport = Transport::Auto;  // the transport it came by
+        // a ROS form's sample of a subscription with a cuda_device (ros::Subscriber): reads it when it is a CUDA buffer
+        std::shared_ptr<ros_cuda::Receiver> receiver;
     };
 
     // How long a subscription that changes its transport keeps the old one for the new one's first frame; after
@@ -137,10 +140,16 @@ namespace xblick::detail
 
     // A ROS subscription (a ROS form, a session in ROS 2) to `topic`: each sample into `latest` (route `route`) as
     // one of ours of `type` (its encoding), by `transport`, without our attachment (no seq, source or publish time).
-    // std::invalid_argument for a session that takes no part in ROS 2.
+    // cuda_device: it takes CUDA buffers on that GPU (ros::Subscriber's; publishers: those known now), its samples
+    // carry the receiver. std::invalid_argument for a session that takes no part in ROS 2.
     std::unique_ptr<ros::Subscriber> ros_subscriber(zenoh::Session& session, const std::string& topic,
                                                     const protocol::MessageType& type, std::shared_ptr<Latest> latest,
-                                                    int route, Transport transport = Transport::Ros);
+                                                    int route, Transport transport = Transport::Ros,
+                                                    std::optional<int> cuda_device = std::nullopt,
+                                                    const std::vector<ros::Token>& publishers = {});
+    // The GPU on which a ROS form of `type` is read as CUDA buffers by a subscriber that works on `cuda_device`:
+    // that one for sensor_msgs/msg/Image unless ros_cuda::kEnableEnv is 0, else none.
+    std::optional<int> ros_cuda_device(const protocol::MessageType& type, std::optional<int> cuda_device);
 
     // A form of a stream on ROS: its transport (Ros, RosCompressed), its topic and message type.
     struct RosForm
@@ -243,6 +252,8 @@ namespace xblick::detail
         // The publishers in ROS's graph (of `topic` or all) once the graph is made (for a ROS name or a ROS transport
         // at the start, else at Auto's first need); none before.
         std::vector<ros::Token> ros_publishers(const std::optional<std::string>& topic = std::nullopt) const;
+        // The receiver of the ROS form in use when it takes CUDA buffers, else null.
+        std::shared_ptr<ros_cuda::Receiver> ros_receiver() const;
         std::chrono::steady_clock::time_point started() const { return started_; }
 
     private:

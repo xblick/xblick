@@ -5,12 +5,17 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <semaphore.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
+
+#include <ctime>
+#include <span>
 
 #include <algorithm>
 #include <atomic>
@@ -37,7 +42,7 @@ namespace xblick::ros_cuda
     namespace
     {
         // ------------------------------------------------------------------------------------- driver API
-        // The functions the pool needs, looked up as the CUDA ring looks up its own (cuda_ring.cpp): libcuda.so.1 at
+        // The functions the pool and the Receiver need, looked up as the CUDA ring looks up its own (cuda_ring.cpp): libcuda.so.1 at
         // run time, CUDA 12.0 ABI. A table of its own keeps the ring's file as it is.
 
         constexpr int kDriverAbi = 12000;
@@ -59,7 +64,15 @@ namespace xblick::ros_cuda
     X(cuMemMap)                                                                                                      \
     X(cuMemUnmap)                                                                                                    \
     X(cuMemSetAccess)                                                                                                \
-    X(cuMemExportToShareableHandle)
+    X(cuMemExportToShareableHandle)                                                                                  \
+    X(cuMemImportFromShareableHandle)                                                                                \
+    X(cuIpcOpenEventHandle)                                                                                          \
+    X(cuEventDestroy)                                                                                                \
+    X(cuStreamCreate)                                                                                                \
+    X(cuStreamDestroy)                                                                                               \
+    X(cuStreamWaitEvent)                                                                                             \
+    X(cuStreamSynchronize)                                                                                           \
+    X(cuMemcpyDtoDAsync)
 
         struct Driver
         {
@@ -1443,38 +1456,82 @@ namespace xblick::ros_cuda
     const std::string& Link::socket_dir() const { return impl_->socket_dir; }
     const std::string& Link::shm_dir() const { return impl_->shm_dir; }
 
+
+    namespace
+    {
+        // Whether the process of a registry entry (a reader or a publisher) shares CUDA blocks with this program on
+        // its GPU `device` (own: the device file minor of that GPU): this Linux user, a backend with an IPC-capable
+        // memory pool, a process seen from here (the same pid namespace), this GPU. And why not.
+        std::pair<bool, std::string> shares_gpu(const RegistryEntry& entry, int device, std::optional<int> own)
+        {
+            if (entry.uid != ::getuid())
+            {
+                return {false, "it runs as Linux user " + std::to_string(entry.uid) + ", this program as " +
+                                   std::to_string(::getuid())};
+            }
+            if (not entry.ipc_capable)
+            {
+                return {false, "its backend cannot share CUDA buffers (no IPC-capable memory pool)"};
+            }
+            const int pid = entry.pid();
+            std::set<int> theirs;
+            std::map<std::string, std::string> env;
+            try
+            {
+                if (not maps_registry(pid, registry_name()))
+                {
+                    throw RingError("the process there does not map the registry");
+                }
+                theirs = gpu_minors(std::to_string(pid));
+                env = environment_of(pid);
+            }
+            catch (const RingError& error)
+            {
+                return {false, "its process " + std::to_string(pid) + " cannot be seen from here (" + error.what() +
+                                   "): it needs this program's pid namespace"};
+            }
+            if (not own)
+            {
+                return {false, "this program cannot tell its own GPU's device file (/proc/driver/nvidia/gpus)"};
+            }
+            if (theirs.size() == 1)
+            {
+                if (*theirs.begin() != *own)
+                {
+                    return {false, "it uses GPU /dev/nvidia" + std::to_string(*theirs.begin()) +
+                                       ", this program /dev/nvidia" + std::to_string(*own)};
+                }
+                return {true, ""};
+            }
+            bool same_numbering = theirs == gpu_minors("self");
+            for (const char* name : kGpuEnv)
+            {
+                const char* mine = std::getenv(name);
+                const auto found = env.find(name);
+                const bool theirs_set = found != env.end();
+                same_numbering = same_numbering and theirs_set == (mine != nullptr) and
+                                 (not theirs_set or found->second == mine);
+            }
+            if (not same_numbering)
+            {
+                return {false, "it sees several GPUs, numbered otherwise than here (its CUDA_VISIBLE_DEVICES and "
+                               "CUDA_DEVICE_ORDER, its GPUs): the backend compares CUDA ordinals only"};
+            }
+            if (entry.device_id != device)
+            {
+                return {false, "it uses CUDA device " + std::to_string(entry.device_id) + ", this program " +
+                                   std::to_string(device)};
+            }
+            return {true, ""};
+        }
+    }  // namespace
+
     std::pair<bool, std::string> Link::importable(const RegistryEntry& entry) const
     {
         const Impl& m = *impl_;
         if (entry.entity_type != kSubscription)
         {
             return {false, "its registry entry is no subscription"};
-        }
-        if (entry.uid != ::getuid())
-        {
-            return {false, "it runs as Linux user " + std::to_string(entry.uid) + ", this program as " +
-                               std::to_string(::getuid())};
-        }
-        if (not entry.ipc_capable)
-        {
-            return {false, "its backend cannot import CUDA buffers (no IPC-capable memory pool)"};
-        }
-        const int pid = entry.pid();
-        std::set<int> theirs;
-        std::map<std::string, std::string> env;
-        try
-        {
-            if (not maps_registry(pid, registry_name()))
-            {
-                throw RingError("the process there does not map the registry");
-            }
-            theirs = gpu_minors(std::to_string(pid));
-            env = environment_of(pid);
-        }
-        catch (const RingError& error)
-        {
-            return {false, "its process " + std::to_string(pid) + " cannot be seen from here (" + error.what() +
-                               "): it needs this program's pid namespace"};
         }
         std::optional<int> own;
         {
@@ -1485,38 +1542,896 @@ namespace xblick::ros_cuda
             }
             own = m.own_minor;
         }
-        if (not own)
+        return shares_gpu(entry, m.device, own);
+    }
+
+    // ------------------------------------------------------------------------------- the link from ROS publishers
+
+    std::optional<BufferImage> parse_image_payload(const std::uint8_t* payload, std::size_t size)
+    {
+        try
         {
-            return {false, "this program cannot tell its own GPU's device file (/proc/driver/nvidia/gpus)"};
-        }
-        if (theirs.size() == 1)
-        {
-            if (*theirs.begin() != *own)
+            ros2_cdr::CdrReader r(std::span<const std::uint8_t>(payload, size));
+            BufferImage out;
+            ImageHeader& h = out.header;
+            h.sec = r.i32();
+            h.nanosec = r.u32();
+            h.frame_id = r.string();
+            h.height = r.u32();
+            h.width = r.u32();
+            h.encoding = r.string();
+            h.is_bigendian = r.u8();
+            h.step = r.u32();
+            if (r.u32() != kMarker)
             {
-                return {false, "it uses GPU /dev/nvidia" + std::to_string(*theirs.begin()) + ", this program /dev/nvidia" +
-                                   std::to_string(*own)};
+                return std::nullopt;  // the data's length: the CPU form
+            }
+            if (r.u32() != kMarkerRos2)
+            {
+                throw RingError("a sensor_msgs/Image with the first marker word of a buffer but not the second");
+            }
+            const std::string backend = r.string();
+            if (backend != kBackend)
+            {
+                throw RingError("a sensor_msgs/Image whose data is a buffer of the backend '" + backend +
+                                "': this program reads the backend '" + kBackend + "' only");
+            }
+            Descriptor& d = out.descriptor;
+            d.size = r.u64();
+            const std::string element = r.string();
+            if (element != kElementType)
+            {
+                throw RingError("a CUDA buffer descriptor of element type '" + element + "', not uint8 ('" +
+                                kElementType + "')");
+            }
+            d.device_id = r.i32();
+            d.use_ipc = r.u8() != 0;
+            d.pid = r.i32();
+            d.block_id = r.u32();
+            d.block_size = r.u64();
+            d.socket_path = r.string();
+            d.uid = r.u64();
+            for (std::uint8_t& b : d.event)
+            {
+                b = r.u8();
+            }
+            return out;
+        }
+        catch (const ros2_cdr::CdrError& error)
+        {
+            throw RingError(std::string("a sensor_msgs/Image that cannot be read: ") + error.what());
+        }
+    }
+
+    namespace
+    {
+        constexpr std::uint8_t kPublisherEntity = 0;
+        constexpr int kSemaphoreWaitS = 2;  // the backend's own wait for the registry's semaphore
+
+        // The backend's registry below shm_dir, mapped writable and locked by its named semaphore as the backend
+        // locks it (glibc keeps sem_open's semaphore in <shm_dir>/sem.<name>; mapped here, so that another
+        // directory than /dev/shm works too). RingError when either cannot be opened (no ROS process with the
+        // backend; a registry of another Linux user, mode 0644) or the semaphore is not free within 2 s.
+        class LockedRegistry
+        {
+        public:
+            explicit LockedRegistry(const std::string& shm_dir)
+            {
+                const std::string path = shm_dir + "/" + registry_name();
+                registry_ = static_cast<EndpointRegistry*>(map(path, sizeof(EndpointRegistry)));
+                const std::string semaphore = shm_dir + "/sem." + registry_name() + "_mtx";
+                try
+                {
+                    semaphore_ = static_cast<sem_t*>(map(semaphore, sizeof(sem_t)));
+                }
+                catch (...)
+                {
+                    ::munmap(registry_, sizeof(EndpointRegistry));
+                    throw;
+                }
+                timespec until{};
+                ::clock_gettime(CLOCK_REALTIME, &until);
+                until.tv_sec += kSemaphoreWaitS;
+                int result = 0;
+                while ((result = ::sem_timedwait(semaphore_, &until)) != 0 and errno == EINTR)
+                {
+                }
+                if (result != 0)
+                {
+                    const std::string why = errno_text();
+                    unmap();
+                    throw RingError(semaphore + " not free within " + std::to_string(kSemaphoreWaitS) + " s: " + why);
+                }
+                if (registry_->version != 1)
+                {
+                    const std::uint32_t version = registry_->version;
+                    ::sem_post(semaphore_);
+                    unmap();
+                    throw RingError(path + ": registry version " + std::to_string(version) + ", this program knows 1");
+                }
+            }
+            ~LockedRegistry()
+            {
+                ::sem_post(semaphore_);
+                unmap();
+            }
+            LockedRegistry(const LockedRegistry&) = delete;
+            LockedRegistry& operator=(const LockedRegistry&) = delete;
+            EndpointRegistry& operator*() { return *registry_; }
+
+        private:
+            static void* map(const std::string& path, std::size_t size)
+            {
+                const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+                if (fd < 0)
+                {
+                    throw RingError("cannot open " + path + " to write: " + errno_text());
+                }
+                struct stat s{};
+                if (::fstat(fd, &s) != 0 or static_cast<std::size_t>(s.st_size) < size)
+                {
+                    ::close(fd);
+                    throw RingError(path + ": " + std::to_string(s.st_size) + " bytes, not the " +
+                                    std::to_string(size) + " of the CUDA buffer backend (version 1)");
+                }
+                void* p = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+                ::close(fd);
+                if (p == MAP_FAILED)
+                {
+                    throw RingError("mmap " + path + ": " + errno_text());
+                }
+                return p;
+            }
+            void unmap()
+            {
+                ::munmap(semaphore_, sizeof(sem_t));
+                ::munmap(registry_, sizeof(EndpointRegistry));
+            }
+
+            EndpointRegistry* registry_ = nullptr;
+            sem_t* semaphore_ = nullptr;
+        };
+
+        // The backend's register_endpoint for a subscription: its gid's slot, else an inactive one, else a new one.
+        void write_entry(const std::string& shm_dir, const std::array<std::uint8_t, 16>& gid, std::uint64_t instance_id,
+                         std::int32_t device_id, bool ipc_capable, const std::string& name)
+        {
+            LockedRegistry locked(shm_dir);
+            EndpointRegistry& r = *locked;
+            const std::uint32_t count = std::min<std::uint32_t>(r.num_entries, kMaxEndpoints);
+            EndpointEntry* slot = nullptr;
+            for (std::uint32_t i = 0; i < count and slot == nullptr; ++i)
+            {
+                if (std::memcmp(r.entries[i].gid, gid.data(), 16) == 0)
+                {
+                    slot = &r.entries[i];
+                }
+            }
+            for (std::uint32_t i = 0; i < count and slot == nullptr; ++i)
+            {
+                if (not r.entries[i].active)
+                {
+                    slot = &r.entries[i];
+                }
+            }
+            if (slot == nullptr)
+            {
+                if (r.num_entries >= std::min<std::uint32_t>(r.max_entries, kMaxEndpoints))
+                {
+                    throw RingError("the CUDA buffer backend's registry is full (" + std::to_string(r.num_entries) +
+                                    " entries)");
+                }
+                slot = &r.entries[r.num_entries];
+                ++r.num_entries;
+            }
+            slot->instance_id = instance_id;
+            std::memcpy(slot->gid, gid.data(), 16);
+            slot->entity_type = kSubscription;
+            slot->device_id = device_id;
+            slot->uid = ::getuid();
+            slot->ipc_capable = ipc_capable;
+            std::memset(slot->padding, 0, sizeof(slot->padding));
+            std::memset(slot->name, 0, sizeof(slot->name));
+            std::memcpy(slot->name, name.data(), std::min(name.size(), sizeof(slot->name) - 1));
+            slot->active = true;
+        }
+
+        // The entry of gid written by instance_id inactive (as the backend's own entries go at its end).
+        void deactivate_entry(const std::string& shm_dir, const std::array<std::uint8_t, 16>& gid,
+                              std::uint64_t instance_id)
+        {
+            LockedRegistry locked(shm_dir);
+            EndpointRegistry& r = *locked;
+            const std::uint32_t count = std::min<std::uint32_t>(r.num_entries, kMaxEndpoints);
+            for (std::uint32_t i = 0; i < count; ++i)
+            {
+                EndpointEntry& e = r.entries[i];
+                if (e.active and e.instance_id == instance_id and std::memcmp(e.gid, gid.data(), 16) == 0)
+                {
+                    e.active = false;
+                }
+            }
+        }
+
+        std::uint64_t next_instance_id()  // as the backend's: the pid in the upper 32 bits, a counter below
+        {
+            static std::atomic<std::uint32_t> next{0x80000000u};
+            return (static_cast<std::uint64_t>(::getpid()) << 32) | next.fetch_add(1);
+        }
+
+        // A block's record mapped writable; null when it does not exist (its block is gone). RingError when it
+        // cannot be opened or is no record.
+        Record* open_record(const std::string& path)
+        {
+            const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+            if (fd < 0)
+            {
+                if (errno == ENOENT)
+                {
+                    return nullptr;
+                }
+                throw RingError("cannot open the block's record " + path + " to hold it: " + errno_text());
+            }
+            struct stat s{};
+            if (::fstat(fd, &s) != 0 or static_cast<std::size_t>(s.st_size) < sizeof(Record))
+            {
+                ::close(fd);
+                throw RingError(path + " is no record of a block (" + std::to_string(s.st_size) + " bytes)");
+            }
+            void* p = ::mmap(nullptr, sizeof(Record), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            ::close(fd);
+            if (p == MAP_FAILED)
+            {
+                throw RingError("mmap " + path + ": " + errno_text());
+            }
+            return static_cast<Record*>(p);
+        }
+
+        // The block's file descriptor from its publisher's socket: the socket file at `name` (release 0.1.2) where
+        // one is, else the abstract socket of that name (the current source). The server must be of this Linux user.
+        int fetch_fd(const std::string& name)
+        {
+            struct stat s{};
+            const bool file = not name.empty() and name[0] == '/' and ::lstat(name.c_str(), &s) == 0 and
+                              S_ISSOCK(s.st_mode);
+            const std::string shown = (file ? "" : "@") + name;
+            const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+            if (fd < 0)
+            {
+                throw RingError("socket: " + errno_text());
+            }
+            const timeval wait{2, 0};
+            ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &wait, sizeof(wait));
+            socklen_t length = 0;
+            const sockaddr_un address = address_of(name, not file, &length);
+            if (::connect(fd, reinterpret_cast<const sockaddr*>(&address), length) != 0)
+            {
+                const std::string why = errno_text();
+                ::close(fd);
+                throw RingError("cannot connect to the block's socket " + shown + ": " + why);
+            }
+            ucred peer{};
+            socklen_t peer_length = sizeof(peer);
+            if (::getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer, &peer_length) != 0 or peer.uid != ::getuid())
+            {
+                ::close(fd);
+                throw RingError("the block's socket " + shown + " is served by Linux user " + std::to_string(peer.uid) +
+                                ", not by this program's " + std::to_string(::getuid()));
+            }
+            char byte = 0;
+            iovec io{&byte, 1};
+            alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int))] = {};
+            msghdr message{};
+            message.msg_iov = &io;
+            message.msg_iovlen = 1;
+            message.msg_control = control;
+            message.msg_controllen = sizeof(control);
+            const ssize_t n = ::recvmsg(fd, &message, MSG_CMSG_CLOEXEC);
+            const std::string why = n < 0 ? errno_text() : std::string("no file descriptor came");
+            ::close(fd);
+            const cmsghdr* c = n == 1 ? CMSG_FIRSTHDR(&message) : nullptr;
+            if (c == nullptr or c->cmsg_level != SOL_SOCKET or c->cmsg_type != SCM_RIGHTS or
+                c->cmsg_len != CMSG_LEN(sizeof(int)))
+            {
+                throw RingError("the block's socket " + shown + " gave no file descriptor: " + why);
+            }
+            int received = -1;
+            std::memcpy(&received, CMSG_DATA(c), sizeof(int));
+            return received;
+        }
+
+        // Whether a publisher's process has this program's /dev/shm: CUDA keeps an interprocess event there, and the
+        // backend's publisher sends one with each descriptor (its write into the block), which a process with
+        // another /dev/shm cannot open (CUDA_ERROR_MAP_FAILED). And why not.
+        std::pair<bool, std::string> shares_shm(int pid)
+        {
+            struct stat theirs{}, mine{};
+            const std::string path = "/proc/" + std::to_string(pid) + "/root/dev/shm";
+            if (::stat(path.c_str(), &theirs) != 0)
+            {
+                return {false, "its /dev/shm cannot be seen from here (" + path + ": " + errno_text() + ")"};
+            }
+            if (::stat("/dev/shm", &mine) != 0)
+            {
+                return {false, "this program has no /dev/shm (" + errno_text() + ")"};
+            }
+            if (theirs.st_dev != mine.st_dev or theirs.st_ino != mine.st_ino)
+            {
+                return {false, "it has another /dev/shm than this program (a container without --ipc host?): the "
+                               "CUDA events that come with its buffers cannot be opened here"};
             }
             return {true, ""};
         }
-        bool same_numbering = theirs == gpu_minors("self");
-        for (const char* name : kGpuEnv)
+
+        struct KnownPublisher
         {
-            const char* mine = std::getenv(name);
-            const auto found = env.find(name);
-            const bool theirs_set = found != env.end();
-            same_numbering = same_numbering and theirs_set == (mine != nullptr) and
-                             (not theirs_set or found->second == mine);
-        }
-        if (not same_numbering)
+            std::array<std::uint8_t, 16> gid{};
+            std::string node;
+            std::optional<bool> shares;  // none: not decided yet (not in the registry)
+            std::string reason;          // why not
+            int pid = 0;
+            std::int32_t device_id = -1;  // its CUDA ordinal (the registry's)
+            std::uint32_t uid = 0;
+            double seen = seconds_now();
+            double checked = -1e9;
+            bool said = false;  // that it is not in the registry
+            bool told = false;  // what it sends, once the entry is there
+        };
+
+        struct Import
         {
-            return {false, "it sees several GPUs, numbered otherwise than here (its CUDA_VISIBLE_DEVICES and "
-                           "CUDA_DEVICE_ORDER, its GPUs): the backend compares CUDA ordinals only"};
-        }
-        if (entry.device_id != m.device)
+            Record* record = nullptr;
+            CUmemGenericAllocationHandle handle{};
+            CUdeviceptr va = 0;
+            std::uint64_t size = 0;
+        };
+    }  // namespace
+
+    struct Receiver::Impl
+    {
+        std::string topic;
+        int device = 0;
+        std::string shm_dir;
+        std::array<std::uint8_t, 16> gid{};
+        std::uint64_t instance_id = next_instance_id();
+        mutable std::mutex mutex;  // everything below
+        std::map<std::string, KnownPublisher> publishers;
+        std::optional<std::int32_t> entry_device;  // the ordinal in the subscription's entry; none: no entry
+        bool entry_ipc = false;                    // the entry says it can import (else: the CPU form, please)
+        double entry_tried = -1e9;
+        std::vector<Note> notes;
+        std::set<std::string> said;
+        std::map<std::pair<int, std::uint32_t>, Import> imports;  // (pid, block id)
+        std::set<int> gone;  // pids of publishers whose token went
+        std::uint64_t copied = 0, stale = 0, refused = 0;
+        std::optional<std::optional<int>> own_minor;
+        bool started = false;
+        CUdevice cu_device{};
+        CUcontext context{};
+        CUstream stream{};
+        std::shared_ptr<DevicePool> pool;
+
+        void say_once(const std::string& kind, bool warning, const std::string& text)
         {
-            return {false, "it uses CUDA device " + std::to_string(entry.device_id) + ", this program " +
-                               std::to_string(m.device)};
+            if (said.insert(kind).second)
+            {
+                notes.push_back({warning, text});
+            }
         }
-        return {true, ""};
+
+        std::optional<int> own()
+        {
+            if (not own_minor)
+            {
+                own_minor = minor_of(cuda_device_uuid(device));
+            }
+            return *own_minor;
+        }
+
+        void start()
+        {
+            if (started)
+            {
+                return;
+            }
+            CU(cuDeviceGet(&cu_device, device));
+            CU(cuDevicePrimaryCtxRetain(&context, cu_device));
+            started = true;
+            ContextGuard guard(context);
+            CU(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
+            pool = make_device_pool(device);
+        }
+
+        void unmap(Import& i)
+        {
+            if (i.va != 0)
+            {
+                ContextGuard guard(context);
+                driver().cuMemUnmap(i.va, i.size);
+                driver().cuMemAddressFree(i.va, i.size);
+                i.va = 0;
+            }
+            if (i.handle != 0)
+            {
+                driver().cuMemRelease(i.handle);
+                i.handle = 0;
+            }
+            if (i.record != nullptr)
+            {
+                ::munmap(i.record, sizeof(Record));
+                i.record = nullptr;
+            }
+        }
+
+        void forget(int pid)
+        {
+            for (auto it = imports.begin(); it != imports.end();)
+            {
+                if (it->first.first == pid)
+                {
+                    unmap(it->second);
+                    it = imports.erase(it);
+                }
+                else
+                {
+                    ++it;
+                }
+            }
+        }
+
+        // The publishers not decided yet looked up in the registry (each every kRecheckS; all at once with now_all).
+        void decide(double now, bool now_all)
+        {
+            for (auto& [key, p] : publishers)
+            {
+                if (p.shares or (not now_all and now - p.checked < kRecheckS))
+                {
+                    continue;
+                }
+                p.checked = now;
+                std::optional<RegistryEntry> entry;
+                try
+                {
+                    entry = registry_lookup(shm_dir, p.gid);
+                }
+                catch (const RingError& error)
+                {
+                    say_once("registry", true, topic + ": " + error.what() + ": the ROS publishers send the CPU form");
+                    continue;
+                }
+                if (not entry)
+                {
+                    if (now - p.seen > kUnknownS and not p.said)
+                    {
+                        p.said = true;
+                        notes.push_back({true, topic + ": ROS publisher " + p.node + " sends the CPU form: it is not "
+                                                       "in the CUDA buffer backend's registry in " + shm_dir +
+                                                       " (another host, another /dev/shm, or no backend plugin)"});
+                    }
+                    continue;
+                }
+                std::pair<bool, std::string> decision{false, "its registry entry is no publisher"};
+                if (entry->entity_type == kPublisherEntity)
+                {
+                    decision = shares_gpu(*entry, device, own());
+                }
+                if (decision.first)
+                {
+                    decision = shares_shm(entry->pid());
+                }
+                p.shares = decision.first;
+                p.reason = decision.second;
+                p.pid = entry->pid();
+                p.device_id = entry->device_id;
+                p.uid = entry->uid;
+            }
+        }
+
+        // The subscription's entry, once: "can import" with the ordinal of the first publisher decided to be on this
+        // GPU; "cannot import" when publishers are decided and none is; with none decided, as a stock subscription
+        // enters itself ("can import", this program's ordinal), so that a publisher that starts later decides by the
+        // backend's own rule (Linux user, CUDA ordinal).
+        void try_enter(double now)
+        {
+            const KnownPublisher* sharing = nullptr;
+            bool decided = false;
+            for (const auto& [key, p] : publishers)
+            {
+                decided = decided or p.shares.has_value();
+                if (p.shares.value_or(false) and sharing == nullptr)
+                {
+                    sharing = &p;
+                }
+            }
+            const bool ipc = sharing != nullptr or not decided;
+            const std::int32_t ordinal = sharing != nullptr ? sharing->device_id : device;
+            try
+            {
+                write_entry(shm_dir, gid, instance_id, ordinal, ipc, topic);
+                entry_device = ordinal;
+                entry_ipc = ipc;
+            }
+            catch (const RingError& error)
+            {
+                entry_tried = now;
+                std::ostringstream again;
+                again << kRecheckS;
+                say_once("entry", true, topic + ": this subscription cannot enter the CUDA buffer backend's registry (" +
+                                            error.what() + "), tried again every " + again.str() + " s: until "
+                                            "then a ROS publisher of release 0.1.2 sends it descriptors, read from "
+                                            "publishers on this GPU only, one of the current source the CPU form");
+            }
+        }
+
+        // What each decided publisher sends, said once the entry is there. A publisher decides by the backend's rule
+        // when it discovers the subscription: descriptors when the entry says "can import" with its Linux user and
+        // CUDA ordinal.
+        void tell()
+        {
+            if (not entry_device)
+            {
+                return;
+            }
+            for (auto& [key, p] : publishers)
+            {
+                if (not p.shares or p.told)
+                {
+                    continue;
+                }
+                p.told = true;
+                const bool by_rule = entry_ipc and *entry_device == p.device_id and p.uid == ::getuid();
+                if (*p.shares and by_rule)
+                {
+                    notes.push_back({false, topic + ": ROS publisher " + p.node + " uses this GPU: the frames it has "
+                                                    "as CUDA buffers come as such"});
+                }
+                else if (*p.shares)
+                {
+                    notes.push_back({true, topic + ": ROS publisher " + p.node + " sends the CPU form: this "
+                                                   "subscription's registry entry, written when it started, says " +
+                                                   (entry_ipc ? "CUDA device " + std::to_string(*entry_device) +
+                                                                    ", the publisher numbers this GPU " +
+                                                                    std::to_string(p.device_id)
+                                                              : std::string("it cannot import")) +
+                                                   " (a publisher decides once, when it discovers a subscription)"});
+                }
+                else if (by_rule)
+                {
+                    notes.push_back({true, topic + ": ROS publisher " + p.node + ": its CUDA buffers cannot be read "
+                                                   "here (" + p.reason + "), and it sends them, because this "
+                                                   "subscription's registry entry has its Linux user and CUDA "
+                                                   "ordinal (the backend's rule): its frames do not reach this "
+                                                   "subscription"});
+                }
+                else
+                {
+                    notes.push_back({true, topic + ": ROS publisher " + p.node + " sends the CPU form: " + p.reason});
+                }
+            }
+        }
+
+        void deactivate()
+        {
+            if (not entry_device)
+            {
+                return;
+            }
+            entry_device.reset();
+            try
+            {
+                deactivate_entry(shm_dir, gid, instance_id);
+            }
+            catch (const RingError& error)
+            {
+                notes.push_back({true, topic + ": this subscription's entry in the CUDA buffer backend's registry "
+                                       "stays active: " + error.what()});
+            }
+        }
+
+        // The block of a descriptor mapped on this GPU (its fd fetched once); RingError when it cannot be.
+        void import(Import& i, const Descriptor& d)
+        {
+            const int fd = fetch_fd(d.socket_path);
+            ContextGuard guard(context);
+            const CUresult imported = driver().cuMemImportFromShareableHandle(
+                &i.handle, reinterpret_cast<void*>(static_cast<std::intptr_t>(fd)),
+                CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR);
+            ::close(fd);
+            check(imported, "cuMemImportFromShareableHandle");
+            i.size = d.block_size;
+            try
+            {
+                CU(cuMemAddressReserve(&i.va, i.size, 0, 0, 0));
+                const CUresult mapped = driver().cuMemMap(i.va, i.size, 0, i.handle, 0);
+                if (mapped != CUDA_SUCCESS)
+                {
+                    driver().cuMemAddressFree(i.va, i.size);
+                    i.va = 0;
+                    check(mapped, "cuMemMap");
+                }
+                CUmemAccessDesc access{};
+                access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+                access.location.id = cu_device;
+                access.flags = CU_MEM_ACCESS_FLAGS_PROT_READ;
+                CU(cuMemSetAccess(i.va, i.size, &access, 1));
+            }
+            catch (...)
+            {
+                Record* record = std::exchange(i.record, nullptr);  // the record stays: the caller holds its count
+                unmap(i);
+                i.record = record;
+                throw;
+            }
+        }
+    };
+
+    Receiver::Receiver(std::string topic, int device, std::string shm_dir, const std::array<std::uint8_t, 16>& gid)
+        : impl_(std::make_unique<Impl>())
+    {
+        struct stat s{};
+        if (::stat(shm_dir.c_str(), &s) != 0 or not S_ISDIR(s.st_mode))
+        {
+            throw std::invalid_argument("GPU frames from ROS publishers: " + shm_dir + " is no directory (" + kShmEnv +
+                                        ")");
+        }
+        Impl& m = *impl_;
+        m.topic = std::move(topic);
+        m.device = device;
+        m.shm_dir = std::move(shm_dir);
+        m.gid = gid;
     }
+
+    Receiver::~Receiver()
+    {
+        Impl& m = *impl_;
+        std::lock_guard lock(m.mutex);
+        m.deactivate();
+        for (auto& [key, i] : m.imports)
+        {
+            m.unmap(i);
+        }
+        m.imports.clear();
+        if (m.started)
+        {
+            {
+                ContextGuard guard(m.context);
+                driver().cuStreamSynchronize(m.stream);
+                driver().cuStreamDestroy(m.stream);
+            }
+            m.pool.reset();  // its buffers keep it (and the context) as long as they live
+            driver().cuDevicePrimaryCtxRelease(m.cu_device);
+        }
+    }
+
+    void Receiver::set_gid(const std::array<std::uint8_t, 16>& gid)
+    {
+        Impl& m = *impl_;
+        std::lock_guard lock(m.mutex);
+        if (gid == m.gid)
+        {
+            return;
+        }
+        const bool entered = m.entry_device.has_value();
+        m.deactivate();
+        m.entry_ipc = false;
+        m.gid = gid;
+        m.entry_tried = -1e9;
+        if (entered)  // entered anew before the new token, with the publishers decided so far
+        {
+            m.try_enter(seconds_now());
+        }
+    }
+
+    void Receiver::add_publisher(const std::string& token_key, const std::array<std::uint8_t, 16>& gid,
+                                 const std::string& node)
+    {
+        Impl& m = *impl_;
+        std::lock_guard lock(m.mutex);
+        KnownPublisher p;
+        p.gid = gid;
+        p.node = node;
+        m.publishers.try_emplace(token_key, std::move(p));  // a token seen again keeps its decision
+    }
+
+    void Receiver::remove_publisher(const std::string& token_key)
+    {
+        Impl& m = *impl_;
+        std::lock_guard lock(m.mutex);
+        const auto found = m.publishers.find(token_key);
+        if (found == m.publishers.end())
+        {
+            return;
+        }
+        if (found->second.shares.value_or(false))
+        {
+            const int pid = found->second.pid;
+            m.publishers.erase(found);
+            const bool still = std::any_of(m.publishers.begin(), m.publishers.end(), [pid](const auto& item) {
+                return item.second.shares.value_or(false) and item.second.pid == pid;
+            });
+            if (not still)  // its other publishers of the topic are gone too: its blocks are no longer read
+            {
+                m.forget(pid);
+                m.gone.insert(pid);
+            }
+            return;
+        }
+        m.publishers.erase(found);
+    }
+
+    void Receiver::enter()
+    {
+        Impl& m = *impl_;
+        const double now = seconds_now();
+        std::lock_guard lock(m.mutex);
+        m.decide(now, true);
+        m.try_enter(now);
+        m.tell();
+    }
+
+    void Receiver::refresh()
+    {
+        Impl& m = *impl_;
+        const double now = seconds_now();
+        std::lock_guard lock(m.mutex);
+        m.decide(now, false);
+        if (not m.entry_device and now - m.entry_tried >= kRecheckS)  // no registry at the start: as soon as there is one
+        {
+            m.try_enter(now);
+        }
+        m.tell();
+    }
+
+    std::shared_ptr<DeviceBuffer> Receiver::take(const Descriptor& d)
+    {
+        Impl& m = *impl_;
+        std::lock_guard lock(m.mutex);
+        const auto refuse = [&m](const std::string& kind, const std::string& text) -> std::shared_ptr<DeviceBuffer> {
+            ++m.refused;
+            m.say_once(kind, true, m.topic + ": " + text);
+            return nullptr;
+        };
+        if (not d.use_ipc or d.socket_path.empty())
+        {
+            return refuse("no ipc", "a CUDA buffer descriptor without a block to fetch (no IPC): not read");
+        }
+        if (d.size > d.block_size)
+        {
+            return refuse("size", "a CUDA buffer descriptor of " + std::to_string(d.size) + " bytes in a block of " +
+                                      std::to_string(d.block_size) + ": not read");
+        }
+        const bool known = std::any_of(m.publishers.begin(), m.publishers.end(), [&d](const auto& item) {
+            return item.second.shares.value_or(false) and item.second.pid == d.pid;
+        });
+        if (not known)
+        {
+            if (m.gone.contains(d.pid))
+            {
+                ++m.stale;  // its publisher went meanwhile
+                return nullptr;
+            }
+            return refuse("pid " + std::to_string(d.pid),
+                          "a CUDA buffer descriptor of process " + std::to_string(d.pid) + ", which is no publisher of "
+                          "the topic found on this GPU: not read");
+        }
+        m.start();
+        const std::pair<int, std::uint32_t> key{d.pid, d.block_id};
+        auto found = m.imports.find(key);
+        if (found == m.imports.end())
+        {
+            Record* record = nullptr;
+            try
+            {
+                record = open_record(m.shm_dir + "/cuda_vmm_" + std::to_string(d.pid) + "_" +
+                                     std::to_string(d.block_id));
+            }
+            catch (const RingError& error)
+            {
+                return refuse("record " + std::to_string(d.pid), error.what() + std::string(": not read"));
+            }
+            if (record == nullptr)
+            {
+                ++m.stale;  // gone: its publisher freed the block (or the record is in another /dev/shm)
+                return nullptr;
+            }
+            found = m.imports.emplace(key, Import{record}).first;
+        }
+        Import& block = found->second;
+        Record& record = *block.record;
+        record.refcount.fetch_add(1, std::memory_order_acq_rel);  // the hold, as the backend's reader takes it
+        struct Release
+        {
+            Record& r;
+            ~Release() { r.refcount.fetch_sub(1, std::memory_order_release); }
+        } release{record};
+        const auto current = [&] { return d.uid == 0 or record.uid.load(std::memory_order_acquire) == d.uid; };
+        if (not current())
+        {
+            ++m.stale;  // rewritten before this frame was taken
+            return nullptr;
+        }
+        if (block.va == 0)
+        {
+            try
+            {
+                m.import(block, d);
+            }
+            catch (const RingError& error)
+            {
+                return refuse("import " + std::to_string(d.pid), error.what() + std::string(": not read"));
+            }
+        }
+        else if (block.size != d.block_size)
+        {
+            return refuse("block size", "block " + std::to_string(d.block_id) + " of process " +
+                                            std::to_string(d.pid) + " announced with another size than before: not "
+                                            "read");
+        }
+        ContextGuard guard(m.context);
+        CUevent event = nullptr;
+        if (std::any_of(d.event.begin(), d.event.end(), [](std::uint8_t b) { return b != 0; }))
+        {
+            CUipcEventHandle handle{};
+            static_assert(sizeof(handle) == sizeof(d.event));
+            std::memcpy(&handle, d.event.data(), sizeof(handle));
+            const CUresult opened = driver().cuIpcOpenEventHandle(&event, handle);
+            if (opened != CUDA_SUCCESS)  // the block may still be written: not read without its event
+            {
+                const char* name = nullptr;
+                driver().cuGetErrorName(opened, &name);
+                return refuse("event " + std::to_string(d.pid),
+                              "the CUDA event of a buffer of process " + std::to_string(d.pid) + " cannot be opened (" +
+                                  (name ? name : "?") + "; CUDA keeps it in the publisher's /dev/shm, which must be "
+                                  "this program's and a tmpfs): not read");
+            }
+        }
+        struct Event
+        {
+            CUevent e;
+            ~Event()
+            {
+                if (e != nullptr)
+                {
+                    driver().cuEventDestroy(e);
+                }
+            }
+        } opened{event};
+        if (event != nullptr)
+        {
+            CU(cuStreamWaitEvent(m.stream, event, 0));  // the publisher's write into the block
+        }
+        auto buffer = std::make_shared<DeviceBuffer>(m.pool, d.size, reinterpret_cast<std::uint64_t>(m.stream));
+        CU(cuMemcpyDtoDAsync(buffer->ptr(), block.va, d.size, m.stream));
+        CU(cuStreamSynchronize(m.stream));
+        if (not current())
+        {
+            ++m.stale;  // rewritten while it was copied
+            return nullptr;
+        }
+        ++m.copied;
+        return buffer;
+    }
+
+    std::vector<Note> Receiver::notes()
+    {
+        std::lock_guard lock(impl_->mutex);
+        return std::exchange(impl_->notes, {});
+    }
+
+    ReceiverStats Receiver::stats() const
+    {
+        const Impl& m = *impl_;
+        std::lock_guard lock(m.mutex);
+        ReceiverStats s;
+        s.copied = m.copied;
+        s.stale = m.stale;
+        s.refused = m.refused;
+        s.blocks = static_cast<std::uint32_t>(std::count_if(m.imports.begin(), m.imports.end(),
+                                                            [](const auto& item) { return item.second.va != 0; }));
+        s.registered = m.entry_device.has_value() and m.entry_ipc;
+        return s;
+    }
+
+    int Receiver::device() const { return impl_->device; }
+    const std::string& Receiver::shm_dir() const { return impl_->shm_dir; }
 }  // namespace xblick::ros_cuda

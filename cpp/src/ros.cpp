@@ -1037,7 +1037,8 @@ namespace xblick::ros
     }
 
     Entity::Entity(const Ros& ros, const NodeName& node, std::string_view kind, const std::string& name,
-                   const std::string& type_name, const Qos& qos, std::string entity_id)
+                   const std::string& type_name, const Qos& qos, std::string entity_id,
+                   std::optional<std::string> backends)
     {
         token.domain = ros.domain();
         token.zid = ros.zid();
@@ -1052,6 +1053,10 @@ namespace xblick::ros
         token.type_hash = hash_of(type_name);
         token.qos = qos;
         token.backends = backends_of(kind, type_name, qos);
+        if (backends)
+        {
+            token.backends = std::move(backends);
+        }
         token_key = token.key();
         key = data_key(ros.domain(), name, type_name, *token.type_hash);
         if (key.empty() or not std::isdigit(static_cast<unsigned char>(key[0])))  // no key of ours starts so
@@ -1550,9 +1555,42 @@ namespace xblick::ros
     struct Subscriber::State
     {
         Callback callback;
+        GpuCallback gpu_callback;
+        std::shared_ptr<ros_cuda::Receiver> receiver;  // with a cuda_device
         std::string topic;
         std::atomic<bool> warned{false};
         std::atomic<bool> closed{false};
+        zenoh::Session* session = nullptr;
+        std::mutex token_mutex;  // token, token_key
+        std::optional<zenoh::LivelinessToken> token;
+        std::string token_key;
+
+        // The subscription's token declared (again: it goes and comes, and the publishers discover it anew).
+        void announce()
+        {
+            std::lock_guard lock(token_mutex);
+            if (closed.load() or session == nullptr)
+            {
+                return;
+            }
+            token.reset();
+            token.emplace(session->liveliness_declare_token(zenoh::KeyExpr(token_key)));
+        }
+
+        // The receiver's look at the registry, and its lines.
+        void refresh()
+        {
+            receiver->refresh();
+            say_notes();
+        }
+
+        void say_notes()
+        {
+            for (const ros_cuda::Note& note : receiver->notes())
+            {
+                say(note.text);
+            }
+        }
 
         // A sample of the topic or of a publisher's history: to the callback with ROS's attachment, else dropped
         // with one line, as ROS drops it.
@@ -1579,6 +1617,12 @@ namespace xblick::ros
                     }
                     return;
                 }
+                if (receiver)
+                {
+                    refresh();  // cheap once every publisher is decided
+                    gpu_callback(sample.get_payload().as_vector(), attachment, receiver);
+                    return;
+                }
                 callback(sample.get_payload().as_vector(), attachment);
             }
             catch (const std::exception& e)  // a bad sample must not end the subscription
@@ -1594,6 +1638,91 @@ namespace xblick::ros
     {
         state_->callback = std::move(callback);
         state_->topic = topic;
+        declare(session, ros, node);
+    }
+
+    Subscriber::Subscriber(zenoh::Session& session, Ros& ros, const NodeName& node, const std::string& topic,
+                           const std::string& type_name, GpuCallback gpu_callback, int cuda_device,
+                           const std::vector<Token>& publishers, const Qos& qos)
+        : entity_(ros, node, kSubscription, topic, type_name, qos, ros.next_id(), std::string(kCudaBackends)),
+          state_(std::make_shared<State>())
+    {
+        if (type_name != "sensor_msgs/msg/Image")
+        {
+            throw RosError(type_name + ": CUDA buffers come in sensor_msgs/msg/Image");
+        }
+        if (qos.durability == kTransientLocal)
+        {
+            throw RosError(topic + ": CUDA buffers come to volatile subscriptions only");
+        }
+        state_->gpu_callback = std::move(gpu_callback);
+        state_->topic = topic;
+        try
+        {
+            state_->receiver = std::make_shared<ros_cuda::Receiver>(topic, cuda_device,
+                                                                    ros_cuda::shm_dir_from_environment(), entity_.gid);
+        }
+        catch (const std::invalid_argument& error)
+        {
+            throw RosError(error.what());
+        }
+        // entered in the registry for the publishers known now, before the token: a publisher decides once, when it
+        // discovers the subscription (ros_cuda.hpp)
+        for (const Token& known : publishers)
+        {
+            if (known.topic == topic and known.type_name == type_name)
+            {
+                const std::string key = known.key();
+                state_->receiver->add_publisher(key, gid(key), known.fully_qualified_node());
+            }
+        }
+        state_->receiver->enter();
+        state_->say_notes();
+        declare(session, ros, node);
+        // the topic's publishers (their tokens): decided by the receiver from the backend's registry
+        const Token& t = entity_.token;
+        const std::string pattern = std::string(kAdminSpace) + "/" + std::to_string(t.domain) + "/*/*/*/" +
+                                    std::string(kPublisher) + "/*/*/*/" + mangle(topic) + "/" + dds_type(type_name) +
+                                    "/" + *t.type_hash + "/**";
+        zenoh::Session::LivelinessSubscriberOptions options;
+        options.history = true;
+        std::weak_ptr<State> weak = state_;
+        publishers_.emplace(session.liveliness_declare_subscriber(
+            zenoh::KeyExpr(pattern),
+            [weak](const zenoh::Sample& sample) {
+                const std::shared_ptr<State> state = weak.lock();
+                if (not state or state->closed.load())
+                {
+                    return;
+                }
+                const std::string key(sample.get_keyexpr().as_string_view());
+                try
+                {
+                    if (sample.get_kind() != Z_SAMPLE_KIND_PUT)
+                    {
+                        state->receiver->remove_publisher(key);
+                        return;
+                    }
+                    const Token publisher = Token::parse(key);
+                    state->receiver->add_publisher(key, gid(key), publisher.fully_qualified_node());
+                    state->refresh();
+                }
+                catch (const std::exception& e)  // not a token rmw_zenoh would take, or the registry: nothing escapes
+                {
+                    say(state->topic + ": a ROS publisher's token not taken: " + e.what());
+                }
+            },
+            zenoh::closures::none, std::move(options)));
+    }
+
+    std::shared_ptr<ros_cuda::Receiver> Subscriber::receiver() const
+    {
+        return state_->receiver;
+    }
+
+    void Subscriber::declare(zenoh::Session& session, Ros& ros, const NodeName& node)
+    {
+        const Qos& qos = *entity_.token.qos;
         const std::shared_ptr<State> state = state_;
         subscriber_.emplace(session.declare_subscriber(
             zenoh::KeyExpr(entity_.key), [state](const zenoh::Sample& sample) { state->take(sample); },
@@ -1640,22 +1769,51 @@ namespace xblick::ros
                 zenoh::KeyExpr(cpu_group_key(entity_.key)),
                 [state](const zenoh::Sample& sample) { state->take(sample); }, zenoh::closures::none));
         }
-        token_.emplace(session.liveliness_declare_token(zenoh::KeyExpr(entity_.token_key)));
-        enrolled_ = enroll_if_program_node(ros, ros_, node, entity_.gid, [this, &session, &ros](const NodeName& n) {
-            entity_.rename(n);
-            ros.own(entity_.gid);
-            token_.reset();
-            token_.emplace(session.liveliness_declare_token(zenoh::KeyExpr(entity_.token_key)));
-        });
+        const auto declare_buffer = [this, &session, state] {
+            if (state->receiver)  // where a Lyrical publisher sends to this subscription (by its gid)
+            {
+                buffer_.reset();
+                buffer_.emplace(session.declare_subscriber(
+                    zenoh::KeyExpr(buffer_key(entity_.key, entity_.gid)),
+                    [state](const zenoh::Sample& sample) { state->take(sample); }, zenoh::closures::none));
+            }
+        };
+        declare_buffer();
+        state->session = &session;
+        {
+            std::lock_guard lock(state->token_mutex);
+            state->token_key = entity_.token_key;
+        }
+        state->announce();
+        enrolled_ = enroll_if_program_node(ros, ros_, node, entity_.gid,
+                                           [this, &ros, state, declare_buffer](const NodeName& n) {
+                                               entity_.rename(n);
+                                               ros.own(entity_.gid);
+                                               if (state->receiver)  // the gid follows the token
+                                               {
+                                                   state->receiver->set_gid(entity_.gid);
+                                                   declare_buffer();
+                                               }
+                                               {
+                                                   std::lock_guard lock(state->token_mutex);
+                                                   state->token_key = entity_.token_key;
+                                               }
+                                               state->announce();
+                                           });
     }
 
     Subscriber::~Subscriber()
     {
         leave(ros_, enrolled_);
-        state_->closed.store(true);
-        token_.reset();
+        {
+            std::lock_guard lock(state_->token_mutex);
+            state_->closed.store(true);
+            state_->token.reset();
+        }
         history_.reset();
         cpu_group_.reset();
+        buffer_.reset();
+        publishers_.reset();
         subscriber_.reset();
     }
 

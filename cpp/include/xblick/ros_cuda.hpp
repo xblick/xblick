@@ -45,6 +45,7 @@
 namespace xblick
 {
     class CudaRingWriter;
+    class DeviceBuffer;
 }
 
 namespace xblick::ros_cuda
@@ -256,6 +257,95 @@ namespace xblick::ros_cuda
         // Whether a reader of this registry entry can import our blocks, and why not.
         std::pair<bool, std::string> importable(const RegistryEntry& entry) const;
         const std::string& socket_dir() const;
+        const std::string& shm_dir() const;
+
+    private:
+        struct Impl;
+        std::unique_ptr<Impl> impl_;
+    };
+
+    // ------------------------------------------------------------------------------- the link from ROS publishers
+    // The other direction: a subscription of ours that reads a ROS image topic and works on a GPU (it asked for device
+    // frames) takes a frame that a ROS publisher has as a CUDA buffer on that GPU without a copy through the CPU. The
+    // Zenoh part is the language's (ros.hpp Subscriber with a cuda_device, Python's ros_cuda.GpuReceiver):
+    //   * its token says "backends:cuda:", as a stock subscription with acceptable_buffer_backends "any", and it reads
+    //     <key>/_buf/<its gid>, where a Lyrical publisher sends to it;
+    //   * a publisher sends it descriptors when it finds the subscription in the backend's registry with the
+    //     publisher's own Linux user and CUDA ordinal and "can import" (the backend's rule), the CPU form when it finds
+    //     another entry, and (release 0.1.2) descriptors as well when it finds none. A publisher decides once per
+    //     subscription, when it discovers it (rmw_zenoh 0.10 never forgets a subscription's gid either), so the entry
+    //     must be right before the subscription's token is announced. A Receiver writes it then (enter()), the only
+    //     thing it writes there, from the publishers known at that moment: "can import" with a publisher's ordinal
+    //     when that publisher uses this GPU (the rules of Link for readers, applied to the publisher's process) and
+    //     has this program's /dev/shm (CUDA keeps the events that come with the buffers there); "cannot import" when
+    //     publishers are known and none does; without a known publisher as a stock subscription enters itself ("can
+    //     import", this program's ordinal), so that a later publisher decides by the backend's rule. Descriptors that
+    //     come from a publisher this rule lets through and the Receiver's own rules do not (another GPU numbered
+    //     alike, another /dev/shm) are not read: one line says that its frames do not reach the subscription. The
+    //     entry goes inactive when the Receiver goes (the registry file stays: the backend's last process removes
+    //     it). Each publisher that sends the CPU form is said in one line with the reason;
+    //   * a descriptor, when the frame is taken (as the backend's reader, which counts at take too): one more in the
+    //     block's record (<shm_dir>/cuda_vmm_<pid>_<block id>; a block without a record is not read), its uid compared
+    //     with the descriptor's (another one: the block was rewritten, the frame is stale), the block's file descriptor
+    //     fetched once from the publisher's socket (a socket file at the path for release 0.1.2, else the abstract
+    //     socket of the name, as the current source serves it; the server must be of this Linux user) and mapped on
+    //     this GPU, the publisher's IPC event waited for, the frame copied into a device buffer of its own (as a CUDA
+    //     ring reader's copy), the uid compared again (another one: stale), and one less in the record. The block stays
+    //     mapped until its publisher's token goes.
+
+    // A sensor_msgs/Image whose data is a CUDA buffer descriptor.
+    struct BufferImage
+    {
+        ImageHeader header;
+        Descriptor descriptor;
+    };
+    // The descriptor of a sensor_msgs/Image in CDR in the buffer form (marker words, "cuda", the descriptor's fields);
+    // none for the CPU form (its data as uint8[]). RingError for another backend's buffer form or a message that is no
+    // sensor_msgs/Image.
+    std::optional<BufferImage> parse_image_payload(const std::uint8_t* payload, std::size_t size);
+
+    struct ReceiverStats
+    {
+        std::uint64_t copied = 0;   // frames copied out of a publisher's block
+        std::uint64_t stale = 0;    // descriptors of a block rewritten or gone before the frame was taken
+        std::uint64_t refused = 0;  // descriptors not read (said once each kind)
+        std::uint32_t blocks = 0;   // publishers' blocks mapped now
+        bool registered = false;    // the subscription's entry in the registry says "can import"
+    };
+
+    // The registry entry, the publishers' decisions and the mapped blocks of one subscription (thread-safe: tokens and
+    // samples come from Zenoh's threads, take() from the reader's).
+    class Receiver
+    {
+    public:
+        // device: the CUDA ordinal the frames are wanted on; shm_dir: the ROS nodes' /dev/shm as this program sees it
+        // (registry, records); gid: the subscription's. std::invalid_argument when shm_dir is no directory. Nothing
+        // is written before a publisher is decided, nothing allocated before the first descriptor.
+        Receiver(std::string topic, int device, std::string shm_dir, const std::array<std::uint8_t, 16>& gid);
+        ~Receiver();  // the entry inactive, the blocks unmapped
+        Receiver(const Receiver&) = delete;
+        Receiver& operator=(const Receiver&) = delete;
+
+        // The subscription's token changed (its node renamed): the old entry inactive, a new one entered at once (with
+        // the publishers decided so far), before the caller announces the new token.
+        void set_gid(const std::array<std::uint8_t, 16>& gid);
+        // A publisher's token came (a token seen before keeps its decision), or went (its blocks unmapped).
+        void add_publisher(const std::string& token_key, const std::array<std::uint8_t, 16>& gid,
+                           const std::string& node);
+        void remove_publisher(const std::string& token_key);
+        // Before the subscription's token is announced, with the publishers known then (add_publisher): decides them
+        // and enters the subscription in the registry (once; without a registry yet, refresh() enters it as soon as
+        // there is one).
+        void enter();
+        // Looks the undecided publishers up in the registry (each every kRecheckS), enters the subscription if it is
+        // not yet, and says what each decided publisher sends. Cheap when nothing is undecided.
+        void refresh();
+        // The frame a descriptor names, copied onto this GPU (complete when it returns); null when it is stale or
+        // refused (counted; a refusal is said once per reason).
+        std::shared_ptr<DeviceBuffer> take(const Descriptor& descriptor);
+        std::vector<Note> notes();  // the lines to say since the last call
+        ReceiverStats stats() const;
+        int device() const;
         const std::string& shm_dir() const;
 
     private:
