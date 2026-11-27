@@ -1159,7 +1159,24 @@ class Subscription:
         return self._session.ros.node.subscriber(
             topic, message_type.TYPE,
             lambda payload, seq, stamp, publisher: latest.offer((payload, None, topic, time.time_ns(),
-                                                                 message_type.ENCODING, transport), route))
+                                                                 message_type.ENCODING, transport), route),
+            cuda_device=self._ros_cuda_device(message_type))
+
+    def _ros_cuda_device(self, message_type) -> int | None:
+        """The GPU on which a ROS form's frames are taken as CUDA buffers from ROS publishers that have them there
+        (ros_cuda.GpuReceiver): this subscriber's ``device`` for an image topic, unless XBLICK_ROS_CUDA is 0; None for
+        a subscriber on the CPU (it gets the bytes)."""
+        if self._on_cpu or message_type.TYPE not in ros_cuda.LINK_TYPES or not ros_cuda.enabled_by_environment():
+            return None
+        return self.device
+
+    def ros_gpu_stats(self) -> dict | None:
+        """The counters of the CUDA buffers taken from ROS publishers (ros_cuda.GpuReceiver.stats) while a ROS form
+        is read with a device; None otherwise."""
+        with self._lock:
+            subscriber = self._subscriber
+        gpu = getattr(subscriber, "gpu", None)
+        return gpu.stats() if gpu is not None else None
 
     def _ros_choice(self, foreign_only: bool = False) -> str | None:
         """The first ROS form (``ros_forms``) that a ROS publisher offers now, of the form's type; None without one.
@@ -1493,7 +1510,9 @@ class ImageSubscriber(Subscription):
     ``/resize/image``; Subscription): ``auto`` reads the topic, or image_transport's compressed topic
     ``<topic>/compressed`` where a publisher offers only that; ``ros`` or ``raw`` the topic, ``compressed`` the
     compressed one. Its camera_info is ROS's convention, ``camera_info`` beside the image topic (``/resize/image`` ->
-    ``/resize/camera_info``), or the topic ``camera_info`` names.
+    ``/resize/camera_info``), or the topic ``camera_info`` names. With a ``device``, the frames that a ROS publisher has
+    as CUDA buffers on that GPU arrive there as gpu.CudaImage (ros_cuda.GpuReceiver;
+    ``ros_gpu_stats``), the others as arrays in host memory.
 
     With ``copy=False`` the shm and cuda transports hand out views into the ring instead of copies: check
     ``Frame.is_valid()`` after using one. With ``camera_info=True`` the stream's CameraInfo is received as well
@@ -1567,6 +1586,12 @@ class ImageSubscriber(Subscription):
         if transport in ("compressed", ROS_COMPRESSED):
             message = CompressedImage.deserialize(payload)
             image, encoding = decompress(message)
+        elif transport == ROS and getattr(payload, "parsed", None) is not None:  # a CUDA buffer (ros_cuda.Received)
+            got = self._from_ros_gpu(payload)
+            if got is None:
+                self.stale += 1
+                return None
+            message, image, encoding = got
         elif transport in ("raw", ROS):
             message = Image.deserialize(payload)
             image, encoding = image_to_numpy(message), message.encoding
@@ -1584,6 +1609,29 @@ class ImageSubscriber(Subscription):
         return Frame(image=image, encoding=encoding, header=message.header, key=key, receive_ns=receive_ns,
                      seq=meta.get("seq"), source=meta.get("source", ""), publish_ns=meta.get("publish_ns"),
                      meta=meta, valid=valid)
+
+    def _from_ros_gpu(self, received):
+        """(message with its header, CudaImage on this subscriber's GPU, encoding) of a ROS publisher's CUDA buffer
+        (ros_cuda.Received); None when it is stale."""
+        p = received.parsed
+        if p["is_bigendian"]:
+            raise RuntimeError(f"{self.base}: big-endian images on the GPU are not supported")
+        enc = info(p["encoding"])
+        shape = (p["height"], p["width"]) if enc.channels == 1 else (p["height"], p["width"], enc.channels)
+        row = p["width"] * enc.channels * enc.dtype.itemsize
+        if p["step"] != row:
+            raise RuntimeError(f"{self.base}: GPU frames of ROS publishers need rows without padding: step "
+                               f"{p['step']}, row {row}")
+        if p["descriptor"]["size"] != row * p["height"]:
+            raise RuntimeError(f"{self.base}: a CUDA buffer of {p['descriptor']['size']} bytes for a "
+                               f"{p['width']}x{p['height']} {p['encoding']} image of {row * p['height']} bytes")
+        buffer = received.receiver.take(received)
+        if buffer is None:
+            return None
+        header = Header(stamp=Time(sec=p["sec"], nanosec=p["nanosec"]), frame_id=p["frame_id"])
+        # the reader's own copy, as a CUDA ring reader's: writable
+        image = CudaImage(buffer.ptr, shape, enc.dtype, buffer.device, owner=buffer, readonly=False)
+        return Image(header=header), image, p["encoding"]
 
     def _from_ring(self, m: ShmImage | CudaImageMsg, transport: str):
         if m.is_bigendian:

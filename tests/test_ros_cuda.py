@@ -4,6 +4,7 @@ that holds a block (its record written here), the sockets, the removal of what a
 of a CameraPublisher with a stand-in reader in this process. The stock subscriber and Isaac ROS: test_ros_cuda_live.py.
 """
 
+import json
 import mmap
 import os
 import socket
@@ -321,6 +322,212 @@ def test_camera_routes_gpu_frames_to_a_cuda_reader(tmp_path, ros_session, monkey
         view.close()
         mapped.close()
     assert sorted(os.listdir(tmp_path)) == [registry.name]  # the pool's files are gone with the camera
+
+
+def test_buffer_form_is_parsed_and_the_cpu_form_is_not():
+    parsed = _core.ros_cuda_parse_image(STOCK)
+    assert {k: parsed[k] for k in ("sec", "nanosec", "frame_id", "height", "width", "encoding", "step")} == {
+        "sec": 0x6B07F4C8, "nanosec": 0x042CB5CB, "frame_id": "s0:16", "height": 48, "width": 64, "encoding": "rgb8",
+        "step": 192}
+    d = parsed["descriptor"]
+    assert (d["size"], d["pid"], d["block_id"], d["block_size"], d["socket_path"], d["event"]) == (
+        9216, 4081145, 0, 2 * 1024 * 1024, "/tmp/cuda_vmm_4081145_0.sock", STOCK[-64:])
+    from xblick.msg import Header, Image, Time
+    cpu = bytes(Image(header=Header(stamp=Time(1, 2), frame_id="f"), height=1, width=2, encoding="mono8", step=2,
+                      data=b"ab").serialize())
+    assert _core.ros_cuda_parse_image(cpu) is None
+    other = STOCK.replace(b"\x05\x00\x00\x00cuda\x00", b"\x05\x00\x00\x00qcom\x00")
+    with pytest.raises(_core.RingError, match="backend 'qcom'"):
+        _core.ros_cuda_parse_image(other)
+
+
+# a stand-in for a ROS publisher with the CUDA buffer backend (its pool is ours, its process a child): it maps the
+# registry as a ROS process does, and for each seed on stdin writes the test pattern into a block and prints the
+# block's descriptor
+PUBLISHER = r"""
+import json, mmap, sys
+import numpy as np
+from xblick import _core
+shm, n = sys.argv[1], int(sys.argv[2])
+f = open(shm + "/" + _core.ros_cuda_registry_name(), "rb")
+view = mmap.mmap(f.fileno(), 0, prot=mmap.PROT_READ)
+pool = _core.RosCudaPool(0, shm, shm, min_reuse_s=0.0)
+ring = _core.CudaRingWriter(0, 2, n)
+print("ready", flush=True)
+for line in sys.stdin:
+    seed = int(line)
+    slot = ring.write_host(((np.arange(n, dtype=np.uint64) * 13 + seed) & 0xFF).astype(np.uint8))[0]
+    index = pool.acquire(n, 0)
+    ring.copy_slot(slot, pool.block_ptr(index), n)
+    print(json.dumps(pool.publish(index, n)), flush=True)
+"""
+
+
+def fake_backend(shm):
+    """The backend's registry (no entries) and its semaphore as glibc's sem_open leaves it (value 1, shared)."""
+    write_registry(shm / _core.ros_cuda_registry_name(), [])
+    (shm / f"sem.{_core.ros_cuda_registry_name()}_mtx").write_bytes(b"\x01" + bytes(31))
+
+
+def add_entry(shm, entry):
+    path = shm / _core.ros_cuda_registry_name()
+    with open(path, "r+b") as f, mmap.mmap(f.fileno(), 0) as m:
+        count = struct.unpack_from("<I", m, 264)[0]
+        REGISTRY_ENTRY.pack_into(m, 272 + count * REGISTRY_ENTRY.size, *entry)
+        struct.pack_into("<I", m, 264, count + 1)
+
+
+def pattern(n, seed):
+    return ((np.arange(n, dtype=np.uint64) * 13 + seed) & 0xFF).astype(np.uint8)
+
+
+@pytest.fixture
+def stand_in_publisher(tmp_path):
+    """(shm, child, its gid, next(seed) -> descriptor) of a stand-in ROS publisher on GPU 0 in the registry."""
+    shm = tmp_path / "shm"
+    shm.mkdir()
+    fake_backend(shm)
+    n = 640 * 480 * 3
+    child = subprocess.Popen([sys.executable, "-c", PUBLISHER, str(shm), str(n)], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, text=True)
+    assert child.stdout.readline().strip() == "ready"
+    gid = bytes(range(16))
+    add_entry(shm, ((child.pid << 32) | 1, gid, 0, 0, os.getuid(), True, True, b"sensor_msgs/msg/Image"))
+
+    def publish(seed):
+        child.stdin.write(f"{seed}\n")
+        child.stdin.flush()
+        return json.loads(child.stdout.readline())
+
+    yield shm, child, gid, publish, n
+    child.stdin.close()
+    child.wait(timeout=30)
+
+
+@needs_cuda
+def test_receiver_takes_a_publishers_block_under_its_hold(stand_in_publisher):
+    """The receiver enters the registry once the publisher there is decided (on its GPU: "can import"), copies a
+    block's frame out under the record's count (back to 0 after), finds a block rewritten after its descriptor stale,
+    refuses a descriptor of a process that is no decided publisher, and unmaps the blocks when the publisher's token
+    goes."""
+    shm, _, publisher_gid, publish, n = stand_in_publisher
+    mine = bytes(range(1, 17))
+    receiver = _core.RosCudaReceiver("/rev/image", 0, str(shm), mine)
+    assert _core.ros_cuda_registry_lookup(str(shm), mine) is None  # nothing before a publisher is known
+    receiver.add_publisher("pub-token", publisher_gid, "/stand_in")
+    receiver.refresh()
+    notes = receiver.notes()
+    assert any("uses this GPU" in text for _, text in notes), notes
+    entry = _core.ros_cuda_registry_lookup(str(shm), mine)
+    assert entry is not None and (entry["pid"], entry["entity_type"], entry["device_id"], entry["uid"],
+                                  entry["ipc_capable"], entry["name"]) == (os.getpid(), 1, 0, os.getuid(), True,
+                                                                           "/rev/image")
+    first = publish(1)
+    buffer = receiver.take(first)
+    host = np.empty(n, np.uint8)
+    buffer.download(host)
+    assert buffer.device == 0 and np.array_equal(host, pattern(n, 1))
+    holder = Holder(record_of(shm, first))
+    assert struct.unpack_from("<i", holder.map, 0)[0] == 0  # the hold ended with the copy
+    second = publish(2)  # the same block again (no reader holds it), a new uid
+    assert second["block_id"] == first["block_id"] and second["uid"] != first["uid"]
+    assert receiver.take(first) is None and receiver.stats()["stale"] == 1
+    buffer = receiver.take(second)
+    buffer.download(host)
+    assert np.array_equal(host, pattern(n, 2))
+    assert receiver.stats() == {"copied": 2, "stale": 1, "refused": 0, "blocks": 1, "registered": True}
+    assert receiver.take({**second, "pid": 1}) is None and receiver.stats()["refused"] == 1
+    assert any("process 1," in text for _, text in receiver.notes())
+    receiver.remove_publisher("pub-token")
+    assert receiver.stats()["blocks"] == 0
+    assert receiver.take(second) is None and receiver.stats()["stale"] == 2  # its publisher went
+    holder.close()
+    del receiver
+    assert _core.ros_cuda_registry_lookup(str(shm), mine) is None  # the entry inactive
+
+
+@needs_cuda
+def test_receiver_leaves_a_publisher_on_another_gpu_or_of_another_user_the_cpu_form(stand_in_publisher):
+    """A publisher of another user decided first: entered as "cannot import", which stays when one on this GPU comes;
+    entered before any publisher: as a stock subscription; on another GPU: its descriptors are refused."""
+    shm, child, publisher_gid, publish, _ = stand_in_publisher
+    other_user = bytes(range(2, 18))
+    add_entry(shm, ((child.pid << 32) | 2, other_user, 0, 0, os.getuid() + 1, True, True, b"t"))
+    receiver = _core.RosCudaReceiver("/rev/image", 0, str(shm), bytes(range(1, 17)))
+    receiver.add_publisher("other-user", other_user, "/other")
+    receiver.refresh()
+    assert receiver.stats()["registered"] is False
+    assert any("sends the CPU form: it runs as Linux user" in text for _, text in receiver.notes())
+    # entered as "cannot import": a publisher that found no entry would send descriptors (release 0.1.2)
+    assert _core.ros_cuda_registry_lookup(str(shm), bytes(range(1, 17)))["ipc_capable"] is False
+    receiver.add_publisher("pub", publisher_gid, "/stand_in")  # one on this GPU comes later: the entry stays
+    receiver.refresh()
+    assert receiver.stats()["registered"] is False
+    assert _core.ros_cuda_registry_lookup(str(shm), bytes(range(1, 17)))["ipc_capable"] is False
+    assert any("written when it started, says it cannot import" in text for _, text in receiver.notes())
+    del receiver
+    # entered before any publisher is known: as a stock subscription ("can import", this program's ordinal)
+    early = _core.RosCudaReceiver("/rev/image", 0, str(shm), bytes(range(4, 20)))
+    early.enter()
+    entry = _core.ros_cuda_registry_lookup(str(shm), bytes(range(4, 20)))
+    assert entry["ipc_capable"] is True and entry["device_id"] == 0 and early.stats()["registered"]
+    del early
+    if _core.cuda_device_count() > 1:  # this program on GPU 1, the publisher on GPU 0 (same numbering)
+        on_other = _core.RosCudaReceiver("/rev/image", 1, str(shm), bytes(range(3, 19)))
+        on_other.add_publisher("pub", publisher_gid, "/stand_in")
+        on_other.refresh()
+        assert on_other.stats()["registered"] is False
+        assert any("uses CUDA device 0, this program 1" in text for _, text in on_other.notes())
+        assert on_other.take(publish(3)) is None and on_other.stats()["refused"] == 1
+        del on_other
+
+
+@needs_cuda
+def test_image_subscriber_with_a_device_reads_a_ros_topics_cuda_buffers(stand_in_publisher, ros_session,
+                                                                        monkeypatch):
+    """ImageSubscriber of a ROS topic with a device: its token says backends:cuda:, it reads <key>/_buf/<its gid>,
+    and a descriptor there becomes a CudaImage on its GPU with the publisher's pixels; a subscriber on the CPU says
+    backends:cpu: and is not entered in the registry."""
+    shm, _, _, publish, n = stand_in_publisher
+    from xblick.camera import ImageSubscriber
+    monkeypatch.setenv(ros_cuda.SHM_ENV, str(shm))
+    s = ros_session
+    topic = "/rev/cam/image"
+    hash_ = ros.hash_of("sensor_msgs/msg/Image")
+    key = ros.data_key(91, topic, "sensor_msgs/msg/Image", hash_)
+    token = "/".join(["@ros2_lv", "91", "0123456789abcdef0123456789abcdef", "90", "91", "MP", "%", "%", "pub",
+                      ros.mangle(topic), "sensor_msgs::msg::dds_::Image_", hash_, "::,10:,:,:,,", "backends:cpu:;cuda:"])
+    # the stand-in's registry entry has the gid of the token
+    with open(shm / _core.ros_cuda_registry_name(), "r+b") as f, mmap.mmap(f.fileno(), 0) as m:
+        m[280:296] = ros.gid(token)
+    live = s.liveliness().declare_token(token)
+    gpu = cpu = None
+    try:
+        gpu = ImageSubscriber(s, topic, transport="ros", device=0)
+        cpu = ImageSubscriber(s, topic, transport="ros")
+        ours = gpu._subscriber
+        assert ours.token.backends == ros.CUDA_BACKENDS and cpu._subscriber.token.backends == ros.CPU_BACKENDS
+        end = time.monotonic() + 10
+        while not gpu.ros_gpu_stats()["registered"] and time.monotonic() < end:
+            time.sleep(0.1)  # the publisher's token came and was decided
+        assert gpu.ros_gpu_stats()["registered"]
+        assert _core.ros_cuda_registry_lookup(str(shm), cpu._subscriber.gid) is None
+        out = s.declare_publisher(ros.buffer_key(key, ours.gid))
+        d = publish(7)
+        payload = _core.ros_cuda_image_payload(5, 6, "xb:7", 480, 640, "rgb8", 0, 640 * 3, d)
+        out.put(payload, attachment=ros.encode_attachment(1, time.time_ns(), ros.gid(token)))
+        frame = gpu.latest(timeout=5)
+        assert frame is not None and isinstance(frame.image, CudaImage) and frame.image.shape == (480, 640, 3)
+        assert frame.header.frame_id == "xb:7" and frame.stamp_ns == 5 * 10**9 + 6
+        assert np.array_equal(frame.image.numpy().reshape(-1), pattern(n, 7))
+        assert gpu.ros_gpu_stats()["copied"] == 1
+        out.undeclare()
+    finally:
+        live.undeclare()
+        for sub in (gpu, cpu):
+            if sub is not None:
+                sub.close()
+    assert _core.ros_cuda_registry_lookup(str(shm), ours.gid) is None
 
 
 @needs_cuda

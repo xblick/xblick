@@ -264,7 +264,8 @@ namespace xblick::detail
 
     std::unique_ptr<ros::Subscriber> ros_subscriber(zenoh::Session& session, const std::string& topic,
                                                     const p::MessageType& type, std::shared_ptr<Latest> latest,
-                                                    int route, Transport transport)
+                                                    int route, Transport transport, std::optional<int> cuda_device,
+                                                    const std::vector<ros::Token>& publishers)
     {
         const std::shared_ptr<ros::Ros> part = ros::of(session);
         if (not part)
@@ -273,6 +274,23 @@ namespace xblick::detail
                                         ros::kNeedsRos);
         }
         const std::string encoding = type.encoding();
+        if (cuda_device)
+        {
+            return std::make_unique<ros::Subscriber>(
+                session, *part, part->node(), topic, std::string(type.name),
+                [latest, topic, encoding, route, transport](std::vector<std::uint8_t>&& payload, const ros::Attachment&,
+                                                            const std::shared_ptr<ros_cuda::Receiver>& receiver) {
+                    auto made = std::make_shared<Item>();
+                    made->payload = std::move(payload);
+                    made->key = topic;
+                    made->encoding = encoding;
+                    made->receive_ns = now_ns();
+                    made->transport = transport;
+                    made->receiver = receiver;
+                    latest->offer(std::move(made), route);
+                },
+                *cuda_device, publishers);
+        }
         return std::make_unique<ros::Subscriber>(
             session, *part, part->node(), topic, std::string(type.name),
             [latest, topic, encoding, route, transport](std::vector<std::uint8_t>&& payload, const ros::Attachment&) {
@@ -284,6 +302,16 @@ namespace xblick::detail
                 made->transport = transport;
                 latest->offer(std::move(made), route);
             });
+    }
+
+    std::optional<int> ros_cuda_device(const p::MessageType& type, std::optional<int> cuda_device)
+    {
+        if (not cuda_device or std::string(type.name) != std::string(p::kImageType.name) or
+            not ros_cuda::enabled_by_environment())
+        {
+            return std::nullopt;
+        }
+        return cuda_device;
     }
 
     bool is_ros_form(Transport t)
@@ -491,6 +519,12 @@ namespace xblick::detail
         return graph ? graph->publishers(topic) : std::vector<ros::Token>{};
     }
 
+    std::shared_ptr<ros_cuda::Receiver> Subscription::ros_receiver() const
+    {
+        std::lock_guard lock(mutex_);
+        return ros_subscriber_ ? ros_subscriber_->receiver() : nullptr;
+    }
+
     void Subscription::recheck()
     {
         {
@@ -539,7 +573,9 @@ namespace xblick::detail
                 {
                     throw std::logic_error(base_ + ": no ROS form " + to_string(t));
                 }
-                ros_subscriber_ = ros_subscriber(session_, form->topic, *form->type, target, route, t);
+                ros_subscriber_ = ros_subscriber(session_, form->topic, *form->type, target, route, t,
+                                                 ros_cuda_device(*form->type, cuda_device_),
+                                                 graph_ ? graph_->publishers(form->topic) : std::vector<ros::Token>{});
             }
             else
             {

@@ -1965,6 +1965,16 @@ namespace xblick
         return impl_->decoded.load();
     }
 
+    std::optional<ros_cuda::ReceiverStats> ImageSubscriber::ros_gpu_stats() const
+    {
+        const std::shared_ptr<ros_cuda::Receiver> receiver = impl_->subscription.ros_receiver();
+        if (not receiver)
+        {
+            return std::nullopt;
+        }
+        return receiver->stats();
+    }
+
     std::optional<Frame> ImageSubscriber::decode(const std::shared_ptr<const detail::Item>& held, Transport t)
     {
         Impl& m = *impl_;
@@ -1991,6 +2001,53 @@ namespace xblick
             f.pixels = std::move(d.pixels);
             ++m.decoded;
             return f;
+        }
+        if (t == Transport::Ros and item.receiver)
+        {
+            // a ROS publisher's CUDA buffer (ros_cuda.hpp Receiver): copied onto this subscriber's GPU
+            if (const auto buffer_form = ros_cuda::parse_image_payload(item.payload.data(), item.payload.size()))
+            {
+                const ros_cuda::ImageHeader& h = buffer_form->header;
+                if (h.is_bigendian)
+                {
+                    throw EncodingError(f.key + ": big-endian images on the GPU are not supported");
+                }
+                const EncodingInfo enc = encoding_info(h.encoding);
+                const std::uint64_t row = static_cast<std::uint64_t>(h.width) * enc.pixel_bytes();
+                if (h.step != row)
+                {
+                    throw EncodingError(f.key + ": GPU frames of ROS publishers need rows without padding: step " +
+                                        std::to_string(h.step) + ", row " + std::to_string(row));
+                }
+                if (buffer_form->descriptor.size != row * h.height)
+                {
+                    throw EncodingError(f.key + ": a CUDA buffer of " + std::to_string(buffer_form->descriptor.size) +
+                                        " bytes for a " + std::to_string(h.width) + "x" + std::to_string(h.height) +
+                                        " " + h.encoding + " image");
+                }
+                std::shared_ptr<DeviceBuffer> buffer = item.receiver->take(buffer_form->descriptor);
+                for (const ros_cuda::Note& note : item.receiver->notes())
+                {
+                    std::fprintf(stderr, "xblick: %s\n", note.text.c_str());
+                }
+                if (not buffer)
+                {
+                    ++m.stale;
+                    return std::nullopt;
+                }
+                f.header.stamp.sec = h.sec;
+                f.header.stamp.nanosec = h.nanosec;
+                f.header.frame_id = h.frame_id;
+                f.encoding = h.encoding;
+                f.height = h.height;
+                f.width = h.width;
+                f.step = h.step;
+                f.device_ptr = buffer->ptr();
+                f.device = buffer->device();
+                f.owner = std::move(buffer);
+                ++m.decoded;
+                return f;
+            }
         }
         if (t == Transport::Raw or t == Transport::Ros)
         {

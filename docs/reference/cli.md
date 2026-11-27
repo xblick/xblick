@@ -51,9 +51,9 @@ accepts these options. [Durchblick and ROS 2](../integrations/ros2.md) explains 
 | Variable | Meaning |
 | --- | --- |
 | `XBLICK_ROS` | `0`: no part in ROS 2, as `--no-ros`. `1` or unset: a part. Any other value ends the program with one line. |
-| `XBLICK_ROS_CUDA` | `0`: ROS readers that accept CUDA buffers get the bytes of GPU frames. `1` or unset: they get CUDA buffers ([GPU frames for ROS readers](../integrations/ros2.md#gpu-frames-for-ros-readers)). A publisher with `cuda_device` refuses any other value with an error. |
+| `XBLICK_ROS_CUDA` | `0`: ROS readers that accept CUDA buffers get the bytes of GPU frames, and our subscribers with a device take the bytes of ROS publishers. `1` or unset: CUDA buffers both ways ([GPU frames for ROS readers](../integrations/ros2.md#gpu-frames-for-ros-readers), [GPU frames from ROS publishers](../integrations/ros2.md#gpu-frames-from-ros-publishers)). A publisher with `cuda_device` and a subscriber with a device refuse any other value with an error. |
 | `XBLICK_ROS_CUDA_SOCKETS` | The directory of the sockets that hand GPU blocks to ROS readers. The default is `/tmp`. |
-| `XBLICK_ROS_CUDA_SHM` | The ROS readers' `/dev/shm` as the publisher sees it. The default is `/dev/shm`. |
+| `XBLICK_ROS_CUDA_SHM` | The ROS nodes' `/dev/shm` as our program sees it: the backend's registry and the blocks' records. The default is `/dev/shm`. |
 
 `--ros-domain`, `--ros-node`, `--ros-params-writable` and `--ros-clock` end the program with one line while ROS 2 is
 off. A node also declares these options as read-only parameters. A program prints one line at the start with its ROS

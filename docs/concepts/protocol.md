@@ -174,7 +174,9 @@ Four rules of `rmw_zenoh` decide how a program takes part:
   subscription on `<key>/_buf/<the subscription's gid>`. It uses the key itself only while it has not yet seen
   every subscription, and it sends each message on one of these ways only. Our volatile subscriptions of buffer
   types therefore end their token in `backends:cpu:` and also read `<key>/_buf_cpu`. The bytes and the attachment
-  there are the same as on the key. Jazzy reads such a token and ignores the last part.
+  there are the same as on the key. Jazzy reads such a token and ignores the last part. An image subscription of ours
+  that works on a GPU ends its token in `backends:cuda:` instead and reads `<key>/_buf/<its gid>`, where a CUDA
+  buffer's descriptor or the bytes arrive ([GPU frames from ROS publishers](../integrations/ros2.md#gpu-frames-from-ros-publishers)).
 
 ## Related pages
 

@@ -204,7 +204,11 @@ program publishes it ([Read a ROS camera](../integrations/ros2.md#read-a-ros-cam
 `SubscriberOptions::camera_info_topic` names a ROS camera_info topic, and `Transport::RosCompressed` is
 image_transport's compressed topic. A `CameraPublisher` with `cuda_device` gives ROS readers that accept CUDA
 buffers its GPU frames as such (`ros::GpuLink`), and `CameraPublisher::ros_gpu_stats()` gives its counters
-([GPU frames for ROS readers](../integrations/ros2.md#gpu-frames-for-ros-readers)).
+([GPU frames for ROS readers](../integrations/ros2.md#gpu-frames-for-ros-readers)). An `ImageSubscriber` with
+`cuda_device` takes the CUDA buffers of ROS publishers on its GPU as frames in device memory (`Frame::device_ptr`), and
+`ImageSubscriber::ros_gpu_stats()` gives its counters
+([GPU frames from ROS publishers](../integrations/ros2.md#gpu-frames-from-ros-publishers)). `ros::Subscriber` with a
+`cuda_device` and `ros_cuda::Receiver` are the parts below it.
 `xblick::ros::of(session)` is the session's part in ROS 2, null for a session without one. `xblick/ros.hpp` also has
 the keys, names, tokens, QoS strings and the attachment of `rmw_zenoh`, and `ros::Publisher`, `ros::Subscriber` and
 `ros::Service` for topics and services of your own.

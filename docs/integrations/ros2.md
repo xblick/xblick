@@ -198,10 +198,12 @@ resized = db.ImageSubscriber(session, "/resize/image", transport="auto", camera_
 ```
 
 The frames arrive as plain CDR, with the input's stamp and frame id and the scaled camera_info. `ros2 topic list`
-shows the names of other nodes' outputs.
+shows the names of other nodes' outputs. The `ResizeNode` of Isaac ROS 5.1 publishes its output from host memory, so
+a reader with a `device` gets the bytes as well ([GPU frames from ROS publishers](#gpu-frames-from-ros-publishers)).
 
 A Lyrical publisher sends images, compressed images and clouds on keys of its own for each kind of subscriber. Our
-readers of these types announce themselves as subscribers that take plain CDR. A Lyrical publisher then sends them the
+readers of these types announce themselves as subscribers that take plain CDR. An image reader with a `device`
+announces itself as one that takes CUDA buffers, and reads its own key `/_buf/<its gid>`. A Lyrical publisher then sends them the
 usual bytes on the topic's key with the suffix `/_buf_cpu`, and our readers read that key as well. A Jazzy publisher
 sends on the topic's key, which our readers read as before
 ([protocol](../concepts/protocol.md#ros-2-on-rmw_zenoh)). Our publishers send on the topic's key as well. One case
@@ -488,13 +490,54 @@ readers' queue depth plus five blocks, and never more than 64. A 1080p `rgb8` bl
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `XBLICK_ROS_CUDA` | `1` | `0` sends the bytes to every ROS reader |
+| `XBLICK_ROS_CUDA` | `1` | `0` sends and takes the bytes with every ROS node |
 | `XBLICK_ROS_CUDA_SOCKETS` | `/tmp` | the directory of the sockets that hand out the blocks |
-| `XBLICK_ROS_CUDA_SHM` | `/dev/shm` | the readers' `/dev/shm` as the publisher sees it |
+| `XBLICK_ROS_CUDA_SHM` | `/dev/shm` | the ROS nodes' `/dev/shm` as our program sees it |
 
 The Python and the C++ `CameraPublisher` follow these rules alike, and the C++ core holds them for both. In C++,
 `CameraPublisher::ros_gpu_stats()` gives the counters. [Frames on the GPU](../concepts/gpu-frames.md#ros-2-readers)
 explains the mechanism.
+
+## GPU frames from ROS publishers
+
+A ROS 2 Lyrical publisher can send image data as a CUDA buffer of the backend (`cuda_buffer_backend::allocate_buffer`).
+A subscriber of ours that works on a GPU takes such a frame on its GPU, without a copy through CPU memory:
+
+```python
+gpu = db.ImageSubscriber(session, "/resize/image", transport="auto", device=0)
+frame = gpu.latest(timeout=1.0)  # frame.image: a CudaImage on GPU 0
+```
+
+In C++, `ImageSubscriber(session, "/resize/image", {.cuda_device = 0})` does the same. The frame is the subscriber's
+own copy on its GPU, as from a CUDA ring. A subscriber without a device gets the bytes as before.
+
+A ROS publisher sends a frame as a CUDA buffer to our subscriber while all of these hold:
+
+1. The publisher runs on `rmw_zenoh_cpp` with the backend's plugin `ros-lyrical-cuda-buffer-backend` and has the
+   frame as a CUDA buffer. A frame in host memory comes as bytes.
+2. It runs on the same PC and as the same Linux user as our subscriber, in our program's process ids.
+3. It uses our subscriber's GPU.
+4. It shares our program's `/dev/shm`. CUDA keeps the event that comes with each buffer there, so a container needs
+   `--ipc host`.
+5. It shares the network namespace (`--network host`). The release 0.1.2 hands out a block through a socket file in
+   its `/tmp`, so a container with that release needs `-v /tmp:/tmp` as well.
+
+Our subscriber enters itself in the backend's registry in `/dev/shm`, as a ROS subscriber does, and announces the
+backend in its token. A publisher decides once whether it sends CUDA buffers, when it discovers the subscriber, so our
+subscriber decides first, from the publishers that run at its start. When one of them meets the conditions, the entry
+asks for CUDA buffers. When publishers run and none meets them, the entry asks for the bytes. When no publisher runs
+yet, the entry is the one a ROS subscriber makes: a later publisher then sends CUDA buffers when its user and its
+number for its GPU (its CUDA ordinal) match ours. Such a publisher on another GPU, or with another `/dev/shm`, sends
+CUDA buffers that our subscriber cannot read. Our subscriber drops them, and one line says that this publisher's
+frames do not reach it. Start the subscriber after the publisher, or give both processes the same
+`CUDA_VISIBLE_DEVICES`.
+
+Every other publisher sends the bytes, and the subscriber prints one line that names the reason. Our subscriber reads
+a block only while it holds the backend's count in the block's record. It copies the frame and releases the count at
+once, so the publisher can reuse the block. A frame whose block the publisher rewrote before the subscriber took it is
+stale and is skipped.
+
+`ImageSubscriber.ros_gpu_stats()` in Python and `ImageSubscriber::ros_gpu_stats()` in C++ give the counters.
 
 ## Wire format
 
@@ -518,8 +561,9 @@ type hashes of the part in ROS 2.
   `xblick play`.
 - A ROS 2 reader gets GPU frames as CUDA buffers only from a `CameraPublisher` with `cuda_device`, only on
   `rmw_zenoh`, and only on the publisher's PC and GPU ([GPU frames for ROS readers](#gpu-frames-for-ros-readers)).
-  Point clouds and frames from ROS publishers into our readers go as bytes. [Alternatives](../project/alternatives.md)
-  describes the buffer backends.
+  Our subscribers take CUDA buffers of ROS publishers only as images, on the publisher's PC and GPU
+  ([GPU frames from ROS publishers](#gpu-frames-from-ros-publishers)). Point clouds go as bytes.
+  [Alternatives](../project/alternatives.md) describes the buffer backends.
 - The CUDA buffer backend keeps a registry in `/dev/shm`, which the first Linux user's ROS node creates. A ROS node
   of a second user with the backend then fails to start on that PC. This is a limit of the backend.
 - [ROS 2 by default](../project/ros-roadmap.md) collects the facts behind the part in ROS 2 and the options that
