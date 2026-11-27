@@ -8,6 +8,7 @@ non-interactive shell starts those with SIGINT ignored).
 0.5.3 found nothing here: a peer that only connected did not listen, and a Zenoh 1.10 router does not route between
 peers (they reach each other directly), while the earlier router tests used sessions that listened."""
 
+import argparse
 import os
 import shlex
 import shutil
@@ -349,30 +350,113 @@ def test_a_background_job_of_a_script_ends_on_sigint_and_sigterm(camera, name, s
 
 
 HELD = """
+import signal
+import sys
+
+sys.argv, sys.orig_argv = {argv!r}, {orig_argv!r}  # as the console script or python -m starts it
+import xblick
+
+handler = signal.getsignal(signal.SIGTERM)
+print(handler.__name__ if callable(handler) else handler.name, flush=True)
+order = list(sys.modules)
+print(all(order.index("xblick._signals") < order.index(m) for m in ("xblick._core", "numpy", "xblick.camera")))
+"""
+
+PY = sys.executable
+
+
+@pytest.mark.parametrize("argv, orig_argv, handler", [
+    (["/venv/bin/xblick", "test-camera"], [PY, "/venv/bin/xblick", "test-camera"], "note"),
+    (["/venv/bin/xblick", "list"], [PY, "/venv/bin/xblick", "list"], "note"),
+    (["-m", "hz", "/T"], [PY, "-X", "importtime", "-m", "xblick.cli", "hz", "/T"], "note"),
+    (["-m", "router"], [PY, "-mxblick.cli", "router"], "note"),
+    (["/venv/bin/xblick", "relay"], [PY, "/venv/bin/xblick", "relay"], "SIG_DFL"),
+    (["/venv/bin/xblick"], [PY, "/venv/bin/xblick"], "SIG_DFL"),
+    (["/venv/bin/xblick", "--connect", "pc"], [PY, "/venv/bin/xblick", "--connect", "pc"], "SIG_DFL"),
+    (["-m", "relay"], [PY, "-m", "xblick.cli", "relay"], "SIG_DFL"),
+    (["-m", "test-camera"], [PY, "-m", "tool.main", "test-camera"], "SIG_DFL"),
+    (["a-program", "test-camera"], [PY, "a-program", "test-camera"], "SIG_DFL"),
+    (["-c", "test-camera"], [PY, "-c", "import xblick", "test-camera"], "SIG_DFL")])
+def test_signals_are_held_from_the_first_line_of_the_package(argv, orig_argv, handler):
+    """The package (xblick/__init__.py, _signals.hold) takes SIGTERM and SIGINT before its other imports (_core,
+    numpy, the camera code) when the process is an xblick command, the console script or python -m xblick.cli; not
+    for xblick relay (the relay keeps the signals as started), the terminal interface (Textual's), or an import by
+    another program, also not by one started with -m."""
+    done = subprocess.run([sys.executable, "-c", HELD.format(argv=argv, orig_argv=orig_argv)],
+                          stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60, env=ENV)
+    assert done.returncode == 0 and done.stdout == f"{handler}\nTrue\n" and not done.stderr, done.stdout + done.stderr
+
+
+STARTING = """
 import os
 import signal
 import sys
 
-sys.argv = sys.argv[1:]  # as the console script starts it: xblick <command> ...
+sys.argv = ["xblick", *sys.argv[1:]]  # as the console script starts it: xblick <command> ...
 import xblick.cli as cli
 
-handler = signal.getsignal(signal.SIGTERM)
-print(handler.__name__ if callable(handler) else handler.name, flush=True)
-if sys.argv[:2] == ["xblick", "test-camera"]:
-    os.kill(os.getpid(), signal.SIGTERM)  # while it starts: before main()
-    sys.exit(cli.main())
+os.kill(os.getpid(), getattr(signal, sys.argv.pop(1)))  # while it starts: before main()
+sys.exit(cli.main())
 """
 
 
-@pytest.mark.parametrize("argv, handler", [(["xblick", "test-camera"], "hold"), (["xblick", "relay"], "SIG_DFL"),
-                                           (["xblick"], "SIG_DFL"), (["a-program", "test-camera"], "SIG_DFL")])
-def test_signals_while_a_command_starts_are_held(argv, handler):
-    """xblick.cli takes SIGTERM and SIGINT before its imports when it starts a command of the program, and main()
-    ends the command with exit code 0 before it begins when one came; not for ``xblick relay`` (the relay keeps the
-    signals as started), the terminal interface (Textual's), or an import by another program."""
-    done = subprocess.run([sys.executable, "-c", HELD, *argv], stdin=subprocess.DEVNULL, capture_output=True,
-                          text=True, timeout=60, env=ENV)
-    assert done.returncode == 0 and done.stdout == f"{handler}\n" and not done.stderr, done.stdout + done.stderr
+@pytest.mark.parametrize("command, sig, status", [
+    (["test-camera"], "SIGTERM", 0), (["test-camera"], "SIGINT", 0), (["router"], "SIGTERM", 0),
+    (["view", "test/camera/color"], "SIGINT", 0),
+    (["list"], "SIGTERM", -signal.SIGTERM), (["list"], "SIGINT", -signal.SIGINT),
+    (["hz", "/image_raw"], "SIGTERM", -signal.SIGTERM), (["param", "--nodes"], "SIGINT", -signal.SIGINT)])
+def test_a_signal_while_a_command_starts_ends_it_before_it_begins(command, sig, status):
+    """A signal held while the command started (_signals.held): main() ends it before it begins. A long-running
+    command with exit code 0, as on a later Ctrl-C or SIGTERM; a one-shot command (cli.ONE_SHOT) by the signal
+    itself, as an interrupted one (130 for SIGINT, 143 for SIGTERM in a shell). Nothing printed in either case."""
+    done = subprocess.run([sys.executable, "-c", STARTING, sig, *command], stdin=subprocess.DEVNULL,
+                          capture_output=True, text=True, timeout=60, env=ENV)
+    assert done.returncode == status and not done.stdout and not done.stderr, (done.returncode, done.stdout,
+                                                                               done.stderr)
+
+
+INTERRUPTED = """
+import sys
+
+import xblick.cli as cli
+
+
+def interrupted(*args, **kwargs):
+    raise KeyboardInterrupt  # Ctrl-C or SIGTERM after main() took the signals, before the command's own handler
+
+
+name = sys.argv[1]
+if name == "router":
+    cli.router.serve = interrupted
+else:
+    setattr(cli, {"test-camera": "_test_camera", "view": "_view", "cam": "_cam", "list": "_list"}[name], interrupted)
+sys.exit(cli.main(sys.argv[1:]))
+"""
+
+
+@pytest.mark.parametrize("command, status", [
+    (["router"], 0), (["view", "test/camera/color"], 0), (["cam", "/dev/video0"], 0), (["test-camera"], 0),
+    (["list"], -signal.SIGINT)])
+def test_a_keyboard_interrupt_before_the_command_takes_it_ends_a_long_running_command_with_0(command, status):
+    """main() ends a long-running command with exit code 0 on a KeyboardInterrupt that comes before the command's
+    own handler (end_on_signals has turned SIGTERM into one); before, router, view and cam ended by SIGINT then. A
+    one-shot command keeps the interrupted end: the traceback, and Python ends by SIGINT."""
+    done = subprocess.run([sys.executable, "-c", INTERRUPTED, *command], stdin=subprocess.DEVNULL,
+                          capture_output=True, text=True, timeout=60, env=ENV)
+    assert done.returncode == status, (done.returncode, done.stdout, done.stderr)
+    assert ("KeyboardInterrupt" in done.stderr) == (status != 0), done.stderr
+
+
+def test_every_command_is_one_shot_or_long_running():
+    """cli.ONE_SHOT names commands of the parser, and every other command but relay serves until it is stopped: a new
+    command needs its place in that set."""
+    from xblick import cli
+
+    parser = cli.build_parser()
+    names = set(next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction)).choices)
+    assert cli.ONE_SHOT <= names
+    assert names - cli.ONE_SHOT - {"relay"} == {"test-camera", "cam", "router", "view", "diagnostics", "rerun", "mps",
+                                                 "record", "play"}
 
 
 def caught(pid: int) -> int:
@@ -386,8 +470,8 @@ def caught(pid: int) -> int:
 
 @pytest.mark.skipif(not os.path.exists("/proc/self/status"), reason="needs /proc")
 def test_a_sigterm_as_early_as_the_command_takes_it_ends_it_with_0(router):
-    """SIGTERM at the first moment ``xblick test-camera`` has a handler for it, which xblick.cli installs before its
-    imports (cli._hold_signals): the command ends with exit code 0 and no traceback, as on a later SIGTERM. Before,
+    """SIGTERM at the first moment ``xblick test-camera`` has a handler for it, which the package installs before its
+    other imports (_signals.hold): the command ends with exit code 0 and no traceback, as on a later SIGTERM. Before,
     the handler came after the imports and the parsing, and a SIGTERM before it, under load, killed the command
     (exit 143)."""
     process = subprocess.Popen(commands(router)["test-camera"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,

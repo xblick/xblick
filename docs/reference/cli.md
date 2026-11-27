@@ -64,6 +64,12 @@ and says that a client needs its router there. In our tests Zenoh gave up within
 session, such as a `--listen` port that is taken, also ends with one line. Nodes that open their session with
 `session.open_from_args` and the C++ programs do the same.
 
+Ctrl-C and SIGTERM end every command, also as a background job of a script, and also while it starts. A command that
+serves until it is stopped, such as `router`, `test-camera`, `cam`, `view`, `rerun`, `record` or `play`, then ends
+with exit code 0. The commands that end on their own, `list`, `hz`, `snapshot`, `param`, `recorder` and `clean`, end
+as interrupted, with a traceback: a shell shows exit status 130 for both signals. A signal while one of them starts
+ends it by that signal, without output: 143 for SIGTERM and 130 for SIGINT. `xblick relay` and the terminal interface keep the signals of the relay and of Textual.
+
 ## Router
 
 ### `xblick router`

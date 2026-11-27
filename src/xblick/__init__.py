@@ -1,5 +1,9 @@
 """Durchblick: camera streams and perception results over Zenoh, with ROS 2 message types on the wire."""
 
+from . import _signals
+
+_signals.hold()  # an xblick command: SIGTERM and SIGINT held from here on, before the imports below (_signals.py)
+
 from . import _core, gpu, topics
 from .camera import (CameraPublisher, Frame, ImageSubscriber, ProtocolError, StaticTransformPublisher,
                      StaticTransformSubscriber, TransformPublisher, TransformSubscriber, query_info)

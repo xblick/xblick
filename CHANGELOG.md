@@ -61,7 +61,8 @@ streams, transforms and parameters, and it reads theirs.
 - A Session in ROS 2 that a program drops without `close()` is released again when it is collected, as without ROS.
 - `xblick play --loop`: a `/tf_static` held twice in a file no longer adds a gap as long as the recording between passes.
 - `xblick test-camera` ends with exit code 0 also when SIGTERM or Ctrl-C comes while it starts (it ended by SIGINT).
-- An `xblick` command takes SIGTERM and SIGINT from before the imports of `xblick.cli` on: one that comes while it starts ends it with exit code 0 before it begins (SIGTERM killed it, and SIGINT did nothing to a background job of a script).
+- An `xblick` command takes SIGTERM and SIGINT from the first line of the package on, before `_core`, numpy and the camera code are imported (a plain `import xblick` in a program, `xblick relay` and the terminal interface keep their signals): one that comes while it starts ends it before it begins (SIGTERM killed it, and SIGINT did nothing to a background job of a script). A command that serves until it is stopped then ends with exit code 0; `list`, `hz`, `snapshot`, `param`, `recorder` and `clean` end by that signal (exit status 143 for SIGTERM and 130 for SIGINT in a shell).
+- `xblick router`, `view` and `cam` end with exit code 0 also on a Ctrl-C or SIGTERM that comes before their own handler (they ended by SIGINT), as `xblick test-camera` does.
 - The ROS graph (`ros.Graph`, C++ `ros::Graph`) knows which sessions are programs of ours from their declaration tokens, which it follows with history, instead of a liveliness query per session: a query that ended by its timeout under load made a program's ROS copy count as a ROS camera for good (`auto`'s fallback, `xblick list`).
 
 ### Known limit
