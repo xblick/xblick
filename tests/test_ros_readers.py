@@ -53,13 +53,15 @@ class RosCamera:
     no program of ours, publishing a 4 x 6 mono8 image (or its PNG; on a ``.../compressedDepth`` topic a 16UC1 image
     as ROS's compressedDepth plugin writes it) and a CameraInfo every 50 ms until ``close``. A (topic, type, "16UC1")
     triple publishes the 16UC1 depth image instead: on an Image topic as it is, on a ``.../compressed`` topic as
-    image_transport's compressed plugin turns depth into 8-bit JPEG (here an 8-bit PNG of the clamped values)."""
+    image_transport's compressed plugin turns depth into 8-bit JPEG (here an 8-bit PNG of the clamped values). A
+    (topic, Image type, encoding) triple of another encoding publishes the mono8 image's bytes under that encoding."""
 
     def __init__(self, endpoint: str, domain: int = DOMAIN, **topics_):
         self.session = session.open_session(connect=[endpoint], declare=False,
                                             ros_options=session.RosOptions(domain, "ros_camera"))
         self.topics = {name: spec[:2] for name, spec in topics_.items()}
-        self.depth_topics = {name for name, spec in topics_.items() if spec[2:] == ("16UC1",)}
+        self.encodings = {name: spec[2] for name, spec in topics_.items() if len(spec) > 2}
+        self.depth_topics = {name for name, encoding in self.encodings.items() if encoding == "16UC1"}
         self.publishers = {name: self.session.ros.node.publisher(topic, kind)
                            for name, (topic, kind) in self.topics.items()}
         self.image = np.arange(24, dtype=np.uint8).reshape(4, 6)
@@ -74,6 +76,8 @@ class RosCamera:
             for name, publisher in self.publishers.items():
                 if publisher.type_name == Image.TYPE and name in self.depth_topics:
                     payload = numpy_to_image(self.depth, "16UC1", header).serialize()
+                elif publisher.type_name == Image.TYPE and name in self.encodings:
+                    payload = Image(header, 4, 6, self.encodings[name], 0, 6, self.image.tobytes()).serialize()
                 elif publisher.type_name == Image.TYPE:
                     payload = numpy_to_image(self.image, "mono8", header).serialize()
                 elif publisher.type_name == ros.COMPRESSED_TYPE and self.topics[name][0].endswith(
@@ -494,6 +498,50 @@ def test_xblick_rerun_bridges_a_ros_camera(network):
         assert not of(rr, "Transform3D")
     finally:
         bridge.close()
+        camera.close()
+
+
+def test_xblick_rerun_leaves_out_a_found_ros_camera_it_does_not_show(network):
+    """Found by discovery (drop_unshown), a ROS camera of an encoding not shown (bayer_rggb8: not drawn; yuv422: not
+    an encoding of ours) is handed over once by unshown(), removed and not added again; the bridge goes on. Named, the
+    same camera ends the bridge with its error."""
+    from test_rerun_bridge import FakeRerun
+
+    from xblick.camera import ProtocolError
+    from xblick.rerun_bridge import RerunBridge
+
+    endpoint, reader = network
+    camera = RosCamera(endpoint, ok=("/fine/image_raw", Image.TYPE),
+                       bayer=("/bayer/image_raw", Image.TYPE, "bayer_rggb8"),
+                       yuv=("/yuv/image_raw", Image.TYPE, "yuv422"))
+    topics_ = ["/fine/image_raw", "/bayer/image_raw", "/yuv/image_raw"]
+    bridge = RerunBridge(reader, FakeRerun(), topics_, drop_unshown=True)
+    try:
+        dropped = []
+        end = time.monotonic() + 8.0
+        while len(dropped) < 2 and time.monotonic() < end:
+            bridge.check()
+            dropped += bridge.unshown()
+            time.sleep(0.05)
+        assert sorted(t for t, _ in dropped) == ["/bayer/image_raw", "/yuv/image_raw"], dropped
+        assert "bayer_rggb8 images are not shown" in dict(dropped)["/bayer/image_raw"]
+        assert "yuv422" in dict(dropped)["/yuv/image_raw"]
+        assert bridge.bases == ["/fine/image_raw"]
+        assert bridge.add(bases=topics_) == [] and bridge.bases == ["/fine/image_raw"]
+        time.sleep(0.3)
+        bridge.check()
+        assert bridge.unshown() == [] and bridge.frames["/fine/image_raw"] > 0
+    finally:
+        bridge.close()
+    named = RerunBridge(reader, FakeRerun(), ["/bayer/image_raw"])
+    try:
+        with pytest.raises(ProtocolError, match="bayer_rggb8 images are not shown"):
+            end = time.monotonic() + 8.0
+            while time.monotonic() < end:
+                named.check()
+                time.sleep(0.05)
+    finally:
+        named.close()
         camera.close()
 
 

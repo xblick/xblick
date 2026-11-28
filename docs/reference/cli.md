@@ -131,7 +131,9 @@ Prints the state of every program that publishes for a camera, once per second.
 ### `xblick rerun [streams ...]`
 
 Shows streams and node results in the Rerun viewer. It shows its selection: the streams given as arguments and the
-topics that the options below name. Without a selection it shows everything that it finds. Needs the extra
+topics that the options below name. Without a selection it shows everything that it finds. A ROS camera that it
+finds with an encoding it does not show, such as `yuv422` or `bayer_rggb8`, is named in one line and left out; a ROS
+topic named in the selection with such an encoding ends `xblick rerun` with that error. Needs the extra
 `xblick[rerun]`. See the [viewer guide](../guides/viewer.md).
 
 | Option | Meaning |
