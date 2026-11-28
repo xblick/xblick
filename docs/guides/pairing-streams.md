@@ -127,10 +127,11 @@ frame. For such a partner, and until the partner has two samples, `PartnerHistor
 is the same for every offset.
 
 The maximum offset is `history.PAIR_MAX_OFFSET_NS` by default, 20 ms (C++ `xblick::kPairMaxOffsetNs`). It covers
-the Azure Kinect's colour and depth of one capture, which lie up to 17 ms apart with auto exposure. It pairs no
-neighbouring frame of a 30 or 15 Hz partner. A value of 0 requires equal stamps. `history.HALF_PERIOD` asks for half
-the partner's measured frame period. That offset changes with the rate and with dropped frames, and it is unknown
-until two samples came. At 30 Hz it is 16.7 ms, which is too small for the Azure Kinect.
+a same-capture stamp offset of up to 17 ms, as can occur with Azure Kinect auto exposure. The nearest stamp can
+still belong to a neighbouring capture. At 30 Hz, a 17 ms offset leaves the preceding or following stamp about
+16.3 ms away. A value of 0 requires equal stamps. `history.HALF_PERIOD` asks for half the partner's measured frame
+period. That offset changes with the rate and with dropped frames. It is unknown until two distinct stamps arrive.
+At 30 Hz it is about 16.7 ms.
 
 In C++ the pieces are `SubscriberOptions::keep_recent`, `ImageSubscriber::recent_stamps` and `ImageSubscriber::at`.
 `partner_of` in `xblick/pairing.hpp` chooses the stamp. `PartnerHistory` calls the same function, so Python and

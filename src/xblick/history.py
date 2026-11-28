@@ -11,9 +11,10 @@ other streams refer to by stamp (the depth of a colour frame, the image a segmen
 
 A stream paired with another (the depth of a colour frame, a mask of an image) is the partner of a primary stream: a
 ``PartnerHistory`` keeps its last samples as they came, and reads (decodes, or copies out of the publisher's ring)
-only the one a primary frame is paired with (``at``; ``wait`` for one that may still come), by default the nearest
-within half the partner's frame period. Take a frame's partners when you take the frame, before working on it: a
-shared-memory or CUDA sample is valid only until its ring slot is reused. With ``--max-hz`` only the primary is
+only the one paired with a primary frame. Use ``at`` to read it or ``wait`` for one that may still come.
+The default pairs with the nearest stamp within 20 ms. Pass ``HALF_PERIOD`` to use half the partner's measured
+frame period. Take a frame's partners when you take the frame, before working on it. A shared-memory or CUDA sample
+is valid only until its ring slot is reused. With ``--max-hz`` only the primary is
 limited (its subscriber's ``max_hz``); the partner's frames of skipped primary frames are never read, and no pair is
 lost to the limit (each stream limited on its own would lose the pairs whose stamps lie on both sides of a period's
 edge).
@@ -126,8 +127,7 @@ LOST_HINT = ("the partner frames are read too late: take a frame and its partner
              "a camera node's slots setting)")
 
 # The default largest offset of a partner sample from its primary frame (C++ kPairMaxOffsetNs, pairing.hpp): 20 ms
-# covers the Azure Kinect's colour and depth of one capture (up to 17 ms apart with auto exposure) and pairs no
-# neighbouring frame of a 30 or 15 Hz partner.
+# covers a same-capture stamp offset of up to 17 ms. The nearest stamp can still belong to a neighbouring capture.
 PAIR_MAX_OFFSET_NS: int = _core.PAIR_MAX_OFFSET_NS
 # max_offset_ns asked for by name: half the partner's frame period, measured from its kept samples (None while fewer
 # than two came). Never a default: it changes with the camera's rate and with dropped frames.

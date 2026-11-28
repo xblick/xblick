@@ -19,9 +19,8 @@
 namespace xblick
 {
     // The default maximum offset of a partner sample from its primary frame, 20 ms (Python's
-    // history.PAIR_MAX_OFFSET_NS). It covers the Azure Kinect's colour and depth of one capture (up to 17 ms apart with
-    // auto exposure) and pairs no neighbouring frame of a 30 or 15 Hz partner. It is fixed: half a measured period
-    // (max_offset_ns empty below) is 16.7 ms at 30 Hz, too small for that camera, and unknown before two samples.
+    // history.PAIR_MAX_OFFSET_NS). The nearest stamp can still belong to a neighbouring capture. Half the measured
+    // period (max_offset_ns empty below) is 16.7 ms at 30 Hz and unknown before two distinct stamps.
     inline constexpr std::int64_t kPairMaxOffsetNs = 20'000'000;
 
     // The partner's frame period: the median step of the kept stamps, each stamp counted once (of an even number of
