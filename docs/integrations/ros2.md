@@ -613,8 +613,8 @@ type hashes of the part in ROS 2.
   it. Lyrical subscribers get these types from Jazzy publishers and from ours.
 - Each `xblick` command is a ROS node while it runs, such as `/xblick_hz`. Two such commands at once share a name
   and each warns once.
-- A subscriber of every key (`**`), such as the traffic meter of the terminal interface, also subscribes to the ROS
-  copies. The publishers then send them as well. The terminal interface shows and counts our keys only.
+- A subscriber of every key (`**`), such as the traffic meter of the terminal interface, also receives the ROS
+  copies while a ROS subscriber has them sent. The terminal interface shows and counts our keys only.
 - The C++ tool `xblick-cpp-camera` keeps its fixed frame `TestCamera`. It serves the tests, which compare its bytes.
 - A ROS camera that `xblick record` recorded plays as a stream of ours only when its topics follow image_transport's
   names (`/<base>/image_raw` and `/<base>/camera_info`). An image topic of another name, such as `/resize/image`,

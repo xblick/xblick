@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <random>
 #include <set>
@@ -979,13 +980,29 @@ namespace xblick::detail
             }
             if (consume and period_ns_ > 0)
             {
-                const std::int64_t period = stamp_of(*item) / period_ns_;  // the stamp, not decoded
+                const std::int64_t stamp = stamp_of(*item);  // the stamp, not decoded
+                const std::int64_t period = stamp / period_ns_;
                 if (last_period_ == period)
                 {
                     ++skipped_max_hz_;  // not decoded, its ring not read: the next within the timeout
+                    // stamps that do not advance (a ROS publisher's zero or fixed header.stamp; ours always stamp):
+                    // all in one period, none handed out after the first; said once, as Python's Subscription
+                    stuck_ = stamp == last_stamp_ ? stuck_ + 1 : 0;
+                    if (stuck_ == kStuckFrames and not stuck_said_)
+                    {
+                        stuck_said_ = true;
+                        std::fprintf(stderr,
+                                     "xblick: %s: %d frames in a row carry the stamp %lld ns of the frame taken before "
+                                     "them (the publisher's header stamps do not advance); max_hz %g chooses frames by "
+                                     "their stamps and hands out none of these: fix the publisher's stamps, or read "
+                                     "every frame (max_hz 0)\n",
+                                     base_.c_str(), kStuckFrames, static_cast<long long>(stamp), max_hz_);
+                    }
                     continue;
                 }
                 last_period_ = period;
+                last_stamp_ = stamp;
+                stuck_ = 0;
             }
             const Transport t = item->transport;
             return Taken{std::move(item), t};
@@ -1022,6 +1039,7 @@ namespace xblick::detail
         {
             throw std::invalid_argument("max_hz " + std::to_string(max_hz) + ": a rate above 0, or 0 for every frame");
         }
+        max_hz_ = max_hz;
         period_ns_ = max_hz > 0 ? static_cast<std::int64_t>(std::llround(1e9 / max_hz)) : 0;
     }
 

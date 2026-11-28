@@ -331,6 +331,28 @@ def test_python_to_cpp_max_hz_and_age_at_send(transport):
     assert skipped >= 2 * len(records), err
 
 
+def test_cpp_max_hz_says_once_that_a_publishers_stamps_do_not_advance():
+    """C++'s twin of test_ros_readers.py's: frames whose stamp stays the same all lie in one period of max_hz, so the
+    first is taken and no other; one line on stderr says why, and every later frame is counted as skipped."""
+    port = free_port()
+    proc = probe(port, "compressed", 1000, "--max-hz", "5", timeout=3)
+    session = open_session(listen=[f"127.0.0.1:{port}"])
+    pub = CameraPublisher(session, "t/py/color", encoding="rgb8", frame_id="PyCamera", source="py", codec="png")
+    end = time.monotonic() + 30
+    try:
+        while proc.poll() is None and time.monotonic() < end:
+            if pub.subscribed:
+                pub.publish(pattern("rgb8", pub.seq + 1), stamp_ns=1_000_000_000)
+            time.sleep(1 / 30)
+        out, err = proc.communicate(timeout=10)
+    finally:
+        pub.close()
+        session.close()
+    assert len(out.splitlines()) == 1 and err.count("header stamps do not advance") == 1, err
+    assert "t/py/color" in err and "max_hz 5 " in err, err
+    assert int(err.rsplit("skipped for max-hz", 1)[1].split()[0]) >= 5, err
+
+
 @pytest.mark.parametrize("codec", ["png", "rvl"])
 def test_python_to_cpp_depth(codec):
     port = free_port()

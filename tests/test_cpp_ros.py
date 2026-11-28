@@ -183,7 +183,8 @@ BASE = "rc/cpp/color"
 
 class CppCamera:
     """xblick-cpp-camera listening on a free port (camera tool arguments ``extra``), and an observer session that sees
-    every key it sends (its subscriber on ``**`` also makes every publisher, ROS's too, send) and every ROS token."""
+    every key it sends and every ROS token. Its subscriber on ``**`` makes our publishers send, not ROS's: those need a
+    ROS subscription of their topic (``ros_readers``)."""
 
     def __init__(self, tmp_path, *extra):
         self.port = free_port()
@@ -206,7 +207,19 @@ class CppCamera:
     def ros_session(self, node="py_reader"):
         return open_session(connect=[f"tcp/127.0.0.1:{self.port}"], ros_options=RosOptions(DOMAIN, node))
 
+    def ros_readers(self, topics: dict[str, str]) -> str:
+        """A ROS session with a subscription of each topic in its type, so that the camera's ROS publishers of these
+        topics send (a subscriber on ``**`` switches none on); closed with the camera. Its zid, whose tokens a test
+        leaves out."""
+        self._reader = self.ros_session("py_ros_readers")
+        self._readers = [self._reader.ros.node.subscriber(t, typ, lambda *_: None) for t, typ in topics.items()]
+        return str(self._reader.info.zid())
+
     def close(self):
+        for reader in getattr(self, "_readers", []):
+            reader.close()
+        if hasattr(self, "_reader"):
+            self._reader.close()
         self._sub.undeclare()
         self._live.undeclare()
         self.observer.close()
@@ -228,11 +241,14 @@ def ours(keys) -> set[str]:
 
 def test_cpp_without_ros_nothing_of_ros_goes_on_the_wire(tmp_path):
     """With --no-ros a C++ program sends what it sent before ROS was on by default: our keys only, no rmw_zenoh key,
-    no ROS token; in ROS 2 (the default) its own keys are the same."""
+    no ROS token; in ROS 2 (the default) its own keys are the same, and ROS's beside them for ROS's subscribers."""
     seen = {}
     for on, flag in ((False, ["--no-ros"]), (True, ["--ros-domain", DOMAIN])):
         camera = CppCamera(tmp_path, "--tf", "--diagnostics", "--params", *flag)
         try:
+            if on:
+                camera.ros_readers({"/rc/cpp/color/image_raw": "sensor_msgs/msg/Image",
+                                    "/tf": "tf2_msgs/msg/TFMessage"})
             wait_until(lambda: f"{BASE}/image_raw" in camera.keys and "rc/cpp/tf" in camera.keys)
             time.sleep(1.5)
             seen[on] = (dict(camera.keys), set(camera.tokens))
@@ -252,8 +268,9 @@ def test_cpp_with_ros_rmw_zenoh_keys_tokens_and_attachments(tmp_path):
                   "/rc/cpp/color/image_raw/compressed": "sensor_msgs/msg/CompressedImage",
                   "/tf": "tf2_msgs/msg/TFMessage", "/rc/cpp/diagnostics": "diagnostic_msgs/msg/DiagnosticArray"}
         data = {ros.data_key(DOMAIN, t, typ, ros.hash_of(typ)): t for t, typ in topics.items()}
+        readers = camera.ros_readers(topics)
         wait_until(lambda: set(data) <= set(camera.keys))
-        parsed = [ros.parse_token(t) for t in set(camera.tokens)]
+        parsed = [t for t in map(ros.parse_token, set(camera.tokens)) if t.zid != readers]
         (node,) = [t for t in parsed if t.kind == ros.NODE]
         assert (node.domain, node.namespace, node.node, node.node_id) == (DOMAIN, "/", "xblick_cpp_camera", "0")
         publishers = {t.topic: t for t in parsed if t.kind == ros.PUBLISHER}

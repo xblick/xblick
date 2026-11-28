@@ -70,8 +70,8 @@ class TrafficMeter:
     publish_ns minus the stamp, the publisher's clock alone) and at receive (this host's receive time minus the stamp:
     with the way here, and two hosts' clocks). ``take_ages`` hands out the ages since it was called last; ``recent``
     the last samples' of a key. ``keep`` (keys) also keeps their last sample (``last``), for a look at its content.
-    Subscribing makes publishers produce what nobody else takes (raw images, every transport, and with ``**`` also
-    their ROS 2 mirrors): meter what you look at. ROS 2's keys (``ros_key``) are not counted: Durchblick's own only."""
+    Subscribing makes publishers produce what nobody else takes (raw images, every transport; not their ROS 2
+    mirrors, which only a ROS subscriber switches on): meter what you look at. ROS 2's keys (``ros_key``) are not counted: Durchblick's own only."""
 
     RECENT = 20  # samples per key in ``recent``
     WINDOW_MAX = 10_000  # ages per key between two take_ages (a fast topic and a slow reader)

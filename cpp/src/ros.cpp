@@ -1129,7 +1129,9 @@ namespace xblick::ros
 
     Publisher::Publisher(zenoh::Session& session, Ros& ros, const NodeName& node, const std::string& topic,
                          const std::string& type_name, const Qos& qos)
-        : entity_(ros, node, kPublisher, topic, type_name, qos, ros.next_id())
+        : entity_(ros, node, kPublisher, topic, type_name, qos, ros.next_id()),
+          session_(session),
+          part_(ros.weak_from_this())
     {
         zenoh::Session::PublisherOptions options;
         options.congestion_control = congestion(qos);
@@ -1199,13 +1201,116 @@ namespace xblick::ros
         cache_token_.reset();
         cache_queryable_.reset();
         publisher_.reset();
+        std::lock_guard lock(readers_mutex_);
+        readers_.reset();
     }
 
     bool Publisher::matched() const
     {
         // transient local: always, as Python's RosPublisher.matched; its samples go into the cache for subscribers
         // that come later, whoever reads now
-        return cache_ != nullptr or publisher_->get_matching_status().matching;
+        if (cache_ != nullptr)
+        {
+            return true;
+        }
+        if (not publisher_->get_matching_status().matching)
+        {
+            return false;
+        }
+        std::shared_ptr<Readers> readers;
+        {
+            std::lock_guard lock(readers_mutex_);
+            if (not readers_)
+            {
+                const std::shared_ptr<Ros> part = part_.lock();
+                if (not part)
+                {
+                    return false;  // the session's part in ROS has gone: nobody of ROS reads through it
+                }
+                readers_ = part->readers(session_);
+            }
+            readers = readers_;
+        }
+        return readers->reads(topic(), type_name());
+    }
+
+    // ------------------------------------------------------------------------------------------- Readers
+
+    struct Readers::State
+    {
+        mutable std::mutex mutex;
+        std::map<std::string, std::pair<std::string, std::string>> tokens;  // key -> (topic, type)
+        std::map<std::pair<std::string, std::string>, std::size_t> count;    // (topic, type) -> its tokens
+    };
+
+    Readers::Readers(zenoh::Session& session, int domain) : state_(std::make_shared<State>())
+    {
+        const std::string pattern = std::string(kAdminSpace) + "/" + std::to_string(domain) + "/*/*/*/" +
+                                    std::string(kSubscription) + "/**";
+        zenoh::Session::LivelinessSubscriberOptions options;
+        options.history = true;
+        subscriber_.emplace(session.liveliness_declare_subscriber(
+            zenoh::KeyExpr(pattern),
+            [state = state_](const zenoh::Sample& sample) {
+                const std::string key(sample.get_keyexpr().as_string_view());
+                if (sample.get_kind() != Z_SAMPLE_KIND_PUT)
+                {
+                    std::lock_guard lock(state->mutex);
+                    const auto found = state->tokens.find(key);
+                    if (found != state->tokens.end())
+                    {
+                        if (--state->count[found->second] == 0)
+                        {
+                            state->count.erase(found->second);
+                        }
+                        state->tokens.erase(found);
+                    }
+                    return;
+                }
+                std::pair<std::string, std::string> read;
+                try
+                {
+                    const Token token = Token::parse(key);
+                    if (not token.topic or not token.type_name)
+                    {
+                        return;
+                    }
+                    read = {*token.topic, *token.type_name};
+                }
+                catch (const RosError&)
+                {
+                    return;  // not a token rmw_zenoh would take
+                }
+                std::lock_guard lock(state->mutex);
+                if (state->tokens.emplace(key, read).second)
+                {
+                    ++state->count[read];
+                }
+            },
+            zenoh::closures::none, std::move(options)));
+    }
+
+    Readers::~Readers()
+    {
+        subscriber_.reset();
+    }
+
+    bool Readers::reads(const std::string& topic, const std::string& type_name) const
+    {
+        std::lock_guard lock(state_->mutex);
+        return state_->count.count({topic, type_name}) != 0;
+    }
+
+    std::shared_ptr<Readers> Ros::readers(zenoh::Session& session)
+    {
+        std::lock_guard lock(readers_mutex_);
+        if (std::shared_ptr<Readers> readers = readers_.lock())
+        {
+            return readers;
+        }
+        auto readers = std::make_shared<Readers>(session, domain());
+        readers_ = readers;
+        return readers;
     }
 
     void Publisher::put(std::span<const std::uint8_t> payload)
@@ -1257,14 +1362,63 @@ namespace xblick::ros
         return image_topic.substr(0, image_topic.rfind('/')) + "/" + std::string(kCameraInfoTopic);
     }
 
+    namespace detail
+    {
+        std::atomic<std::int64_t> graph_declarations_dropped_until_ns{0};
+    }
+
     struct Graph::State
     {
         mutable std::mutex mutex;
         std::map<std::string, Token> tokens;
         std::set<std::string> xblick;  // the zids of the sessions that declared a program of ours
+        // the publishers' tokens (key, put) held until the query of the declarations there are has its replies
+        bool history_done = false;
+        bool history_new = false;  // a reply of that query made a zid known
+        std::vector<std::pair<std::string, bool>> held;
         std::function<void()> changed;
         std::string own_zid;
-        std::atomic<bool> closed{false};
+        std::size_t before = 0, after = 0;  // a declaration key's parts around the zid
+        std::mutex calling;                 // closed and the calls of changed: none once ~Graph has begun
+        bool closed = false;
+
+        // A declaration's key: its zid known as ours (called with the mutex); true when it was new.
+        bool declared(const std::string& key)
+        {
+            if (key.size() <= before + after)
+            {
+                return false;
+            }
+            const std::string zid = key.substr(before, key.size() - before - after);
+            return zid.find('/') == std::string::npos and xblick.insert(zid).second;
+        }
+
+        // A publisher's token came (put) or went (called with the mutex); true when that changed what is known.
+        bool seen(const std::string& key, bool put)
+        {
+            if (put)
+            {
+                try
+                {
+                    tokens.insert_or_assign(key, Token::parse(key));
+                }
+                catch (const RosError&)
+                {
+                    return false;  // not a token rmw_zenoh would take
+                }
+                return true;
+            }
+            return tokens.erase(key) != 0;
+        }
+
+        void tell()
+        {
+            std::lock_guard lock(calling);
+            if (not closed and changed)
+            {
+                changed();
+            }
+        }
     };
 
     Graph::Graph(zenoh::Session& session, int domain, std::function<void()> changed)
@@ -1275,33 +1429,29 @@ namespace xblick::ros
         // the declarations first (the class's comment in ros.hpp): Zenoh calls the callbacks of one link's samples
         // one after the other, and a program's declaration comes before its ROS tokens
         const std::string all = declaration_key("*");
-        const std::size_t before = all.find('*'), after = all.size() - before - 1;
+        state_->before = all.find('*');
+        state_->after = all.size() - state_->before - 1;
         zenoh::Session::LivelinessSubscriberOptions declared;
         declared.history = true;
         declarations_.emplace(session.liveliness_declare_subscriber(
             zenoh::KeyExpr(all),
-            [state = state_, before, after](const zenoh::Sample& sample) {
-                if (state->closed.load() or sample.get_kind() != Z_SAMPLE_KIND_PUT)
+            [state = state_](const zenoh::Sample& sample) {
+                if (sample.get_kind() != Z_SAMPLE_KIND_PUT)
                 {
                     return;  // a zid once declared stays ours: the tokens of a program that ends go in no fixed order
                 }
-                const std::string key(sample.get_keyexpr().as_string_view());
-                if (key.size() <= before + after)
+                if (detail::graph_declarations_dropped_until_ns.load() > now_ns())
                 {
-                    return;
+                    return;  // tests only (ros.hpp)
                 }
-                const std::string zid = key.substr(before, key.size() - before - after);
                 {
                     std::lock_guard lock(state->mutex);
-                    if (zid.find('/') != std::string::npos or not state->xblick.insert(zid).second)
+                    if (not state->declared(std::string(sample.get_keyexpr().as_string_view())))
                     {
                         return;
                     }
                 }
-                if (state->changed)
-                {
-                    state->changed();
-                }
+                state->tell();
             },
             zenoh::closures::none, std::move(declared)));
         const std::string pattern = std::string(kAdminSpace) + "/" + std::to_string(domain) + "/*/*/*/" +
@@ -1311,40 +1461,63 @@ namespace xblick::ros
         subscriber_.emplace(session.liveliness_declare_subscriber(
             zenoh::KeyExpr(pattern),
             [state = state_](const zenoh::Sample& sample) {
-                if (state->closed.load())
-                {
-                    return;
-                }
                 const std::string key(sample.get_keyexpr().as_string_view());
+                const bool put = sample.get_kind() == Z_SAMPLE_KIND_PUT;
                 {
                     std::lock_guard lock(state->mutex);
-                    if (sample.get_kind() == Z_SAMPLE_KIND_PUT)
+                    if (not state->history_done)
                     {
-                        try
-                        {
-                            state->tokens.insert_or_assign(key, Token::parse(key));
-                        }
-                        catch (const RosError&)
-                        {
-                            return;  // not a token rmw_zenoh would take
-                        }
+                        state->held.emplace_back(key, put);  // until the declarations there are known
+                        return;
                     }
-                    else if (state->tokens.erase(key) == 0)
+                    if (not state->seen(key, put))
                     {
                         return;
                     }
                 }
-                if (state->changed)
-                {
-                    state->changed();
-                }
+                state->tell();
             },
             zenoh::closures::none, std::move(options)));
+        // the declarations there now, asked after both subscribers exist: the publishers' tokens are held until it
+        // has its replies (the class's comment in ros.hpp)
+        zenoh::Session::LivelinessGetOptions history;
+        history.timeout_ms = kGraphHistoryTimeoutMs;
+        session.liveliness_get(
+            zenoh::KeyExpr(all),
+            [state = state_](const zenoh::Reply& reply) {
+                if (reply.is_ok())
+                {
+                    const std::string key(reply.get_ok().get_keyexpr().as_string_view());
+                    std::lock_guard lock(state->mutex);
+                    state->history_new = state->declared(key) or state->history_new;
+                }
+            },
+            [state = state_] {
+                bool changed = false;
+                {
+                    std::lock_guard lock(state->mutex);
+                    changed = state->history_new;
+                    for (const auto& [key, put] : state->held)
+                    {
+                        changed = state->seen(key, put) or changed;
+                    }
+                    state->held.clear();
+                    state->history_done = true;
+                }
+                if (changed)
+                {
+                    state->tell();
+                }
+            },
+            std::move(history));
     }
 
     Graph::~Graph()
     {
-        state_->closed.store(true);
+        {
+            std::lock_guard lock(state_->calling);  // a call of changed under way ends first
+            state_->closed = true;
+        }
         subscriber_.reset();
         declarations_.reset();
     }

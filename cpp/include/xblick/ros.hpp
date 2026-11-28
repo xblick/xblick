@@ -112,6 +112,9 @@ namespace xblick::ros
     bool enabled_by_environment();
     inline constexpr std::string_view kClockTopic = "/clock";  // ROS's global clock (use_sim_time)
     inline constexpr int kClockWaitS = 1;  // --ros-clock: a program without its clock's publisher by then is told
+    // Graph: the query of the declarations there are, which the publishers' tokens wait for (Python's
+    // ros.HISTORY_TIMEOUT_S)
+    inline constexpr std::uint64_t kGraphHistoryTimeoutMs = 2000;
     // sensor_msgs/msg/Image -> sensor_msgs::msg::dds_::Image_ (a service: pkg/srv/Name -> pkg::srv::dds_::Name_).
     std::string dds_type(const std::string& type_name);
     std::string type_of_dds(const std::string& dds);
@@ -238,7 +241,30 @@ namespace xblick::ros
     namespace detail
     {
         using StaticTransform = std::tuple<std::string, std::array<double, 3>, std::array<double, 4>>;
+        // Tests only: until this time (ns since the epoch, system_clock), every Graph's declarations subscriber drops
+        // its samples, as if its history came late; the Graph's query of the declarations still has them.
+        extern std::atomic<std::int64_t> graph_declarations_dropped_until_ns;
     }
+
+    // The ROS subscriptions on a session's domain, as a liveliness subscriber with history keeps their tokens
+    // (Python's ros.Readers; made by the first Publisher::matched that has a Zenoh match, Ros::readers): reads(topic,
+    // type_name), whether one of them reads the topic in that type. Every ROS subscription has such a token
+    // (rmw_zenoh declares it with its subscriber, ours too, this session's own as well); a Zenoh subscriber on `**`
+    // (a storage, z_sub, a traffic meter) has none, so that a publisher sends its ROS form for ROS's subscribers only.
+    class Readers
+    {
+    public:
+        Readers(zenoh::Session& session, int domain);
+        ~Readers();
+        Readers(const Readers&) = delete;
+        Readers& operator=(const Readers&) = delete;
+        bool reads(const std::string& topic, const std::string& type_name) const;
+
+    private:
+        struct State;
+        std::shared_ptr<State> state_;
+        std::optional<zenoh::Subscriber<void>> subscriber_;
+    };
 
     // A session's part in ROS 2: domain, its program's node, the entity ids (one counter per session, as rmw_zenoh's
     // per context). The program's node carries its publishers, subscribers and its first parameters' services
@@ -296,6 +322,10 @@ namespace xblick::ros
         // (on_static_sample): one per Ros, as Python's, made by the first static publisher (mirror_tf) and shared by
         // all of them, so that it goes with the last of them, before the session.
         std::shared_ptr<Subscriber> static_reader(zenoh::Session& session);
+        // The ROS subscriptions on the domain (Readers), as Publisher::matched asks them: one per Ros, made at the
+        // first ask and shared by the publishers that asked, so that it goes with the last of them, before the
+        // session.
+        std::shared_ptr<Readers> readers(zenoh::Session& session);
 
     private:
         struct Duplicates;
@@ -327,6 +357,8 @@ namespace xblick::ros
         std::map<std::string, std::shared_ptr<void>> parameterless_;
         std::mutex static_reader_mutex_;  // static_reader_ (taken before graph_mutex_, never inside it)
         std::weak_ptr<Subscriber> static_reader_;
+        std::mutex readers_mutex_;  // readers_ (taken before graph_mutex_, never inside it)
+        std::weak_ptr<Readers> readers_;
         std::jthread clock_check_;  // last: it ends first (it reads the members above)
     };
 
@@ -378,8 +410,11 @@ namespace xblick::ros
         Publisher(const Publisher&) = delete;
         Publisher& operator=(const Publisher&) = delete;
 
-        // A ROS subscriber (or any other) of the key is known. Always true when transient local, as Python's
-        // RosPublisher.matched: its samples go into the cache for subscribers that come later.
+        // A ROS subscription of the topic in its type is known, as Python's RosPublisher.matched: a Zenoh subscriber
+        // of the key (Zenoh's matching status) and a subscription token of the topic and type in ROS's graph
+        // (Ros::readers, made at the first Zenoh match). A Zenoh subscriber without such a token (one on `**`: a
+        // storage, z_sub, a traffic meter) is none. Always true when transient local: its samples go into the cache
+        // for subscribers that come later. False once the session's part in ROS has gone.
         bool matched() const;
         void put(std::span<const std::uint8_t> payload);
         // The attachment of the next message, its sequence number counted: for a message that goes on keys of its
@@ -404,6 +439,10 @@ namespace xblick::ros
         std::uint64_t enrolled_ = 0;
         std::int64_t seq_ = 0;
         std::mutex mutex_;
+        zenoh::Session& session_;
+        std::weak_ptr<Ros> part_;                   // its Ros, for readers_
+        mutable std::mutex readers_mutex_;
+        mutable std::shared_ptr<Readers> readers_;  // at the first Zenoh match (matched)
         std::optional<zenoh::Publisher> publisher_;
         std::shared_ptr<Cache> cache_;                    // transient local
         std::optional<zenoh::Queryable<void>> cache_queryable_;
@@ -438,7 +477,13 @@ namespace xblick::ros
     // second liveliness subscriber with history, of every program's declaration token, declared before the
     // publishers' (not from a query per session, which, ended by its timeout under load, said "not ours" for good): a
     // program declares itself before it takes part in ROS, its tokens arrive in that order, and Zenoh calls the
-    // callbacks of one link one after the other. A zid once declared stays ours.
+    // callbacks of one link one after the other. That order holds for tokens that come live, not for the two
+    // subscribers' histories (each one a query of its own, whose replies come in no fixed order): the publishers'
+    // tokens are held until a liveliness query of every declaration, asked after both subscribers were declared, has
+    // its replies (at most kGraphHistoryTimeoutMs). A publisher in the history had its program's declaration before
+    // it, so that query has it. A query ended by its timeout under load gives the tokens as before: the declarations'
+    // subscriber still brings what it missed, and `changed` is called then. A zid once declared stays ours. No call
+    // of `changed` once the destructor has begun.
     class Graph
     {
     public:

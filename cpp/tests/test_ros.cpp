@@ -2,8 +2,10 @@
 // static_transform_publisher on domain 87) and 0.10.6 (ROS 2 Lyrical's cam2image and showimage on domain 77); the
 // same captures as tests/test_ros.py. The comparison with Python's
 // xblick.ros case by case is tests/test_cpp_ros.py. The live part (live()) runs on one session that reaches nobody:
-// the transient-local history, matched(), the program node's rename by its first Parameters, the services without
-// parameters over repeated Parameters, and the /tf_static reader that the static publishers share.
+// the transient-local history, matched() (a Zenoh subscriber on ** is no ROS subscriber), the program node's rename
+// by its first Parameters, the services without parameters over repeated Parameters, and the /tf_static reader that
+// the static publishers share. graph_history(): two sessions on the loopback, a Graph made while a program of ours
+// runs.
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -14,6 +16,11 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include "xblick/camera.hpp"
 #include "xblick/parameters.hpp"
@@ -171,6 +178,63 @@ namespace
         return answers->wait("list_parameters of " + node);
     }
 
+    // A free TCP port on the loopback (bound once, released).
+    int free_port()
+    {
+        const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        socklen_t size = sizeof(address);
+        if (fd < 0 or ::bind(fd, reinterpret_cast<sockaddr*>(&address), size) != 0 or
+            ::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &size) != 0)
+        {
+            std::perror("free_port");
+            std::exit(2);
+        }
+        ::close(fd);
+        return ntohs(address.sin_port);
+    }
+
+    // A Graph made while a program of ours runs (its tokens in both subscribers' histories), its declarations
+    // subscriber's history late (it comes by a query of its own, in no fixed order with the publishers'): the
+    // program's ROS publisher is never in the graph as a foreign one; the Graph's query of the declarations holds it
+    // back (Python's test_the_graph_holds_publishers_of_its_history_until_the_declarations_are_known).
+    void graph_history()
+    {
+        const std::string endpoint = "tcp/127.0.0.1:" + std::to_string(free_port());
+        zenoh::Session ours = xblick::open_session(
+            {.listen = {endpoint}, .ros = ros::Options{.domain = kDomain, .node = "ours_history"}});
+        zenoh::Session reader = xblick::open_session(
+            {.connect = {endpoint}, .ros = ros::Options{.domain = kDomain, .node = "graph_reader"}});
+        const std::shared_ptr<ros::Ros> part = ros::of(ours);
+        const std::string topic = "/ours_history/image_raw";
+        ros::Publisher publisher(ours, *part, part->node(), topic, "sensor_msgs/msg/Image");
+        const std::string zid = ours.get_zid().to_string();
+        {
+            const ros::Graph first(reader, kDomain);
+            check(soon([&] { return not first.publishers(topic).empty(); }), "the reader sees the publisher");
+        }
+        const auto now = std::chrono::system_clock::now().time_since_epoch();
+        ros::detail::graph_declarations_dropped_until_ns.store(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now + std::chrono::seconds(1)).count());
+        const ros::Graph graph(reader, kDomain);
+        bool seen = false, foreign = false;
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < end)
+        {
+            if (not graph.publishers(topic).empty())
+            {
+                seen = true;
+                foreign = foreign or not graph.by_xblick(zid);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        ros::detail::graph_declarations_dropped_until_ns.store(0);
+        check(seen, "the Graph made later has the publisher");
+        check(not foreign, "never as a foreign one: held until the declarations are known");
+    }
+
     void live()
     {
         ::unsetenv(ros::kEnableEnv);
@@ -194,6 +258,22 @@ namespace
         ros::Publisher plain(session, *part, part->node(), "/plain_test", tf);
         check(cached.matched(), "a transient-local publisher is matched without a subscriber");
         check(not plain.matched(), "a volatile publisher without a subscriber is not");
+
+        // a Zenoh subscriber on ** (a storage, z_sub, a traffic meter) switches no ROS form on; a ROS subscription of
+        // the topic and type does (this session's own here), and none once it has gone (Python's
+        // test_a_subscriber_on_everything_is_no_ros_subscriber)
+        {
+            auto everything = session.declare_subscriber(
+                zenoh::KeyExpr("**"), [](const zenoh::Sample&) {}, zenoh::closures::none);
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            check(not plain.matched(), "a Zenoh subscriber on ** is no ROS subscriber");
+            {
+                ros::Subscriber reader(session, *part, part->node(), "/plain_test", tf,
+                                       [](std::vector<std::uint8_t>&&, const ros::Attachment&) {});
+                check(soon([&] { return plain.matched(); }), "a ROS subscription of the topic and type matches");
+            }
+            check(soon([&] { return not plain.matched(); }), "no longer once that subscription has gone");
+        }
         for (std::uint8_t i = 1; i <= 4; ++i)
         {
             const std::vector<std::uint8_t> payload{i};
@@ -424,6 +504,7 @@ int main()
     refused([] { ros::hash_of("xblick_msgs/msg/ShmImage"); }, "a type without a hash");
 
     live();
+    graph_history();
 
     std::printf(failures ? "%d failure(s)\n" : "ros: ok\n", failures);
     return failures ? 1 : 0;

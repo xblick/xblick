@@ -178,6 +178,10 @@ namespace xblick::detail
                        std::string_view our_suffix, const protocol::MessageType& type,
                        const protocol::MessageType* compressed_type);
 
+    // max_hz: so many frames skipped in a row with the stamp of the frame taken last are said once (Python's
+    // camera.STUCK_FRAMES): the publisher's stamps do not advance.
+    inline constexpr int kStuckFrames = 3;
+
     // The header stamp of a stream's sample, not decoded (every representation starts with std_msgs/Header).
     std::int64_t stamp_of(const Item& item);
 
@@ -297,8 +301,12 @@ namespace xblick::detail
         std::atomic<bool> closed_{false};
         std::thread chooser_;
         std::size_t keep_ = 0;        // keep_recent
+        double max_hz_ = 0.0;
         std::int64_t period_ns_ = 0;  // limit_rate; 0 none
         std::optional<std::int64_t> last_period_;
+        std::int64_t last_stamp_ = 0;  // the stamp of the frame taken last
+        int stuck_ = 0;                // frames skipped in a row with that stamp (Python's MaxRate.stuck)
+        bool stuck_said_ = false;      // said once (kStuckFrames)
         std::atomic<std::uint64_t> skipped_max_hz_{0};
     };
 
