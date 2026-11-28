@@ -24,6 +24,12 @@
 // subscriber is there (mirror, mirror_tf), and Parameters serves ROS's parameter services on the program's node. A
 // session without a part sends nothing of ROS.
 //
+// The session stays in place: the entities here (Publisher, Subscriber, Service, Graph, GpuLink) and the objects
+// made on a session (CameraPublisher, the subscribers, Parameters) keep a reference to the zenoh::Session they were
+// made with and use it later: when the first Parameters rename the program's node, and in Zenoh's threads (a
+// transient-local Subscriber's history query to a publisher that comes later). Move the session (open_session returns it by value) only before
+// the first of them is made, and destroy it only after the last has gone.
+//
 // /tf_static (transient local): rmw_zenoh uses zenoh-ext's AdvancedPublisher with a cache, which zenoh-c offers only
 // with its unstable API (not in its standalone release). Publisher here stands in for it with the parts a late ROS
 // subscriber uses: the cache's liveliness token and queryable <key>/@adv/pub/<zid>/<id>/_ answering the last `depth`
