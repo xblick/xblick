@@ -545,6 +545,49 @@ def test_a_rosbag2_with_raw_and_compressed_publishes_each_frame_once(sessions, t
         player.close()
 
 
+def test_the_camera_info_of_an_image_topic_that_is_no_stream_reaches_ros(sessions, tmp_path):  # noqa: F811
+    """A bag's /resize/image and /resize/camera_info (no image_transport names, so no stream of ours): both play on
+    their keys and on their ROS topics."""
+    from xblick.encodings import numpy_to_image
+
+    a, b = sessions
+    path = tmp_path / "resize.mcap"
+    mcap = recording.import_mcap()
+    with open(path, "wb") as stream:
+        writer = mcap.writer.Writer(stream)
+        writer.start(profile="ros2", library="rosbag2")
+        channels = {}
+        for topic, name in (("/resize/image", "sensor_msgs/msg/Image"),
+                            ("/resize/camera_info", "sensor_msgs/msg/CameraInfo")):
+            schema = writer.register_schema(name, "ros2msg", MSGDEFS[name].encode())
+            channels[topic] = writer.register_channel(topic, "cdr", schema, {"offered_qos_profiles": ""})
+        for k in range(20):
+            header = Header(Time.from_ns(1_000_000_000 * (k + 1)), "resized")
+            for topic, message in (("/resize/image", numpy_to_image(np.zeros((4, 6), np.uint8), "mono8", header)),
+                                   ("/resize/camera_info", CameraInfo.pinhole(6, 4, 5.0, 5.0, 2.5, 1.5,
+                                                                              frame_id="resized"))):
+                writer.add_message(channels[topic], log_time=50_000_000 * k + 1, data=bytes(message.serialize()),
+                                   publish_time=50_000_000 * k + 1)
+        writer.finish()
+    infos = []
+    subscriber = b.ros.node.subscriber("/resize/camera_info", CameraInfo.TYPE, lambda payload, *_: infos.append(
+        CameraInfo.deserialize(payload)), daemon=True)
+    player = recording.Player(a, [path])
+    try:
+        assert {"resize/image", "resize/camera_info"} <= set(player._ros)
+        wait_until(lambda: player._ros["resize/camera_info"].matched, timeout=5.0)
+        thread = threading.Thread(target=player.run)
+        thread.start()
+        thread.join(timeout=10.0)
+        assert player.error is None
+        wait_until(lambda: infos, timeout=2.0)
+        assert infos and infos[0].header.frame_id == "resized"
+    finally:
+        subscriber.close()
+        player.end()
+        player.close()
+
+
 def test_rosbag2_directories_and_the_sqlite3_storage(tmp_path):
     bag = tmp_path / "bag"
     bag.mkdir()

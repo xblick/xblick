@@ -1970,6 +1970,9 @@ class Player(Paced):
             if key[: -len(topics.CAMERA_INFO) - 1] not in self._cameras:  # camera_info of a stream not played
                 self._publishers[key] = self.session.declare_publisher(
                     self._out(key), encoding=zenoh.Encoding(self._encodings[key]), congestion_control=self._congestion)
+                mirrored = self._ros_publisher(self._out(key), self._encodings[key])  # as the image beside it
+                if mirrored is not None:
+                    self._ros[key] = mirrored
 
     def _serve_cloud_info(self, key: str, cloud):
         """The info record of a rosbag2's point cloud ``<base>/cloud``, from its first cloud: raw only."""
