@@ -661,6 +661,9 @@ def _param(args) -> int:
     from . import parameters
     from .msg import ParameterType
 
+    if args.nodes and args.via_ros:
+        raise SystemExit("xblick param: --nodes lists the nodes of ours, not ROS's: leave out --via-ros "
+                         "(ros2 node list lists ROS's)")
     with zsession.open_from_args(args, prog=f"xblick {args.command}") as z:
         if args.nodes:
             found = parameters.find_nodes(z, args.timeout)

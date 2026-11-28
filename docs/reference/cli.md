@@ -236,7 +236,7 @@ Reads and changes the parameters of a node. See [parameters](parameters.md).
 | `--atomically` | with `--set`: change all or none |
 | `--dump FILE` | write the parameters as a ROS params file |
 | `--timeout S` | how long to wait for the node |
-| `--via-ros` | the parameters of the ROS node `/<--node>` through ROS 2's keys, such as `--node talker`. A set carries no node and no deadline, because ROS has neither. |
+| `--via-ros` | the parameters of the ROS node `/<--node>` through ROS 2's keys, such as `--node talker`. A set carries no node and no deadline, because ROS has neither. Refused with `--nodes`, which lists our nodes only. |
 
 ## Record and play
 
