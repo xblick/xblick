@@ -1,11 +1,22 @@
 // ros.hpp against bytes captured from rmw_zenoh_cpp 0.2.13 (ROS 2 Jazzy's talker, listener and tf2_ros'
 // static_transform_publisher on domain 87) and 0.10.6 (ROS 2 Lyrical's cam2image and showimage on domain 77); the
 // same captures as tests/test_ros.py. The comparison with Python's
-// xblick.ros case by case is tests/test_cpp_ros.py.
+// xblick.ros case by case is tests/test_cpp_ros.py. The live part (live()) runs on one session that reaches nobody:
+// the transient-local history, matched(), the program node's rename by its first Parameters, the services without
+// parameters over repeated Parameters, and the /tf_static reader that the static publishers share.
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
+#include <mutex>
+#include <set>
 #include <string>
+#include <thread>
+#include <vector>
 
+#include "xblick/camera.hpp"
+#include "xblick/parameters.hpp"
 #include "xblick/ros.hpp"
 
 namespace
@@ -72,6 +83,189 @@ namespace
     const std::string kChatterKey =
         "87/chatter/std_msgs::msg::dds_::String_/RIHS01_df668c740482bbd48fb39d76a70dfd4bd59db1288021743503259e948f6b1a18";
     const std::string kChatterAttachment = "0300000000000000dca5f02d39ace8181031b1bb10e2fda68e3b7018e216540748";
+
+    // ----------------------------------------------------------------------------------------- the live part
+
+    constexpr int kDomain = 211;  // the live part's domain: its session reaches nobody anyway
+
+    // Waits until `done` holds, at most `seconds`.
+    template <class F>
+    bool soon(F done, int seconds = 5)
+    {
+        const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+        while (std::chrono::steady_clock::now() < end)
+        {
+            if (done())
+            {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        return done();
+    }
+
+    // What a query's callbacks fill in, and its end (they may come after the wait: they keep it).
+    template <class T>
+    struct Answers
+    {
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::vector<T> items;
+        bool done = false;
+
+        void add(T item)
+        {
+            std::lock_guard lock(mutex);
+            items.push_back(std::move(item));
+        }
+        void end()
+        {
+            std::lock_guard lock(mutex);
+            done = true;
+            cv.notify_all();
+        }
+        std::vector<T> wait(const std::string& what)
+        {
+            std::unique_lock lock(mutex);
+            check(cv.wait_for(lock, std::chrono::seconds(5), [this] { return done; }), what + ": query finalized");
+            return items;
+        }
+    };
+
+    // The liveliness tokens of `pattern` there now.
+    std::vector<std::string> tokens(const zenoh::Session& session, const std::string& pattern)
+    {
+        auto answers = std::make_shared<Answers<std::string>>();
+        session.liveliness_get(
+            zenoh::KeyExpr(pattern),
+            [answers](const zenoh::Reply& reply) {
+                if (reply.is_ok())
+                {
+                    answers->add(std::string(reply.get_ok().get_keyexpr().as_string_view()));
+                }
+            },
+            [answers] { answers->end(); });
+        return answers->wait("tokens " + pattern);
+    }
+
+    // The names in each ok reply to a ROS client's list_parameters of `node` (fully qualified), every reply kept.
+    std::vector<std::vector<std::string>> listed(const zenoh::Session& session, const std::string& node)
+    {
+        const std::string type = "rcl_interfaces/srv/ListParameters";
+        auto answers = std::make_shared<Answers<std::vector<std::string>>>();
+        zenoh::Session::GetOptions options;
+        options.target = Z_QUERY_TARGET_ALL_COMPLETE;  // as ROS clients ask
+        options.consolidation = zenoh::QueryConsolidation(Z_CONSOLIDATION_MODE_NONE);
+        options.attachment = zenoh::Bytes(ros::encode_attachment(1, 0, ros::Gid{}));
+        options.timeout_ms = 2000;
+        session.get(
+            zenoh::KeyExpr(ros::data_key(kDomain, node + "/list_parameters", type, ros::hash_of(type))), "",
+            [answers](const zenoh::Reply& reply) {
+                if (reply.is_ok())
+                {
+                    answers->add(xblick::ListParametersResponse::deserialize(reply.get_ok().get_payload().as_vector())
+                                     .names);
+                }
+            },
+            [answers] { answers->end(); }, std::move(options));
+        return answers->wait("list_parameters of " + node);
+    }
+
+    void live()
+    {
+        ::unsetenv(ros::kEnableEnv);
+        zenoh::Session session = xblick::open_session(
+            {.local_router = false,
+             .ros = ros::Options{.domain = kDomain, .node = "test_ros", .follow_parameters = true}});
+        const std::shared_ptr<ros::Ros> part = ros::of(session);
+        check(part != nullptr, "the session takes part in ROS");
+        if (not part)
+        {
+            return;
+        }
+        const std::string tf = std::string(xblick::protocol::kTFMessageType.name);
+        const std::string zid = session.get_zid().to_string();
+        const std::string own = std::string(ros::kAdminSpace) + "/" + std::to_string(kDomain) + "/" + zid + "/*/*/";
+
+        // transient local: matched() always (as Python's), and a late subscriber gets every sample of the cache's
+        // depth, not one (the history query keeps every reply)
+        const ros::Qos history{.durability = ros::kTransientLocal, .depth = 3};
+        ros::Publisher cached(session, *part, part->node(), "/history_test", tf, history);
+        ros::Publisher plain(session, *part, part->node(), "/plain_test", tf);
+        check(cached.matched(), "a transient-local publisher is matched without a subscriber");
+        check(not plain.matched(), "a volatile publisher without a subscriber is not");
+        for (std::uint8_t i = 1; i <= 4; ++i)
+        {
+            const std::vector<std::uint8_t> payload{i};
+            cached.put(payload);
+        }
+        struct Got
+        {
+            std::mutex mutex;
+            std::set<int> payloads;  // each sample's one byte (-1: another size)
+        };
+        auto got = std::make_shared<Got>();
+        {
+            ros::Subscriber late(
+                session, *part, part->node(), "/history_test", tf,
+                [got](std::vector<std::uint8_t>&& payload, const ros::Attachment&) {
+                    std::lock_guard lock(got->mutex);
+                    got->payloads.insert(payload.size() == 1 ? payload[0] : -1);
+                },
+                history);
+            const auto all = [got] {
+                std::lock_guard lock(got->mutex);
+                return got->payloads.size() >= 3;
+            };
+            check(soon(all), "a late transient-local subscriber gets the depth-3 history");
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));  // a fourth would have come by now
+            std::lock_guard lock(got->mutex);
+            check(got->payloads == std::set<int>{2, 3, 4},
+                  "the history: the last 3 samples, not the one before them");
+        }
+
+        // one /tf_static reader per Ros, shared by the static publishers, gone with the last of them
+        const std::string static_readers = own + "MS/%/%/test_ros/%tf_static/**";
+        {
+            const auto a = ros::mirror_tf(session, true, "t/a/tf_static");
+            const auto b = ros::mirror_tf(session, true, "t/b/tf_static");
+            check(a and b and a->companion_ and a->companion_ == b->companion_,
+                  "two static publishers share one /tf_static reader");
+            check(tokens(session, static_readers).size() == 1, "one /tf_static subscription in ROS's graph");
+        }
+        check(tokens(session, static_readers).empty(), "the /tf_static reader goes with the last static publisher");
+
+        // the program's first Parameters rename its node (follow_parameters): its entities declared anew under the
+        // new name; the services without parameters of the old name go
+        const std::string old_publisher = own + "MP/%/%/test_ros/%history_test/**";
+        const std::string new_publisher = own + "MP/%/%test%cam/probe/%history_test/**";
+        check(part->parameterless_sets() == 1, "open_session served the node without parameters");
+        check(tokens(session, own + "SS/%/%/test_ros/**").size() == 6, "six services without parameters");
+        check(listed(session, "/test_ros") == std::vector<std::vector<std::string>>{{}},
+              "the node without parameters answers list_parameters, with no names");
+        for (int round = 0; round < 4; ++round)
+        {
+            const std::string r = " (round " + std::to_string(round) + ")";
+            {
+                xblick::Parameters parameters(session, "probe", "test/cam");
+                parameters.declare("gain", 1.0);
+                check(part->node().fully_qualified() == "/test/cam/probe", "the node takes its parameters' name" + r);
+                check(*cached.entity().token.topic == "/history_test" and cached.entity().token.node == "probe" and
+                          cached.entity().token.ns == "/test/cam",
+                      "a publisher made before is renamed" + r);
+                check(tokens(session, old_publisher).empty() and tokens(session, new_publisher).size() == 1,
+                      "its token goes under the new name" + r);
+                check(tokens(session, own + "SS/%/%/test_ros/**").empty(), "the old name's services go" + r);
+                check(tokens(session, own + "SS/%/%test%cam/probe/**").size() == 6, "six services of theirs" + r);
+                check(listed(session, "/test/cam/probe") == std::vector<std::vector<std::string>>{{"gain"}},
+                      "only the Parameters answer while they live" + r);
+            }
+            check(part->parameterless_sets() == 2, "one set per node name, served again, not made anew" + r);
+            check(tokens(session, own + "SS/%/%test%cam/probe/**").size() == 6, "six services without parameters" + r);
+            check(listed(session, "/test/cam/probe") == std::vector<std::vector<std::string>>{{}},
+                  "after them, the node without parameters answers alone" + r);
+        }
+    }
 }  // namespace
 
 int main()
@@ -228,6 +422,8 @@ int main()
     // hashes
     check(ros::type_hashes().size() == 24, "24 type hashes, as Python's table");
     refused([] { ros::hash_of("xblick_msgs/msg/ShmImage"); }, "a type without a hash");
+
+    live();
 
     std::printf(failures ? "%d failure(s)\n" : "ros: ok\n", failures);
     return failures ? 1 : 0;

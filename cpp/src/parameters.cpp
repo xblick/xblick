@@ -817,7 +817,41 @@ namespace xblick
         catch (...)
         {
             calls_->close();  // the members go: no call may still run on them
+            release_ros();    // the program's node as ~Parameters leaves it: given back, served without parameters
             throw;
+        }
+    }
+
+    void Parameters::release_ros()
+    {
+        ros_services_.clear();
+        ros_events_.reset();
+        ros_node_.reset();
+        if (not ros_part_)
+        {
+            return;
+        }
+        ros_part_->release_parameters();
+        // the program's node answers ROS's parameter tools again, without parameters, as before its first ones
+        // (Python's Ros.release_parameters); not on a session that is closing
+        const std::string node = ros_name_.empty() ? name_ : ros_name_;
+        try
+        {
+            if (ros_session_ != nullptr and not ros_session_->is_closed())
+            {
+                serve_none(*ros_session_, ros_part_);
+            }
+        }
+        catch (const std::exception& e)  // a destructor's: said, and the node has no services until the end
+        {
+            std::fprintf(stderr, "xblick: ROS node %s: its parameter services not served again: %s\n", node.c_str(),
+                         e.what());
+            std::fflush(stderr);
+        }
+        catch (...)
+        {
+            std::fprintf(stderr, "xblick: ROS node %s: its parameter services not served again\n", node.c_str());
+            std::fflush(stderr);
         }
     }
 
@@ -883,67 +917,66 @@ namespace xblick
 
     void Parameters::serve_none(zenoh::Session& session, const std::shared_ptr<ros::Ros>& part)
     {
+        // One set per node name, kept by the Ros (Ros::parameterless) and by the session: its queryables are
+        // background ones (one undeclared while the session closes would wait for good), so a program that makes and
+        // drops its Parameters again and again serves the same set again instead of adding six queryables each time.
         struct State
         {
             State(const std::string& name, const std::string& ns) : parameters(nullptr, name, ns) {}
             Parameters parameters;  // none declared: what they answer
-            std::atomic<bool> retired{false};
+            std::atomic<bool> serving{false};
+            std::mutex mutex;  // tokens
+            std::vector<std::string> token_keys;
+            std::vector<zenoh::LivelinessToken> tokens;  // while serving
         };
         const ros::NodeName node = part->node();
-        std::string ns = node.ns;
-        ns.erase(0, ns.find_first_not_of('/'));
-        auto state = std::make_shared<State>(node.name, ns);
-        state->parameters.ros_params_writable_ = part->params_writable();
-        state->parameters.ros_name_ = node.fully_qualified();
-        auto tokens = std::make_shared<std::vector<zenoh::LivelinessToken>>();
-        for (const std::string_view service : services())
+        const auto state = std::static_pointer_cast<State>(part->parameterless(node.fully_qualified(), [&] {
+            std::string ns = node.ns;
+            ns.erase(0, ns.find_first_not_of('/'));
+            auto made = std::make_shared<State>(node.name, ns);
+            made->parameters.ros_params_writable_ = part->params_writable();
+            made->parameters.ros_name_ = node.fully_qualified();
+            for (const std::string_view service : services())
+            {
+                const std::string s(service);
+                const ros::Entity e(*part, node, ros::kService, node.fully_qualified() + "/" + s,
+                                    ros_service_type(s), ros::kParametersQos, part->next_id());
+                zenoh::Session::QueryableOptions options;
+                options.complete = true;  // as ros::Service: ROS clients query with target ALL_COMPLETE
+                session.declare_background_queryable(
+                    zenoh::KeyExpr(e.key),
+                    [made, s, key = e.key](const zenoh::Query& query) {
+                        if (not made->serving.load())
+                        {
+                            return;  // the program's parameters answer now: dropped, no reply
+                        }
+                        made->parameters.answer_ros(s, key, query);
+                    },
+                    [] {}, std::move(options));
+                made->token_keys.push_back(e.token_key);
+            }
+            return std::shared_ptr<void>(made);
+        }));
         {
-            const std::string s(service);
-            const ros::Entity e(*part, node, ros::kService, node.fully_qualified() + "/" + s, ros_service_type(s),
-                                ros::kParametersQos, part->next_id());
-            zenoh::Session::QueryableOptions options;
-            options.complete = true;  // as ros::Service: ROS clients query with target ALL_COMPLETE
-            // background: the session ends it; one undeclared while the session closes would wait for good
-            session.declare_background_queryable(
-                zenoh::KeyExpr(e.key),
-                [state, s, key = e.key](const zenoh::Query& query) {
-                    if (state->retired.load())
-                    {
-                        return;  // the program's parameters answer now: dropped, no reply
-                    }
-                    state->parameters.answer_ros(s, key, query);
-                },
-                [] {}, std::move(options));
-            tokens->push_back(session.liveliness_declare_token(zenoh::KeyExpr(e.token_key)));
+            std::lock_guard lock(state->mutex);
+            state->tokens.clear();
+            for (const std::string& key : state->token_keys)
+            {
+                state->tokens.push_back(session.liveliness_declare_token(zenoh::KeyExpr(key)));
+            }
+            state->serving.store(true);
         }
-        part->until_parameters([state, tokens] {
-            state->retired.store(true);
-            tokens->clear();
+        part->until_parameters([state] {
+            std::lock_guard lock(state->mutex);
+            state->serving.store(false);
+            state->tokens.clear();
         });
     }
 
     Parameters::~Parameters()
     {
         calls_->close();  // first: no call runs on the members below while they go
-        ros_services_.clear();
-        ros_events_.reset();
-        ros_node_.reset();
-        if (ros_part_)
-        {
-            ros_part_->release_parameters();
-            // the program's node answers ROS's parameter tools again, without parameters, as before its first ones
-            // (Python's Ros.release_parameters); not on a session that is closing
-            try
-            {
-                if (ros_session_ != nullptr and not ros_session_->is_closed())
-                {
-                    serve_none(*ros_session_, ros_part_);
-                }
-            }
-            catch (...)  // NOLINT(bugprone-empty-catch): a destructor; the node then has no services until the end
-            {
-            }
-        }
+        release_ros();
         token_.reset();
         queryables_.clear();
         events_.reset();

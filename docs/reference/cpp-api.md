@@ -33,6 +33,10 @@ if (camera.subscribed())
 
 `publish` also accepts a `DeviceImage` for a frame in GPU memory.
 
+Publishers, subscribers and `Parameters` keep a reference to the `zenoh::Session` they are made with and use it
+later, for example when the first `Parameters` rename the program's ROS node. Move the session only before the first
+of them is made, and destroy it only after the last one has gone.
+
 Set `SessionOptions::program` to the program's name (`Options::session_options` sets it). `open_session` then prints
 one line on stderr, `<program>: ...`, when the options make a peer that connects only to other PCs and listens on
 loopback only, as the Python commands do ([sessions](../concepts/sessions.md#which-mode-when)).

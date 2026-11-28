@@ -50,6 +50,7 @@ streams, transforms and parameters, and it reads theirs.
 - `xblick test-camera` names its frame after the stream (`test_camera_color`, was `TestCamera`); `xblick-cpp-probe --tf-static` reads ROS's `/tf_static` with `--via-ros` (was `--ros`).
 - A key that is no ROS name is left out of ROS with one warning line instead of stopping the program.
 - A subscriber name with a leading `/` is a ROS topic (it was our stream without the `/`); `CameraSpec` refuses a camera with a leading `/`.
+- C++: `ImageSubscriber` and `PointCloudSubscriber` take a base with a leading `/` as a ROS 2 topic as well: `/ns/cam/color` reads ROS publishers of that topic, not our stream `ns/cam/color` (and throws on a session without ROS). Drop the leading `/` to read our stream.
 - After its parameters close, a program's ROS node serves the six parameter services without parameters again, so `ros2 param list` keeps answering.
 - `xblick list` takes ROS's topics from the session's ROS graph (`cli.ros_camera_topics` lost its `timeout`).
 - C++: a ROS-only subscriber now counts in `CameraPublisher::subscribed()`, `needs_pixels()` and `ImuPublisher::subscribed()`, so frames render for it; a ROS reader of camera_info alone counts in `subscribed()`, not in `needs_pixels()`.

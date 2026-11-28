@@ -2022,6 +2022,7 @@ namespace xblick
                     throw EncodingError(f.key + ": GPU frames of ROS publishers need rows without padding: step " +
                                         std::to_string(h.step) + ", row " + std::to_string(row));
                 }
+                // no overflow: row equals the 32-bit step (checked above), so row * height < 2^64
                 if (buffer_form->descriptor.size != row * h.height)
                 {
                     throw EncodingError(f.key + ": a CUDA buffer of " + std::to_string(buffer_form->descriptor.size) +
