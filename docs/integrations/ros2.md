@@ -507,7 +507,9 @@ A publisher of ours with `cuda_device` sends a frame as a CUDA buffer while all 
 6. The reader uses the publisher's GPU. A reader that sees one GPU is compared by that GPU. A reader that sees
    several GPUs needs the publisher's `CUDA_VISIBLE_DEVICES` and `CUDA_DEVICE_ORDER`, because the backend compares
    CUDA ordinals only.
-7. The reader keeps the last few messages of its topic (`KEEP_LAST`). A reader that keeps all messages gets the bytes.
+7. The reader keeps the last 59 messages of its topic at most (`KEEP_LAST` with a depth up to 59). A reader that
+   keeps more, or all messages, gets the bytes, because the pool of 64 blocks cannot hold back that many queued
+   frames.
 8. No reader of the topic is older than Lyrical. A Jazzy reader reads only the topic's key, and then all readers of
    that topic get the bytes there.
 
@@ -562,7 +564,10 @@ A ROS publisher sends a frame as a CUDA buffer to our subscriber while all of th
 
 Our subscriber enters itself in the backend's registry in `/dev/shm`, as a ROS subscriber does, and announces the
 backend in its token. A publisher decides once whether it sends CUDA buffers, when it discovers the subscriber, so our
-subscriber decides first, from the publishers that run at its start. When one of them meets the conditions, the entry
+subscriber decides first, from the publishers that run at its start. When no ROS process with the backend has run on
+the PC yet, our subscriber creates the registry the way the backend creates it, and a ROS process that starts later
+uses it. When the entry can only be written after the token, for example because another Linux user owns the
+registry, one line names each publisher that may send the bytes. When one of them meets the conditions, the entry
 asks for CUDA buffers. When publishers run and none meets them, the entry asks for the bytes. When no publisher runs
 yet, the entry is the one a ROS subscriber makes: a later publisher then sends CUDA buffers when its user and its
 number for its GPU (its CUDA ordinal) match ours. Such a publisher on another GPU, or with another `/dev/shm`, sends
@@ -603,7 +608,8 @@ type hashes of the part in ROS 2.
   Our subscribers take CUDA buffers of ROS publishers only as images, on the publisher's PC and GPU
   ([GPU frames from ROS publishers](#gpu-frames-from-ros-publishers)). Point clouds go as bytes.
   [Alternatives](../project/alternatives.md) describes the buffer backends.
-- The CUDA buffer backend keeps a registry in `/dev/shm`, which the first Linux user's ROS node creates. A ROS node
-  of a second user with the backend then fails to start on that PC. This is a limit of the backend.
+- The CUDA buffer backend keeps a registry in `/dev/shm`, which the first Linux user's ROS node or GPU subscriber of
+  ours creates. A ROS node of a second user with the backend then fails to start on that PC. This is a limit of the
+  backend.
 - [ROS 2 by default](../project/ros-roadmap.md) collects the facts behind the part in ROS 2 and the options that
   would change our own keys.
