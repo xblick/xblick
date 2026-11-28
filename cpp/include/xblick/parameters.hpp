@@ -110,8 +110,9 @@ namespace xblick
         ~Parameters();
         // A program's ROS node until its first Parameters (Python's Parameters.none_on; open_session): the six services
         // on ROS's keys only, answering as a node without parameters (every set refused), so that ROS's parameter tools
-        // get an answer from every node. Kept by the session (background queryables); they stop answering, and their
-        // tokens go, when the program's first Parameters serve on the node (ros::Ros::until_parameters).
+        // get an answer from every node. Kept by the session (background queryables), one set per node name
+        // (ros::Ros::parameterless), served again by a later call; they stop answering, and their tokens go, when the
+        // program's first Parameters serve on the node (ros::Ros::until_parameters).
         static void serve_none(zenoh::Session& session, const std::shared_ptr<ros::Ros>& part);
         Parameters(const Parameters&) = delete;
         Parameters& operator=(const Parameters&) = delete;
@@ -181,6 +182,9 @@ namespace xblick
         std::optional<std::string> refusal(const Parameter& p, bool local) const;
         void publish_event(const std::vector<Parameter>& added, const std::vector<Parameter>& changed);
         void declare_services(zenoh::Session& session);  // the constructor's, with a session
+        // The ROS services and events gone; the program's node given back (ros::Ros::release_parameters) and served
+        // without parameters again (serve_none): ~Parameters, and a constructor that throws after taking the node.
+        void release_ros();
         void answer(const std::string& service, const zenoh::Query& query);
         // A ROS client's call on ROS's key (--ros): parameters.cpp has the rules.
         void answer_ros(const std::string& service, const std::string& key, const zenoh::Query& query);

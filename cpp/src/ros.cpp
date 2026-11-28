@@ -857,18 +857,22 @@ namespace xblick::ros
         {
             return std::nullopt;
         }
-        parameters_taken_ = true;
-        if (retire_)
-        {
-            std::exchange(retire_, {})();
-        }
-        if (options_.follow_parameters and (ns != node_.ns or node != node_.name))
+        const bool rename = options_.follow_parameters and (ns != node_.ns or node != node_.name);
+        if (rename)  // checked before anything changes: a name refused leaves the node as it was
         {
             check_node_name(node);
             if (ns != "/")
             {
                 check_ros_name(ns, "namespace");
             }
+        }
+        parameters_taken_ = true;
+        if (retire_)
+        {
+            std::exchange(retire_, {})();
+        }
+        if (rename)
+        {
             node_.ns = ns;
             node_.name = node;
             if (attached_)
@@ -1947,19 +1951,50 @@ namespace xblick::ros
         publisher->check = [ros, is_static](std::span<const std::uint8_t> payload) { ros->check_tf(payload, is_static); };
         if (is_static)
         {
-            // ROS's /tf_static of other programs, compared with this program's (Ros::check_tf): read while this
+            // ROS's /tf_static of other programs, compared with this program's (Ros::check_tf): read while a static
             // publisher lives, so that it goes with an object of the program, before the session
-            std::weak_ptr<Ros> weak = ros;
-            publisher->companion_ = std::make_unique<Subscriber>(
-                session, *ros, ros->node(), "/tf_static", std::string(protocol::kTFMessageType.name),
-                [weak](std::vector<std::uint8_t>&& payload, const Attachment& attachment) {
-                    if (const std::shared_ptr<Ros> part = weak.lock())
-                    {
-                        part->on_static_sample(payload, attachment);
-                    }
-                },
-                kTfStaticReadQos);
+            publisher->companion_ = ros->static_reader(session);
         }
         return publisher;
+    }
+
+    std::shared_ptr<Subscriber> Ros::static_reader(zenoh::Session& session)
+    {
+        std::lock_guard lock(static_reader_mutex_);
+        if (std::shared_ptr<Subscriber> reader = static_reader_.lock())
+        {
+            return reader;
+        }
+        std::weak_ptr<Ros> weak = weak_from_this();
+        auto reader = std::make_shared<Subscriber>(
+            session, *this, node(), "/tf_static", std::string(protocol::kTFMessageType.name),
+            [weak](std::vector<std::uint8_t>&& payload, const Attachment& attachment) {
+                if (const std::shared_ptr<Ros> part = weak.lock())
+                {
+                    part->on_static_sample(payload, attachment);
+                }
+            },
+            kTfStaticReadQos);
+        static_reader_ = reader;
+        return reader;
+    }
+
+    std::shared_ptr<void> Ros::parameterless(const std::string& node,
+                                             const std::function<std::shared_ptr<void>()>& make)
+    {
+        std::lock_guard lock(parameterless_mutex_);
+        if (const auto found = parameterless_.find(node); found != parameterless_.end())
+        {
+            return found->second;
+        }
+        std::shared_ptr<void> set = make();  // one that throws leaves nothing behind
+        parameterless_.emplace(node, set);
+        return set;
+    }
+
+    std::size_t Ros::parameterless_sets() const
+    {
+        std::lock_guard lock(parameterless_mutex_);
+        return parameterless_.size();
     }
 }  // namespace xblick::ros

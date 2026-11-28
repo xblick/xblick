@@ -280,6 +280,16 @@ namespace xblick::ros
         // --ros-clock: mirror made the clock key's publisher. Without one within kClockWaitS of attach, one warning
         // line says so (a program may still make it later: no error).
         void clock_published() { clock_published_.store(true); }
+        // The program node's six services without parameters (Parameters::serve_none): one set per node name (its
+        // fully qualified name), made by `make` the first time and kept with the session, as its queryables are
+        // background ones (one undeclared while the session closes would wait for good); a later serve_none on the
+        // same name serves that set again instead of declaring another.
+        std::shared_ptr<void> parameterless(const std::string& node, const std::function<std::shared_ptr<void>()>& make);
+        std::size_t parameterless_sets() const;  // how many such sets were made (one per node name)
+        // The subscription of ROS's /tf_static that compares other programs' static transforms with this program's
+        // (on_static_sample): one per Ros, as Python's, made by the first static publisher (mirror_tf) and shared by
+        // all of them, so that it goes with the last of them, before the session.
+        std::shared_ptr<Subscriber> static_reader(zenoh::Session& session);
 
     private:
         struct Duplicates;
@@ -307,6 +317,10 @@ namespace xblick::ros
         std::map<std::string, detail::StaticTransform> static_mine_, static_others_;
         std::set<std::string> static_said_;
         std::atomic<bool> clock_published_{false};
+        mutable std::mutex parameterless_mutex_;  // parameterless_ (taken before graph_mutex_, never inside it)
+        std::map<std::string, std::shared_ptr<void>> parameterless_;
+        std::mutex static_reader_mutex_;  // static_reader_ (taken before graph_mutex_, never inside it)
+        std::weak_ptr<Subscriber> static_reader_;
         std::jthread clock_check_;  // last: it ends first (it reads the members above)
     };
 
@@ -372,8 +386,9 @@ namespace xblick::ros
         const Entity& entity() const { return entity_; }
         // Called with each payload before it goes out (mirror_tf: the frames' parents).
         std::function<void(std::span<const std::uint8_t>)> check;
-        // A subscription that lives as long as this publisher (mirror_tf, static: ROS's /tf_static of others).
-        std::unique_ptr<Subscriber> companion_;
+        // A subscription kept while this publisher lives (mirror_tf, static: ROS's /tf_static of others,
+        // Ros::static_reader, shared by the program's static publishers).
+        std::shared_ptr<Subscriber> companion_;
 
     private:
         struct Cache;
