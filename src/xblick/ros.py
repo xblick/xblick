@@ -988,23 +988,27 @@ class Ros:
             return self._graph
 
     def close(self):
+        """Closes every part (the graph, the services without parameters, the duplicate watch, the nodes), each also
+        when one before it raised (their threads stop); the first error is raised after the last part."""
         if self._clock_check is not None:
             self._clock_check.cancel()
         with self._lock:
             self._closed = True
             graph, self._graph = self._graph, None
             no_parameters, self._no_parameters = self._no_parameters, None
-        if graph is not None:
-            graph.close()
-        if no_parameters is not None:
-            no_parameters.close()
-        if self._duplicates is not None:
-            self._duplicates.undeclare()
-            self._duplicates = None
-        with self._lock:
+            duplicates, self._duplicates = self._duplicates, None
             nodes, self._nodes = self._nodes, []
-        for node in nodes:
-            node.close()
+        steps = ([graph.close] if graph is not None else []) \
+            + ([no_parameters.close] if no_parameters is not None else []) \
+            + ([duplicates.undeclare] if duplicates is not None else []) + [node.close for node in nodes]
+        first = None
+        for step in steps:
+            try:
+                step()
+            except Exception as error:  # noqa: BLE001 - raised after the other parts are closed
+                first = first or error
+        if first is not None:
+            raise first
 
     def _read_static(self):
         """The subscription to ROS's /tf_static that compares other programs' static transforms with this program's
@@ -1190,13 +1194,23 @@ class RosNode:
         return self._add(RosClient(self, name, type_name, qos))
 
     def close(self):
+        """Closes its entities and its token, each also when one before it raised (the first error is raised after
+        the token), and leaves the session's nodes (Ros._nodes): a program that makes and closes further parameters
+        keeps no node."""
+        with self.ros._lock:
+            if self in self.ros._nodes:
+                self.ros._nodes.remove(self)
         with self._lock:
             entities, self._entities = self._entities, []
-        for entity in entities:
-            entity.close()
-        if self._token is not None:
-            self._token.undeclare()
-            self._token = None
+            token, self._token = self._token, None
+        first = None
+        for step in [entity.close for entity in entities] + ([token.undeclare] if token is not None else []):
+            try:
+                step()
+            except Exception as error:  # noqa: BLE001 - raised after the other parts are closed
+                first = first or error
+        if first is not None:
+            raise first
 
 
 def _reliability(qos: Qos) -> zenoh.Reliability:
@@ -1224,29 +1238,40 @@ class _Entity:
         self._raw = _raw(node.ros.session)
         self._declared = None
         self._live = None
+        # a rename (its node's, in another thread) and close one after the other: a rename after close declares no
+        # token again for an entity that is gone
+        self._entity_lock = threading.Lock()
+        self._closed = False
 
     def _announce(self):
         self._live = self._raw.liveliness().declare_token(self.token.key())
 
     def _rename(self):
-        """Its node renamed (RosNode.rename): its token and gid of the node's new name."""
-        node = self.node
-        token = dataclasses.replace(self.token, namespace=node.namespace, node=node.name)
-        self.token, self.gid = token, gid(token.key())
-        node.ros.own(self.gid)
-        if self._live is not None:
-            self._live.undeclare()
-            self._announce()
+        """Its node renamed (RosNode.rename): its token and gid of the node's new name; nothing once it is closed."""
+        with self._entity_lock:
+            if self._closed:
+                return
+            node = self.node
+            token = dataclasses.replace(self.token, namespace=node.namespace, node=node.name)
+            self.token, self.gid = token, gid(token.key())
+            node.ros.own(self.gid)
+            if self._live is not None:
+                self._live.undeclare()
+                self._announce()
 
     def close(self):
         """Undeclares it and its token (again: nothing)."""
         self.node._forget(self)
-        if self._live is not None:
-            self._live.undeclare()
-            self._live = None
-        if self._declared is not None:
-            self._declared.undeclare()
-            self._declared = None
+        with self._entity_lock:
+            self._closed = True
+            live, self._live = self._live, None
+            declared, self._declared = self._declared, None
+        try:
+            if live is not None:
+                live.undeclare()
+        finally:
+            if declared is not None:
+                declared.undeclare()
 
 
 class RosPublisher(_Entity):
@@ -1344,17 +1369,20 @@ class RosSubscriber(_Entity):
             super()._rename()
             return
         # the gid follows the token: the registry entry (before the new token) and the buffer key too
-        node = self.node
-        self.token = dataclasses.replace(self.token, namespace=node.namespace, node=node.name)
-        self.gid = gid(self.token.key())
-        node.ros.own(self.gid)
-        self._gpu.set_gid(self.gid)
-        old, self._buffer = self._buffer, self._raw.declare_subscriber(buffer_key(self.key, self.gid),
-                                                                      self._on_sample)
-        old.undeclare()
-        if self._live is not None:
-            self._live.undeclare()
-            self._announce()
+        with self._entity_lock:  # as _Entity._rename: nothing once it is closed
+            if self._closed:
+                return
+            node = self.node
+            self.token = dataclasses.replace(self.token, namespace=node.namespace, node=node.name)
+            self.gid = gid(self.token.key())
+            node.ros.own(self.gid)
+            self._gpu.set_gid(self.gid)
+            old, self._buffer = self._buffer, self._raw.declare_subscriber(buffer_key(self.key, self.gid),
+                                                                          self._on_sample)
+            old.undeclare()
+            if self._live is not None:
+                self._live.undeclare()
+                self._announce()
 
     @property
     def gpu(self):

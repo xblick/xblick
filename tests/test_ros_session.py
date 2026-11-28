@@ -316,6 +316,87 @@ def test_matched_is_our_key_and_ros_matched_ros():
         a.close()
 
 
+def test_a_part_that_cannot_be_closed_keeps_no_other_open():
+    """session._close_parts closes the declaration when the part in ROS raises; Ros.close closes every part when one
+    raises (the services without parameters stop their thread, the node its token) and raises the first error."""
+
+    class Part:
+        def __init__(self, fails):
+            self.fails, self.closed = fails, False
+
+        def close(self):
+            self.closed = True
+            if self.fails:
+                raise zenoh.ZError("closed")
+
+    taking_part, declared = Part(True), Part(False)
+    session._close_parts(declared, taking_part)
+    assert taking_part.closed and declared.closed
+
+    a = session.open_session(local_router=False, ros_options=session.RosOptions(DOMAIN, "xblick_parts"))
+    try:
+        graph, none = a.ros.graph, a.ros._no_parameters
+        closes = graph.close
+
+        def failing():
+            closes()
+            raise zenoh.ZError("the graph's close failed")
+
+        graph.close = failing
+        server, node = none._server, a.ros.node
+        with pytest.raises(zenoh.ZError, match="the graph's close failed"):
+            a.ros.close()
+        server.join(timeout=2.0)
+        assert not server.is_alive() and a.ros._duplicates is None and node._token is None and not a.ros._nodes
+    finally:
+        a.close()
+
+
+def test_a_rename_that_races_a_close_leaves_no_token():
+    """RosNode.rename against an entity's close in another thread: the close waits for the rename's new token and
+    undeclares it, and no token of the publisher remains in ROS's graph."""
+    import threading
+
+    a = session.open_session(local_router=False, ros_options=session.RosOptions(DOMAIN, "xblick_race"))
+    try:
+        publisher = a.ros.node.publisher("/rostest/race/image_raw", "sensor_msgs/msg/Image")
+        live = publisher._live
+        closer = threading.Thread(target=publisher.close)
+
+        class Racing:  # the old token: its undeclare lets the close start in the middle of the rename
+            def undeclare(self):
+                live.undeclare()
+                closer.start()
+                closer.join(0.3)  # with the entity's lock the close waits for the rename
+
+        publisher._live = Racing()
+        a.ros.node.rename("xblick_raced")
+        closer.join(5.0)
+        assert not closer.is_alive() and publisher._live is None
+        tokens = [ros.parse_token(str(r.ok.key_expr))
+                  for r in session.replies(a, "@ros2_lv/**", 1.0, liveliness=True) if r.ok is not None]
+        assert not [t for t in tokens if t.topic == "/rostest/race/image_raw"]
+        publisher._rename()  # closed: nothing declared again
+        assert publisher._live is None
+    finally:
+        a.close()
+
+
+def test_closed_parameters_of_their_own_leave_the_sessions_nodes():
+    a = session.open_session(local_router=False, ros_options=session.RosOptions(DOMAIN, "xblick_nodes"))
+    try:
+        first = Parameters(a, "first", "rostest/nodes")
+        count = len(a.ros._nodes)
+        for _ in range(3):
+            more = Parameters(a, "more", "rostest/nodes")
+            assert more._ros_own_node and len(a.ros._nodes) == count + 1
+            more.close()
+            assert len(a.ros._nodes) == count
+        first.close()
+    finally:
+        a.close()
+
+
 def test_one_node_per_program_named_after_its_parameters(capsys):
     """A default node name gives way to the name of the program's first parameters: one node, which carries the
     publishers made before (their tokens declared anew), the six services and the publishers made after. Further
