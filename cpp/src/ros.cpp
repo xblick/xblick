@@ -1199,7 +1199,9 @@ namespace xblick::ros
 
     bool Publisher::matched() const
     {
-        return publisher_->get_matching_status().matching;
+        // transient local: always, as Python's RosPublisher.matched; its samples go into the cache for subscribers
+        // that come later, whoever reads now
+        return cache_ != nullptr or publisher_->get_matching_status().matching;
     }
 
     void Publisher::put(std::span<const std::uint8_t> payload)
@@ -1734,6 +1736,8 @@ namespace xblick::ros
             // those there now and those that come later, and a query of that key for its last `depth` samples, as
             // zenoh-ext's AdvancedSubscriber with detect_late_publishers asks it (_max, _anyke). A sample can come
             // twice (live and from the history); its reader takes it again (tf2: the same transform).
+            // Every reply kept (consolidation NONE, as zenoh-ext's history queries): all of them carry the data key,
+            // and Zenoh's default for a selector without _time (LATEST) would keep one sample of the `depth`.
             const std::string params = "_max=" + std::to_string(std::max(qos.depth, 1)) + ";_anyke";
             zenoh::Session::LivelinessSubscriberOptions options;
             options.history = true;
@@ -1746,6 +1750,8 @@ namespace xblick::ros
                     }
                     try
                     {
+                        zenoh::Session::GetOptions get;
+                        get.consolidation = zenoh::QueryConsolidation(Z_CONSOLIDATION_MODE_NONE);
                         session.get(
                             token.get_keyexpr(), params,
                             [state](const zenoh::Reply& reply) {
@@ -1754,7 +1760,7 @@ namespace xblick::ros
                                     state->take(reply.get_ok());
                                 }
                             },
-                            [] {});
+                            [] {}, std::move(get));
                     }
                     catch (const std::exception& e)  // the session closing
                     {

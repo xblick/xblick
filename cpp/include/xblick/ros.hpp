@@ -358,7 +358,8 @@ namespace xblick::ros
         Publisher(const Publisher&) = delete;
         Publisher& operator=(const Publisher&) = delete;
 
-        // A ROS subscriber (or any other) of the key is known.
+        // A ROS subscriber (or any other) of the key is known. Always true when transient local, as Python's
+        // RosPublisher.matched: its samples go into the cache for subscribers that come later.
         bool matched() const;
         void put(std::span<const std::uint8_t> payload);
         // The attachment of the next message, its sequence number counted: for a message that goes on keys of its
