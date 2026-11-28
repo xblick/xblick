@@ -521,6 +521,30 @@ def test_a_rosbag2_with_raw_and_compressed_plays_the_raw_frames(sessions, tmp_pa
         player.close()
 
 
+def test_a_rosbag2_with_raw_and_compressed_publishes_each_frame_once(sessions, tmp_path):  # noqa: F811
+    """The bag's own image_raw/compressed is not played beside the frames the camera compresses from image_raw."""
+    a, b = sessions
+    path = tmp_path / "both.mcap"
+    write_rosbag(path, frames=3, compressed_too=True)
+    player = recording.Player(a, [path])
+    stamps = []
+    sub = b.declare_subscriber("rb/cam/color/image_raw/compressed", lambda s: stamps.append(
+        CompressedImage.deserialize(s.payload.to_bytes()).header.stamp.to_ns()))
+    time.sleep(0.5)
+    thread = threading.Thread(target=player.run)
+    thread.start()
+    try:
+        thread.join(timeout=10.0)
+        time.sleep(0.3)
+        assert player.error is None
+        assert stamps == [1_000_000_000, 2_000_000_000, 3_000_000_000]
+    finally:
+        sub.undeclare()
+        player.end()
+        thread.join()
+        player.close()
+
+
 def test_rosbag2_directories_and_the_sqlite3_storage(tmp_path):
     bag = tmp_path / "bag"
     bag.mkdir()

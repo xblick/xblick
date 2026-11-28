@@ -1911,15 +1911,21 @@ class Player(Paced):
             self._static[key] = payload
 
     def _messages(self, from_ns: int | None = None):
-        """(log time ns, key, payload) of all files in log-time order (from log time ``from_ns`` on)."""
+        """(log time ns, key, payload) of all files in log-time order (from log time ``from_ns`` on). A rosbag2's
+        ``<base>/image_raw/compressed`` is left out when its stream plays from ``<base>/image_raw`` (``_raw_streams``):
+        the playback camera compresses those frames itself, and the bag's would go out a second time."""
         for path in self.files:
             self._file = str(path)
             with open(path, "rb") as stream:
                 for _, channel, message in self.mcap.reader.make_reader(stream).iter_messages(
                         log_time_order=True, **({"starting_at": from_ns} if from_ns is not None else {})):
                     key = key_of(channel)
-                    if key is not None and self._wanted(key):
-                        yield message.log_time, key, message.data
+                    if key is None or not self._wanted(key):
+                        continue
+                    if (key.endswith("/" + topics.COMPRESSED) and "zenoh_key" not in channel.metadata
+                            and key[: -len(topics.COMPRESSED) - 1] in self._raw_streams):
+                        continue
+                    yield message.log_time, key, message.data
 
     def run(self):
         """Play until the end of the files (with ``loop`` until :meth:`end`). An error ends it and stays in
