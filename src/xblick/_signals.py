@@ -27,17 +27,29 @@ def interface_command(argv: list[str]) -> bool:
 
 
 def _module_of(orig_argv: list[str]) -> str | None:
-    """The module of ``python [options] -m <module> ...``, None for a script or ``-c``."""
+    """The module of ``python [options] -m <module> ...``, None for a script or ``-c``. Short options may be combined
+    as Python takes them (``-Im xblick.cli``, ``-Bum``, ``-IWerror -m``): in a cluster ``m`` ends the options (the
+    rest of the cluster, else the next word, is the module), ``c`` ends them for a command, and ``W`` or ``X`` take
+    the rest of the cluster, else the next word, as their value."""
     words = iter(orig_argv[1:])
     for word in words:
-        if word == "-m":
-            return next(words, None)
-        if word.startswith("-m"):
-            return word[2:]
-        if word in ("-c", "-") or not word.startswith("-"):
+        if word == "-" or not word.startswith("-"):
             return None
-        if word in ("-X", "-W", "--check-hash-based-pycs"):  # options with a value of their own
-            next(words, None)
+        if word.startswith("--"):
+            if word == "--check-hash-based-pycs":  # a long option with a value of its own
+                next(words, None)
+            continue
+        letters = word[1:]
+        for i, letter in enumerate(letters):
+            rest = letters[i + 1:]
+            if letter == "m":
+                return rest or next(words, None)
+            if letter == "c":
+                return None
+            if letter in ("W", "X"):
+                if not rest:
+                    next(words, None)
+                break
     return None
 
 
