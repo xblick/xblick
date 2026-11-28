@@ -748,7 +748,9 @@ def test_a_command_reaches_every_queryable_of_its_key():
         "cpp/src/ros.cpp": {"options.complete = true;  // ROS clients query with target ALL_COMPLETE (ros.hpp)": 1},
         # C++ Parameters::serve_none: a program node's services without parameters, on keys of ros::Entity as above
         "cpp/src/parameters.cpp": {
-            "options.complete = true;  // as ros::Service: ROS clients query with target ALL_COMPLETE": 1}}
+            "options.complete = true;  // as ros::Service: ROS clients query with target ALL_COMPLETE": 1},
+        # C++ test_ros.cpp: listed() asks list_parameters as a ROS client does, on a key of ros::data_key
+        "cpp/tests/test_ros.cpp": {"options.target = Z_QUERY_TARGET_ALL_COMPLETE;  // as ROS clients ask": 1}}
     found, allowed = [], {}
     for f in files:
         name = str(f.relative_to(root))
