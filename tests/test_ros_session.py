@@ -178,7 +178,14 @@ def test_without_ros_nothing_of_ros_goes_on_the_wire():
 
 
 def test_with_ros_our_keys_and_rmw_zenohs_side_by_side():
+    """The ROS forms go out for ROS subscriptions (b's; the observer's ``**`` subscriber is none)."""
+    from xblick.msg import TFMessage
+
     net = Network(with_ros=True)
+    readers = [net.b.ros.node.subscriber(topic, kind, lambda *_: None) for topic, kind in (
+        ("/rostest/cam/color/image_raw", "sensor_msgs/msg/Image"),
+        ("/rostest/cam/color/camera_info", "sensor_msgs/msg/CameraInfo"),
+        ("/rostest/cam/boxer/boxes", "vision_msgs/msg/Detection2DArray"), ("/tf", TFMessage.TYPE))]
     try:
         time.sleep(0.5)
         _publish_everything(net)
@@ -205,6 +212,8 @@ def test_with_ros_our_keys_and_rmw_zenohs_side_by_side():
                                                     "describe_parameters", "get_parameter_types",
                                                     "set_parameters_atomically")} <= services
     finally:
+        for reader in readers:
+            reader.close()
         net.close()
 
 
@@ -314,6 +323,37 @@ def test_matched_is_our_key_and_ros_matched_ros():
         publisher.close()
         b.close()
         a.close()
+
+
+def test_a_subscriber_on_everything_is_no_ros_subscriber():
+    """A Zenoh subscriber on ``**`` (a storage, z_sub, a traffic meter) switches no ROS form on; a ROS subscription
+    does, also one that comes later, one of the publishing session itself, and none once it is closed."""
+    from xblick.camera import CountedPublisher, cdr_encoding
+    from xblick.msg import JointState
+
+    endpoint = f"tcp/127.0.0.1:{free_port()}"
+    a = session.open_session(listen=[endpoint], ros_options=session.RosOptions(DOMAIN, "xblick_a"))
+    b = session.open_session(connect=[endpoint], ros_options=session.RosOptions(DOMAIN, "xblick_b"))
+    observer = session.open_session(connect=[endpoint], declare=False, ros_options=False)
+    publisher = CountedPublisher(a, "rostest/everything/joint_states", cdr_encoding(JointState))
+    everything = observer.declare_subscriber("**", lambda s: None)
+    try:
+        wait_until(lambda: publisher._ros._declared.matching_status.matching)  # Zenoh matches the ** subscriber
+        time.sleep(0.5)
+        assert not publisher.ros_matched
+        late = b.ros.node.subscriber("/rostest/everything/joint_states", JointState.TYPE, lambda *_: None)
+        wait_until(lambda: publisher.ros_matched)
+        late.close()
+        wait_until(lambda: not publisher.ros_matched)
+        own = a.ros.node.subscriber("/rostest/everything/joint_states", JointState.TYPE, lambda *_: None)
+        wait_until(lambda: publisher.ros_matched)
+        own.close()
+        wait_until(lambda: not publisher.ros_matched)
+    finally:
+        everything.undeclare()
+        publisher.close()
+        for s in (b, a, observer):
+            s.close()
 
 
 def test_a_part_that_cannot_be_closed_keeps_no_other_open():

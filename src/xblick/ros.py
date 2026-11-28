@@ -37,6 +37,7 @@ Type hashes (RIHS01, REP 2011): ``TYPE_HASHES`` for every type Durchblick carrie
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import hashlib
 import itertools
@@ -807,6 +808,53 @@ class Graph:
             self._listeners = []
 
 
+def subscription_pattern(domain: int) -> str:
+    """The liveliness key expression of the subscriptions' tokens on ``domain``."""
+    return "/".join([ADMIN_SPACE, str(domain), "*", "*", "*", SUBSCRIPTION, "**"])
+
+
+class Readers:
+    """The ROS subscriptions on a session's domain, as a liveliness subscriber with history keeps their tokens (made
+    at the first ``RosPublisher.matched``, ``Ros.readers``, closed with the session's part in ROS): ``reads(topic,
+    type_name)``, whether one of them reads the topic in that type. Every ROS subscription has such a token (rmw_zenoh
+    declares it with its subscriber, ours too, this session's own as well), a Zenoh subscriber on ``**`` (a storage,
+    ``z_sub``, a traffic meter) has none: a publisher sends its ROS form for ROS's subscribers only. Polled as
+    _Polled (one thread)."""
+
+    def __init__(self, ros_: Ros):
+        self._lock = threading.Lock()
+        self._tokens: dict[str, tuple[str, str]] = {}  # key -> (topic, type)
+        self._count: collections.Counter = collections.Counter()  # (topic, type) -> its tokens
+        self._polled = _Polled(_raw(ros_.session).liveliness().declare_subscriber(
+            subscription_pattern(ros_.domain), history=True), self._seen, f"ros readers {ros_.domain}")
+
+    def _seen(self, sample):
+        key = str(sample.key_expr)
+        if sample.kind == zenoh.SampleKind.PUT:
+            try:
+                token = parse_token(key)
+            except RosError:
+                return
+            read = (token.topic, token.type_name)
+        with self._lock:
+            if sample.kind != zenoh.SampleKind.PUT:
+                read = self._tokens.pop(key, None)
+                if read is not None:
+                    self._count[read] -= 1
+                    if not self._count[read]:
+                        del self._count[read]
+            elif key not in self._tokens:
+                self._tokens[key] = read
+                self._count[read] += 1
+
+    def reads(self, topic: str, type_name: str) -> bool:
+        with self._lock:
+            return (topic, type_name) in self._count
+
+    def close(self):
+        self._polled.undeclare()
+
+
 def _below(topic: str, prefix: str) -> bool:
     """``topic`` is ``/<prefix>`` or below it (every topic for an empty prefix)."""
     below = "/" + prefix.strip("/") if prefix.strip("/") else ""
@@ -908,6 +956,7 @@ class Ros:
         self._no_parameters = None
         self._closed = False
         self._graph: Graph | None = None
+        self._readers: Readers | None = None
         self._clock_published = False
         self._clock_check = None
         self.node = self.add_node(node, namespace)
@@ -1018,18 +1067,30 @@ class Ros:
                 self._graph = Graph(self)
             return self._graph
 
+    @property
+    def readers(self) -> Readers:
+        """ROS's subscriptions on the domain (Readers), made at the first use: a program that offers nothing to ROS
+        keeps none."""
+        with self._lock:
+            if self._closed:
+                raise RosError("the session's part in ROS 2 is closed")
+            if self._readers is None:
+                self._readers = Readers(self)
+            return self._readers
+
     def close(self):
-        """Closes every part (the graph, the services without parameters, the duplicate watch, the nodes), each also
+        """Closes every part (the graph, the readers, the services without parameters, the duplicate watch, the nodes), each also
         when one before it raised (their threads stop); the first error is raised after the last part."""
         if self._clock_check is not None:
             self._clock_check.cancel()
         with self._lock:
             self._closed = True
             graph, self._graph = self._graph, None
+            readers, self._readers = self._readers, None
             no_parameters, self._no_parameters = self._no_parameters, None
             duplicates, self._duplicates = self._duplicates, None
             nodes, self._nodes = self._nodes, []
-        steps = ([graph.close] if graph is not None else []) \
+        steps = ([graph.close] if graph is not None else []) + ([readers.close] if readers is not None else []) \
             + ([no_parameters.close] if no_parameters is not None else []) \
             + ([duplicates.undeclare] if duplicates is not None else []) + [node.close for node in nodes]
         first = None
@@ -1329,11 +1390,14 @@ class RosPublisher(_Entity):
 
     @property
     def matched(self) -> bool:
-        """A ROS subscriber (or any other) of the key is known. Always True for a transient-local publisher: zenoh-ext's
-        AdvancedPublisher has no matching status, and its samples go into its cache for later subscribers anyway."""
+        """A ROS subscription of the topic in its type is known: a Zenoh subscriber of the key (Zenoh's matching
+        status) and a subscription token of the topic and type in ROS's graph (``Ros.readers``). A Zenoh subscriber
+        without such a token (one on ``**``: a storage, ``z_sub``, a traffic meter) is none. Always True for a
+        transient-local publisher: zenoh-ext's AdvancedPublisher has no matching status, and its samples go into its
+        cache for later subscribers anyway."""
         if self.qos.durability == TRANSIENT_LOCAL:
             return True
-        return self._declared.matching_status.matching
+        return self._declared.matching_status.matching and self.node.ros.readers.reads(self.topic, self.type_name)
 
     def attachment(self) -> bytes:
         """The attachment of the next message, its sequence number counted: for a message that goes on keys of its
