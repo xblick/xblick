@@ -419,3 +419,114 @@ def test_cpp_parameter_golden_bytes():
     for name, message in (("kParameterEvent", event), ("kDescribe", describe), ("kSetResults", results)):
         constant = re.search(rf'const char\* {name} = "([0-9a-f]+)";', source).group(1)
         assert constant == bytes(message.serialize()).hex(), name
+
+
+# ---------------------------------------------------------------------------------- payloads that are no message
+
+from xblick import msg  # noqa: E402
+from xblick.cdr import Reader, Writer  # noqa: E402
+
+FORGED = 1_000_000  # a count far beyond what the bytes after it hold
+
+
+def _payload(*parts) -> bytes:
+    """A payload of these parts: an int a uint32, a str a string, bytes as they are, a Header or Time written."""
+    w = Writer()
+    for part in parts:
+        if isinstance(part, int):
+            w.u32(part)
+        elif isinstance(part, str):
+            w.string(part)
+        elif isinstance(part, bytes):
+            w.buffer.extend(part)
+        else:
+            part.write(w)
+    w.buffer.extend(b"\x00" * 64)  # a few bytes more: room for some elements, not for the count
+    return bytes(w.getvalue())
+
+
+@pytest.mark.parametrize("kind,parts", [
+    (msg.TFMessage, [FORGED]),
+    (msg.DiagnosticArray, [Header(), FORGED]),
+    (msg.DiagnosticArray, [Header(), 1, b"\x00", "", "", "", FORGED]),  # one status, its values' count forged
+    (msg.JointState, [Header(), FORGED]),
+    (msg.PointCloud2, [Header(), 1, 1, FORGED]),
+    (msg.Detection2DArray, [Header(), FORGED]),
+    (msg.Detection2DArray, [Header(), 1, Header(), FORGED]),  # one detection whose results' count is forged
+    (msg.Detection3DArray, [Header(), FORGED]),
+    (msg.Classification, [Header(), FORGED]),
+    (msg.Float64MultiArray, [FORGED]),
+    (msg.RobotState, [Header(), 0, 0, 0, 0, Header(), FORGED]),
+    (msg.RobotState, [Header(), 0, 0, 0, 0, Header(), 0, FORGED]),
+    (msg.ParameterEvent, [Time(), "/node", FORGED]),
+    (msg.DescribeParametersResponse, [FORGED]),
+    (msg.GetParametersResponse, [FORGED]),
+    (msg.SetParametersResponse, [FORGED]),
+    (msg.ListControllersResponse, [FORGED]),
+])
+def test_a_count_beyond_the_bytes_left_is_refused_at_once(kind, parts):
+    """A count read from the payload whose elements, at their smallest, cannot be in the bytes left is a CdrError
+    before any element is built: no loop builds objects until the data runs out."""
+    with pytest.raises(CdrError, match=f"a sequence of {FORGED} elements of at least"):
+        kind.deserialize(_payload(*parts))
+
+
+def test_sequences_of_the_reader_refuse_a_count_beyond_the_bytes_left():
+    for read in (Reader.i64_sequence, Reader.string_sequence):
+        with pytest.raises(CdrError, match="a sequence of"):
+            read(Reader(_payload(FORGED)))
+
+
+def test_messages_of_empty_elements_read_back():
+    """The smallest elements (empty strings and sequences) pass the count check: its minimum sizes are no larger
+    than what the elements take."""
+    detection_2d = msg.Detection2D(results=[msg.ObjectHypothesisWithPose()] * 2)
+    detection_3d = msg.Detection3D(results=[msg.ObjectHypothesisWithPose()])
+    messages = [
+        TFMessage(transforms=[TransformStamped()] * 3),
+        DiagnosticArray(status=[DiagnosticStatus(values=[KeyValue()] * 2)] * 2),
+        msg.JointState(name=["", ""]),
+        PointCloud2(fields=[PointField(name="", datatype=PointField.UINT8)] * 2),
+        msg.Detection2DArray(detections=[detection_2d] * 2),
+        msg.Detection3DArray(detections=[detection_3d] * 2),
+        msg.Classification(results=[msg.ObjectHypothesis()] * 3),
+        msg.Float64MultiArray(msg.MultiArrayLayout([msg.MultiArrayDimension()] * 2)),
+        msg.RobotState(msg.JointState(), msg.MultiDOFJointState(joint_names=["", ""], transforms=[Transform()] * 2,
+                                                                twists=[msg.Twist()] * 2,
+                                                                wrenches=[msg.Wrench()] * 2)),
+        ParameterEvent(new_parameters=[Parameter()] * 2, changed_parameters=[Parameter()], deleted_parameters=[]),
+        DescribeParametersResponse([ParameterDescriptor(floating_point_range=[FloatingPointRange()],
+                                                        integer_range=[IntegerRange()])] * 2),
+        GetParametersResponse([ParameterValue()] * 2),
+        SetParametersResponse([SetParametersResult()] * 3),
+        msg.ListControllersResponse([msg.ControllerState(chain_connections=[msg.ChainConnection()] * 2)] * 2),
+    ]
+    for message in messages:
+        assert type(message).deserialize(message.serialize()) == message, type(message).__name__
+
+
+def test_a_string_that_is_no_utf8_is_a_cdr_error():
+    w = Writer()
+    w.u32(3)
+    w.buffer.extend(b"\xff\xfe\x00")
+    with pytest.raises(CdrError, match="no UTF-8"):
+        Reader(bytes(w.getvalue())).string()
+
+
+def test_joint_and_robot_states_that_write_refuses_are_cdr_errors_when_read():
+    """JointState.read refuses the lengths write refuses (a bag that plays would fail only when written again, e.g.
+    by xblick play --loop); RobotState.read's errors while decoding are CdrErrors."""
+    w = Writer()
+    Header().write(w)
+    w.string_sequence(["a", "b", "c"])
+    w.f64_sequence([1.0, 2.0])  # 2 positions for 3 joints
+    w.f64_sequence([])
+    w.f64_sequence([])
+    with pytest.raises(CdrError, match="2 values for 3 joints"):
+        msg.JointState.deserialize(bytes(w.getvalue()))
+    attached = _payload(Header(), 0, 0, 0, 0, Header(), 0, 0, 0, 0, 1)[:-64] + b"\x00"
+    with pytest.raises(CdrError, match="1 attached collision objects"):
+        msg.RobotState.deserialize(attached)
+    one_joint_no_transform = _payload(Header(), 0, 0, 0, 0, Header(), 1, "tcp", 0, 0, 0, 0)[:-64] + b"\x00"
+    with pytest.raises(CdrError, match="0 transforms, 0 twists, 0 wrenches for 1 joints"):
+        msg.RobotState.deserialize(one_joint_no_transform)

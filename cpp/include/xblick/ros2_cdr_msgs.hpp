@@ -797,7 +797,7 @@ namespace ros2_cdr
             {
                 JointState m;
                 m.header = read_header(r);
-                const std::uint32_t n = r.u32();
+                const std::uint32_t n = r.count(4);  // a name: at least its length
                 for (std::uint32_t i = 0; i < n; ++i)
                 {
                     m.name.push_back(r.string());
@@ -1001,7 +1001,7 @@ namespace ros2_cdr
         {
             CdrReader r(payload);
             TFMessage m;
-            const std::uint32_t n = r.u32();
+            const std::uint32_t n = r.count(72);  // a TransformStamped: header 12, child 4, transform 56
             for (std::uint32_t i = 0; i < n; ++i)
             {
                 TransformStamped t;
@@ -1042,7 +1042,7 @@ namespace ros2_cdr
             CdrReader r(payload);
             DiagnosticArray m;
             m.header = detail::read_header(r);
-            const std::uint32_t n = r.u32();
+            const std::uint32_t n = r.count(17);  // a DiagnosticStatus: level, 3 strings, its values' count
             for (std::uint32_t i = 0; i < n; ++i)
             {
                 DiagnosticStatus s;
@@ -1050,7 +1050,7 @@ namespace ros2_cdr
                 s.name = r.string();
                 s.message = r.string();
                 s.hardware_id = r.string();
-                const std::uint32_t k = r.u32();
+                const std::uint32_t k = r.count(8);  // a KeyValue: 2 strings
                 for (std::uint32_t j = 0; j < k; ++j)
                 {
                     KeyValue kv;
@@ -1156,11 +1156,11 @@ namespace ros2_cdr
             m.joint_state = detail::read_joint_state(r);
             MultiDOFJointState& d = m.multi_dof_joint_state;
             d.header = detail::read_header(r);
-            for (std::uint32_t i = 0, n = r.u32(); i < n; ++i)
+            for (std::uint32_t i = 0, n = r.count(4); i < n; ++i)
             {
                 d.joint_names.push_back(r.string());
             }
-            for (std::uint32_t i = 0, n = r.u32(); i < n; ++i)
+            for (std::uint32_t i = 0, n = r.count(56); i < n; ++i)
             {
                 Transform& t = d.transforms.emplace_back();
                 t.translation = detail::read_vector3(r);
@@ -1169,13 +1169,13 @@ namespace ros2_cdr
                 t.rotation.z = r.f64();
                 t.rotation.w = r.f64();
             }
-            for (std::uint32_t i = 0, n = r.u32(); i < n; ++i)
+            for (std::uint32_t i = 0, n = r.count(48); i < n; ++i)
             {
                 Twist& t = d.twists.emplace_back();
                 t.linear = detail::read_vector3(r);
                 t.angular = detail::read_vector3(r);
             }
-            for (std::uint32_t i = 0, n = r.u32(); i < n; ++i)
+            for (std::uint32_t i = 0, n = r.count(48); i < n; ++i)
             {
                 Wrench& t = d.wrenches.emplace_back();
                 t.force = detail::read_vector3(r);
@@ -1217,7 +1217,7 @@ namespace ros2_cdr
         {
             CdrReader r(payload);
             Float64MultiArray m;
-            const std::uint32_t n = r.u32();
+            const std::uint32_t n = r.count(12);  // a MultiArrayDimension: label, size, stride
             for (std::uint32_t i = 0; i < n; ++i)
             {
                 MultiArrayDimension& d = m.layout.dim.emplace_back();

@@ -156,6 +156,16 @@ class Reader:
     def f64(self) -> float:
         return self._unpack("<d", 8)
 
+    def count(self, min_size: int) -> int:
+        """A sequence's count (uint32), refused at once when that many elements of at least ``min_size`` bytes each
+        cannot be in the bytes left: a count from the payload never drives a loop that builds objects until the data
+        runs out."""
+        count = self.u32()
+        left = self.view.nbytes - self.pos
+        if count * min_size > left:
+            raise CdrError(f"a sequence of {count} elements of at least {min_size} bytes each, {left} bytes left")
+        return count
+
     def string(self) -> str:
         length = self.u32()
         if length == 0:
@@ -163,7 +173,11 @@ class Reader:
         raw = self._take(length)
         if raw[-1] != 0:
             raise CdrError("string without terminating NUL")
-        return bytes(raw[:-1]).decode("utf-8")
+        try:
+            return bytes(raw[:-1]).decode("utf-8")
+        except UnicodeDecodeError as e:
+            raise CdrError(f"string of {length - 1} bytes is no UTF-8 ({e.reason} at byte {e.start}: "
+                           f"{bytes(raw[e.start:e.end]).hex()})") from None
 
     def f64_array(self, length: int) -> np.ndarray:
         self._align(8)
@@ -181,13 +195,13 @@ class Reader:
         return self._take(self.u32())
 
     def i64_sequence(self) -> list[int]:
-        return [self.i64() for _ in range(self.u32())]
+        return [self.i64() for _ in range(self.count(8))]
 
     def bool_sequence(self) -> list[bool]:
         return [b != 0 for b in bytes(self._take(self.u32()))]
 
     def string_sequence(self) -> list[str]:
-        return [self.string() for _ in range(self.u32())]
+        return [self.string() for _ in range(self.count(4))]
 
     def expect_end(self):
         # trailing bytes up to the next 4-byte boundary are padding some writers add

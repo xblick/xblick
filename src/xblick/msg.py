@@ -25,9 +25,32 @@ from pathlib import Path
 import numpy as np
 
 from ._core import protocol as _protocol
-from .cdr import Reader, Writer
+from .cdr import CdrError, Reader, Writer
 
 NS_PER_S = 1_000_000_000
+
+# The fewest bytes an element of a sequence takes on the wire (empty strings and sequences, no padding): a count read
+# from a payload is refused at once when that many cannot be in the bytes left (cdr.Reader.count).
+_MIN_STRING = 4  # its length
+_MIN_HEADER = 8 + _MIN_STRING  # stamp, frame_id
+_MIN_TRANSFORM = 7 * 8  # translation, rotation
+_MIN_TRANSFORM_STAMPED = _MIN_HEADER + _MIN_STRING + _MIN_TRANSFORM  # header, child_frame_id, transform
+_MIN_TWIST = 6 * 8  # also a Wrench
+_MIN_KEY_VALUE = 2 * _MIN_STRING
+_MIN_DIAGNOSTIC_STATUS = 1 + 3 * _MIN_STRING + 4  # level, name, message, hardware_id, values
+_MIN_POINT_FIELD = _MIN_STRING + 4 + 1 + 4  # name, offset, datatype, count
+_MIN_HYPOTHESIS = _MIN_STRING + 8  # class_id, score
+_MIN_HYPOTHESIS_WITH_POSE = _MIN_HYPOTHESIS + 7 * 8 + 36 * 8  # hypothesis, pose, covariance
+_MIN_DETECTION_2D = _MIN_HEADER + 4 + 5 * 8 + _MIN_STRING  # header, results, bbox, id
+_MIN_DETECTION_3D = _MIN_HEADER + 4 + 7 * 8 + 3 * 8 + _MIN_STRING  # header, results, center, size, id
+_MIN_DIMENSION = _MIN_STRING + 4 + 4  # label, size, stride
+_MIN_RANGE = 3 * 8  # FloatingPointRange, IntegerRange
+_MIN_PARAMETER_VALUE = 1 + 1 + 8 + 8 + _MIN_STRING + 5 * 4  # type, bool, int, double, string, five sequences
+_MIN_PARAMETER = _MIN_STRING + _MIN_PARAMETER_VALUE
+_MIN_PARAMETER_DESCRIPTOR = 3 * _MIN_STRING + 1 + 2 + 2 * 4  # 3 strings, type, 2 bools, 2 range sequences
+_MIN_SET_PARAMETERS_RESULT = 1 + _MIN_STRING
+_MIN_CHAIN_CONNECTION = _MIN_STRING + 4  # name, reference_interfaces
+_MIN_CONTROLLER_STATE = 3 * _MIN_STRING + 1 + 2 + 5 * 4 + 2 + 4  # 3 strings, is_async, rate, 5 lists, 2 bools, chain
 
 
 @dataclass
@@ -489,7 +512,7 @@ class TFMessage(Message):
     @classmethod
     def read(cls, r: Reader) -> "TFMessage":
         transforms = []
-        for _ in range(r.u32()):
+        for _ in range(r.count(_MIN_TRANSFORM_STAMPED)):
             header, child = Header.read(r), r.string()
             translation = Vector3(r.f64(), r.f64(), r.f64())
             rotation = Quaternion(r.f64(), r.f64(), r.f64(), r.f64())
@@ -601,9 +624,9 @@ class DiagnosticArray(Message):
     @classmethod
     def read(cls, r: Reader) -> "DiagnosticArray":
         header, status = Header.read(r), []
-        for _ in range(r.u32()):
+        for _ in range(r.count(_MIN_DIAGNOSTIC_STATUS)):
             level, name, message, hardware_id = r.u8(), r.string(), r.string(), r.string()
-            values = [KeyValue(r.string(), r.string()) for _ in range(r.u32())]
+            values = [KeyValue(r.string(), r.string()) for _ in range(r.count(_MIN_KEY_VALUE))]
             status.append(DiagnosticStatus(level, name, message, hardware_id, values))
         return cls(header=header, status=status)
 
@@ -637,7 +660,8 @@ def _write_fields(w: Writer, fields: list):
 
 
 def _read_fields(r: Reader) -> list:
-    return [PointField(name=r.string(), offset=r.u32(), datatype=r.u8(), count=r.u32()) for _ in range(r.u32())]
+    return [PointField(name=r.string(), offset=r.u32(), datatype=r.u8(), count=r.u32())
+            for _ in range(r.count(_MIN_POINT_FIELD))]
 
 
 @dataclass
@@ -937,7 +961,7 @@ def _write_results(w: Writer, results: list):
 
 
 def _read_results(r: Reader) -> list:
-    return [ObjectHypothesisWithPose.read(r) for _ in range(r.u32())]
+    return [ObjectHypothesisWithPose.read(r) for _ in range(r.count(_MIN_HYPOTHESIS_WITH_POSE))]
 
 
 @dataclass
@@ -973,7 +997,7 @@ class Detection2DArray(Message):
     @classmethod
     def read(cls, r: Reader) -> "Detection2DArray":
         header, detections = Header.read(r), []
-        for _ in range(r.u32()):
+        for _ in range(r.count(_MIN_DETECTION_2D)):
             h, results = Header.read(r), _read_results(r)
             bbox = BoundingBox2D(Pose2D(Point2D(r.f64(), r.f64()), r.f64()), r.f64(), r.f64())
             detections.append(Detection2D(h, results, bbox, r.string()))
@@ -1014,7 +1038,7 @@ class Detection3DArray(Message):
     @classmethod
     def read(cls, r: Reader) -> "Detection3DArray":
         header, detections = Header.read(r), []
-        for _ in range(r.u32()):
+        for _ in range(r.count(_MIN_DETECTION_3D)):
             h, results = Header.read(r), _read_results(r)
             center = Pose.read(r)
             bbox = BoundingBox3D(center, Vector3(r.f64(), r.f64(), r.f64()))
@@ -1042,7 +1066,8 @@ class Classification(Message):
     @classmethod
     def read(cls, r: Reader) -> "Classification":
         header = Header.read(r)
-        return cls(header=header, results=[ObjectHypothesis(r.string(), r.f64()) for _ in range(r.u32())])
+        return cls(header=header,
+                   results=[ObjectHypothesis(r.string(), r.f64()) for _ in range(r.count(_MIN_HYPOTHESIS))])
 
 
 # ------------------------------------------------------------------------------------------- robot state
@@ -1067,10 +1092,16 @@ class JointState(Message):
     velocity: np.ndarray = field(default_factory=_empty)
     effort: np.ndarray = field(default_factory=_empty)
 
-    def write(self, w: Writer):
+    def _mismatch(self) -> str | None:
+        """What is wrong with the lengths (None: nothing): write refuses it, read too, at the first message."""
         for values in (self.position, self.velocity, self.effort):
             if len(values) not in (0, len(self.name)):
-                raise ValueError(f"JointState: {len(values)} values for {len(self.name)} joints (that many or none)")
+                return f"JointState: {len(values)} values for {len(self.name)} joints (that many or none)"
+        return None
+
+    def write(self, w: Writer):
+        if (wrong := self._mismatch()) is not None:
+            raise ValueError(wrong)
         self.header.write(w)
         w.u32(len(self.name))
         for n in self.name:
@@ -1082,8 +1113,11 @@ class JointState(Message):
     @classmethod
     def read(cls, r: Reader) -> "JointState":
         header = Header.read(r)
-        name = [r.string() for _ in range(r.u32())]
-        return cls(header, name, r.f64_sequence(), r.f64_sequence(), r.f64_sequence())
+        name = [r.string() for _ in range(r.count(_MIN_STRING))]
+        state = cls(header, name, r.f64_sequence(), r.f64_sequence(), r.f64_sequence())
+        if (wrong := state._mismatch()) is not None:
+            raise CdrError(wrong)
+        return state
 
     def __eq__(self, other):
         return (isinstance(other, JointState) and self.header == other.header and self.name == other.name
@@ -1186,12 +1220,19 @@ class MultiDOFJointState:
     twists: list = field(default_factory=list)
     wrenches: list = field(default_factory=list)
 
-    def check(self):
+    def _mismatch(self) -> str | None:
+        """What is wrong with the lengths (None: nothing): check() raises it as ValueError, RobotState.read as
+        CdrError."""
         n = len(self.joint_names)
         if len(self.transforms) != n or len(self.twists) not in (0, n) or len(self.wrenches) not in (0, n):
-            raise ValueError(f"MultiDOFJointState: {len(self.transforms)} transforms, {len(self.twists)} twists, "
-                             f"{len(self.wrenches)} wrenches for {n} joints (a transform each; twists and wrenches "
-                             "that many or none)")
+            return (f"MultiDOFJointState: {len(self.transforms)} transforms, {len(self.twists)} twists, "
+                    f"{len(self.wrenches)} wrenches for {n} joints (a transform each; twists and wrenches that many "
+                    "or none)")
+        return None
+
+    def check(self):
+        if (wrong := self._mismatch()) is not None:
+            raise ValueError(wrong)
 
 
 @dataclass
@@ -1234,19 +1275,20 @@ class RobotState(Message):
     def read(cls, r: Reader) -> "RobotState":
         joint_state = JointState.read(r)
         header = Header.read(r)
-        names = [r.string() for _ in range(r.u32())]
+        names = [r.string() for _ in range(r.count(_MIN_STRING))]
         transforms = [Transform(Vector3(r.f64(), r.f64(), r.f64()), Quaternion(r.f64(), r.f64(), r.f64(), r.f64()))
-                      for _ in range(r.u32())]
+                      for _ in range(r.count(_MIN_TRANSFORM))]
         twists = [Twist(Vector3(r.f64(), r.f64(), r.f64()), Vector3(r.f64(), r.f64(), r.f64()))
-                  for _ in range(r.u32())]
+                  for _ in range(r.count(_MIN_TWIST))]
         wrenches = [Wrench(Vector3(r.f64(), r.f64(), r.f64()), Vector3(r.f64(), r.f64(), r.f64()))
-                    for _ in range(r.u32())]
+                    for _ in range(r.count(_MIN_TWIST))]
         attached = r.u32()
         if attached:
-            raise ValueError(f"RobotState with {attached} attached collision objects: Durchblick carries none")
+            raise CdrError(f"RobotState with {attached} attached collision objects: Durchblick carries none")
         is_diff = r.u8() != 0
         d = MultiDOFJointState(header, names, transforms, twists, wrenches)
-        d.check()
+        if (wrong := d._mismatch()) is not None:
+            raise CdrError(wrong)
         return cls(joint_state, d, is_diff)
 
 
@@ -1291,7 +1333,7 @@ class Float64MultiArray(Message):
 
     @classmethod
     def read(cls, r: Reader) -> "Float64MultiArray":
-        dims = [MultiArrayDimension(r.string(), r.u32(), r.u32()) for _ in range(r.u32())]
+        dims = [MultiArrayDimension(r.string(), r.u32(), r.u32()) for _ in range(r.count(_MIN_DIMENSION))]
         return cls(MultiArrayLayout(dims, r.u32()), r.f64_sequence())
 
     def __eq__(self, other):
@@ -1478,8 +1520,8 @@ class ParameterDescriptor:
     def read(cls, r: Reader) -> "ParameterDescriptor":
         name, type_, description, constraints, read_only, dynamic = (r.string(), r.u8(), r.string(), r.string(),
                                                                      r.bool(), r.bool())
-        floating = [FloatingPointRange(r.f64(), r.f64(), r.f64()) for _ in range(r.u32())]
-        integer = [IntegerRange(r.i64(), r.i64(), r.u64()) for _ in range(r.u32())]
+        floating = [FloatingPointRange(r.f64(), r.f64(), r.f64()) for _ in range(r.count(_MIN_RANGE))]
+        integer = [IntegerRange(r.i64(), r.i64(), r.u64()) for _ in range(r.count(_MIN_RANGE))]
         return cls(name, type_, description, constraints, read_only, dynamic, floating, integer)
 
 
@@ -1505,8 +1547,8 @@ def _write_list(w: Writer, items):
         item.write(w)
 
 
-def _read_list(r: Reader, kind) -> list:
-    return [kind.read(r) for _ in range(r.u32())]
+def _read_list(r: Reader, kind, min_size: int) -> list:
+    return [kind.read(r) for _ in range(r.count(min_size))]
 
 
 @dataclass
@@ -1529,8 +1571,7 @@ class ParameterEvent(Message):
 
     @classmethod
     def read(cls, r: Reader) -> "ParameterEvent":
-        return cls(Time.read(r), r.string(), _read_list(r, Parameter), _read_list(r, Parameter),
-                   _read_list(r, Parameter))
+        return cls(Time.read(r), r.string(), *(_read_list(r, Parameter, _MIN_PARAMETER) for _ in range(3)))
 
 
 # the services' requests and responses (rcl_interfaces/srv/*: <Service>_Request, <Service>_Response)
@@ -1613,7 +1654,7 @@ class DescribeParametersResponse(Message):
 
     @classmethod
     def read(cls, r: Reader) -> "DescribeParametersResponse":
-        return cls(_read_list(r, ParameterDescriptor))
+        return cls(_read_list(r, ParameterDescriptor, _MIN_PARAMETER_DESCRIPTOR))
 
 
 @dataclass
@@ -1627,7 +1668,7 @@ class GetParametersResponse(Message):
 
     @classmethod
     def read(cls, r: Reader) -> "GetParametersResponse":
-        return cls(_read_list(r, ParameterValue))
+        return cls(_read_list(r, ParameterValue, _MIN_PARAMETER_VALUE))
 
 
 @dataclass
@@ -1655,7 +1696,7 @@ class ParametersRequest(Message):
 
     @classmethod
     def read(cls, r: Reader):
-        return cls(_read_list(r, Parameter))
+        return cls(_read_list(r, Parameter, _MIN_PARAMETER))
 
 
 @dataclass
@@ -1679,7 +1720,7 @@ class SetParametersResponse(Message):
 
     @classmethod
     def read(cls, r: Reader) -> "SetParametersResponse":
-        return cls(_read_list(r, SetParametersResult))
+        return cls(_read_list(r, SetParametersResult, _MIN_SET_PARAMETERS_RESULT))
 
 
 @dataclass
@@ -1819,7 +1860,7 @@ class ControllerState:
     def read(cls, r: Reader) -> "ControllerState":
         return cls(r.string(), r.string(), r.string(), r.bool(), r.u16(), r.string_sequence(), r.string_sequence(),
                    r.string_sequence(), r.bool(), r.bool(), r.string_sequence(), r.string_sequence(),
-                   _read_list(r, ChainConnection))
+                   _read_list(r, ChainConnection, _MIN_CHAIN_CONNECTION))
 
 
 @dataclass
@@ -1847,7 +1888,7 @@ class ListControllersResponse(Message):
 
     @classmethod
     def read(cls, r: Reader) -> "ListControllersResponse":
-        return cls(_read_list(r, ControllerState))
+        return cls(_read_list(r, ControllerState, _MIN_CONTROLLER_STATE))
 
 
 @dataclass

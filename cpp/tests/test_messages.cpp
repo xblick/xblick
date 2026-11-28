@@ -114,6 +114,34 @@ namespace
                                                       1, 0, 0, 0, 1, 0, 0, 0};
         expect(refused([](const auto& b) { return PointCloud2::deserialize(b); }, forged(0xFFFFFFFFU, 64, cloud_head)),
                "a cloud claiming 2^32 - 1 fields is refused");
+        // the messages a node reads from others' topics: refused by the count itself (Python's
+        // test_a_count_beyond_the_bytes_left_is_refused_at_once), before any element is built
+        const auto by_count = [](auto decode, const std::vector<std::uint8_t>& payload) {
+            try
+            {
+                decode(payload);
+                return false;
+            }
+            catch (const std::exception& e)
+            {
+                return std::string(e.what()).find("a sequence of 1000000 elements does not fit") != std::string::npos;
+            }
+        };
+        const std::vector<std::uint8_t> header(cloud_head.begin(), cloud_head.begin() + 16);  // stamp, frame_id "a"
+        std::vector<std::uint8_t> robot = header;  // a JointState without joints, then the multi-DOF header
+        robot.resize(robot.size() + 16, 0);
+        robot.insert(robot.end(), header.begin(), header.end());
+        constexpr std::uint32_t kMillion = 1000 * 1000;
+        expect(by_count([](const auto& b) { return TFMessage::deserialize(b); }, forged(kMillion, 64)),
+               "a TFMessage claiming 10^6 transforms is refused by its count");
+        expect(by_count([](const auto& b) { return DiagnosticArray::deserialize(b); }, forged(kMillion, 64, header)),
+               "a DiagnosticArray claiming 10^6 statuses is refused by its count");
+        expect(by_count([](const auto& b) { return JointState::deserialize(b); }, forged(kMillion, 64, header)),
+               "a JointState claiming 10^6 names is refused by its count");
+        expect(by_count([](const auto& b) { return RobotState::deserialize(b); }, forged(kMillion, 64, robot)),
+               "a RobotState claiming 10^6 multi-DOF joints is refused by its count");
+        expect(by_count([](const auto& b) { return Float64MultiArray::deserialize(b); }, forged(kMillion, 64)),
+               "a Float64MultiArray claiming 10^6 dimensions is refused by its count");
         const long grown = peak_mb() - before;
         std::fprintf(stderr, "forged counts: peak memory grew by %ld MB\n", grown);
         expect(grown < 300, "forged counts allocate about what the payload holds, not hundreds of times more");

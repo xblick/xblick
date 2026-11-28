@@ -252,9 +252,9 @@ namespace xblick
 
         std::vector<PointField> read_fields(CdrReader& r)
         {
-            // appended, not pre-sized: a forged count allocates only the fields the payload holds
+            // a forged count is refused at once (a field: name, offset, datatype, count: 13 bytes at least)
             std::vector<PointField> fields;
-            for (std::uint32_t i = 0, n = r.u32(); i < n; ++i)
+            for (std::uint32_t i = 0, n = r.count(13); i < n; ++i)
             {
                 PointField& f = fields.emplace_back();
                 f.name = r.string();
