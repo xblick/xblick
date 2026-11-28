@@ -926,7 +926,12 @@ class MaxRate:
     """At most ``hz`` frames a second, decided by their stamps before they are decoded: a frame is taken when its stamp
     lies in a later period of 1/hz s than the last frame taken (periods counted from the epoch, so that the streams of
     one camera, which share their stamps, take the same frames and still pair). The frame taken is the newest there is
-    then; the later ones of its period are skipped. A stamp that went back (a camera's restart) is taken."""
+    then; the later ones of its period are skipped. A stamp that went back (a camera's restart) is taken.
+
+    Frames whose stamps do not advance (a ROS publisher that sends a zero or fixed ``header.stamp``; ours always
+    stamp) all lie in one period: the first is taken, no other. ``stuck`` counts the frames skipped in a row with the
+    stamp of the frame taken last; Subscription says it in one warning line at STUCK_FRAMES. The pacing stays by
+    stamp: a receive time would break the pairing of streams that share their stamps."""
 
     def __init__(self, hz: float):
         if not hz > 0:
@@ -934,13 +939,19 @@ class MaxRate:
         self.hz = hz
         self.period_ns = round(1e9 / hz)
         self._last: int | None = None
+        self._last_stamp: int | None = None
+        self.stuck = 0
 
     def admit(self, stamp_ns: int) -> bool:
         period = stamp_ns // self.period_ns
         if period == self._last:
+            self.stuck = self.stuck + 1 if stamp_ns == self._last_stamp else 0
             return False
-        self._last = period
+        self._last, self._last_stamp, self.stuck = period, stamp_ns, 0
         return True
+
+
+STUCK_FRAMES = 3  # MaxRate.stuck: so many frames in a row with the stamp of the frame taken last are said once
 
 
 def _stamp_of(payload: bytes) -> int:
@@ -1035,6 +1046,7 @@ class Subscription:
         self.stale = 0  # descriptors whose data was overwritten before it could be read
         self.max_rate = MaxRate(max_hz) if max_hz is not None else None
         self.skipped_max_hz = 0  # frames left out for max_hz, not decoded
+        self._stuck_said = False  # MaxRate.stuck said (_say_stuck)
         self.decoded = 0  # frames decoded (or read from their ring) and handed out
         self._keep, self._on_put = 0, None  # keep_recent
         self._session = session
@@ -1421,10 +1433,22 @@ class Subscription:
                 return None
             payload, attachment, key, receive_ns, encoding_of_sample, transport = item
             _check_encoding(key, encoding_of_sample, self.TYPES[transport])
-            if consume and self.max_rate is not None and not self.max_rate.admit(_stamp_of(payload)):
+            if consume and self.max_rate is not None and not self.max_rate.admit(stamp := _stamp_of(payload)):
                 self.skipped_max_hz += 1  # not decoded, its ring not read: wait for the next within the timeout
+                if self.max_rate.stuck == STUCK_FRAMES:  # stamps that do not advance
+                    self._say_stuck(stamp)
                 continue
             return payload, parse_attachment(attachment), key, receive_ns, transport
+
+    def _say_stuck(self, stamp_ns: int):
+        """One warning line: the publisher's stamps do not advance, and max_hz chooses by stamps (MaxRate)."""
+        if self._stuck_said:
+            return
+        self._stuck_said = True
+        log.warning(f"{self.base}: {STUCK_FRAMES} frames in a row carry the stamp {stamp_ns} ns of the frame taken "
+                    f"before them (the publisher's header stamps do not advance); max_hz {self.max_rate.hz:g} chooses "
+                    "frames by their stamps and hands out none of these: fix the publisher's stamps, or read every "
+                    "frame (--max-hz none)")
 
     def _moved(self, message, transport: str) -> bool:
         """True if the ring descriptor ``message`` is of another host: with auto, choose again; else raise."""

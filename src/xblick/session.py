@@ -968,14 +968,15 @@ def _take(session) -> tuple:
 
 def _close_parts(declared, taking_part) -> None:
     """Closes a session's part in ROS 2 and its declaration (either may be None) while the zenoh session still
-    sends."""
-    try:
-        if taking_part is not None:  # its tokens gone first, so that ROS's graph drops the node at once
-            taking_part.close()
-        if declared is not None:
-            declared.close()
-    except zenoh.ZError:  # the session was closed already (by zenoh directly): nothing left to undeclare
-        pass
+    sends. Each part on its own: a part that cannot be closed does not keep the other open."""
+    # the part in ROS 2 first: its tokens gone, ROS's graph drops the node at once
+    for part in (taking_part, declared):
+        if part is None:
+            continue
+        try:
+            part.close()
+        except zenoh.ZError:  # the session was closed already (by zenoh directly): nothing left to undeclare
+            pass
 
 
 def _drop(declared, taking_part) -> None:

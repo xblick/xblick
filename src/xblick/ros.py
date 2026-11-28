@@ -37,6 +37,7 @@ Type hashes (RIHS01, REP 2011): ``TYPE_HASHES`` for every type Durchblick carrie
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import hashlib
 import itertools
@@ -585,6 +586,7 @@ def _raw(session):
 
 
 POLL_PERIOD_S = 0.05  # how often a _Polled subscriber looks for samples
+HISTORY_TIMEOUT_S = 2.0  # Graph: the query of the declarations there are, which the publishers' tokens wait for
 
 
 class _Polled:
@@ -683,7 +685,12 @@ class Graph:
     and its tokens reach this session one after the other on the same way, so its declaration arrives before its ROS
     tokens. One thread reads both subscribers: each round it takes the publishers' samples first and the declarations'
     after, and applies the declarations first, so that a publisher it looks at has its program's declaration known.
-    A zid once declared stays ours (a session's zid is its own for its life): the tokens of a program that ends go in
+    That order holds for tokens that come live, not for the two subscribers' histories (each one a query of its own,
+    whose replies come in no fixed order): the publishers' tokens are held until a liveliness query of every
+    declaration, asked after both subscribers were declared, has its replies (at most ``HISTORY_TIMEOUT_S`` and the
+    deadline of session.replies). A publisher in the history had its program's declaration before it, so that query
+    has it. A query ended by its deadline under load gives the tokens as before: the declarations' subscriber still
+    brings what it missed, and the listeners are told then. A zid once declared stays ours (a session's zid is its own for its life): the tokens of a program that ends go in
     no fixed order. A declaration that arrives tells the listeners as a publisher does, so that a choice made before
     it (a program whose ROS tokens came another way first) is made again."""
 
@@ -697,9 +704,27 @@ class Graph:
         raw = _raw(ros_.session)
         self._declarations = raw.liveliness().declare_subscriber(declaration.ALL, history=True)
         self._publishers = raw.liveliness().declare_subscriber(publisher_pattern(ros_.domain), history=True)
+        # the declarations there now, asked after both subscribers exist: the publishers' tokens are held until it
+        # has its replies (the class's docstring)
+        self._history: list[str] | None = None
+        self._history_done = threading.Event()
+        threading.Thread(target=self._ask_history, args=(raw,), name=f"ros graph {ros_.domain} history",
+                         daemon=True).start()
+        self._held: list = []
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name=f"ros graph {ros_.domain}", daemon=True)
         self._thread.start()
+
+    def _ask_history(self, raw):
+        from . import declaration
+        from .session import replies
+        try:
+            self._history = [str(r.ok.key_expr) for r in replies(raw, declaration.ALL, HISTORY_TIMEOUT_S,
+                                                                 liveliness=True) if r.ok is not None]
+        except zenoh.ZError:  # closed with its session
+            self._history = []
+        finally:
+            self._history_done.set()
 
     @staticmethod
     def _drain(subscriber) -> list:
@@ -718,11 +743,18 @@ class Graph:
                 declared = self._drain(self._declarations)
             except zenoh.ZError:  # closed with its session
                 return
+            keys = [str(s.key_expr) for s in declared if s.kind == zenoh.SampleKind.PUT]
+            if self._held is not None:  # the publishers' tokens held until the declarations there are known
+                self._held += tokens
+                tokens = []
+                if self._history_done.is_set():
+                    keys += self._history or []
+                    tokens, self._held = self._held, None
             changed = False
             with self._lock:
-                for sample in declared:
-                    zid = declaration.zid_of(str(sample.key_expr))
-                    if sample.kind == zenoh.SampleKind.PUT and zid is not None and zid not in self._xblick:
+                for key in keys:
+                    zid = declaration.zid_of(key)
+                    if zid is not None and zid not in self._xblick:
                         self._xblick.add(zid)
                         changed = True
                 for sample in tokens:
@@ -774,6 +806,53 @@ class Graph:
         self._declarations.undeclare()
         with self._lock:
             self._listeners = []
+
+
+def subscription_pattern(domain: int) -> str:
+    """The liveliness key expression of the subscriptions' tokens on ``domain``."""
+    return "/".join([ADMIN_SPACE, str(domain), "*", "*", "*", SUBSCRIPTION, "**"])
+
+
+class Readers:
+    """The ROS subscriptions on a session's domain, as a liveliness subscriber with history keeps their tokens (made
+    at the first ``RosPublisher.matched``, ``Ros.readers``, closed with the session's part in ROS): ``reads(topic,
+    type_name)``, whether one of them reads the topic in that type. Every ROS subscription has such a token (rmw_zenoh
+    declares it with its subscriber, ours too, this session's own as well), a Zenoh subscriber on ``**`` (a storage,
+    ``z_sub``, a traffic meter) has none: a publisher sends its ROS form for ROS's subscribers only. Polled as
+    _Polled (one thread)."""
+
+    def __init__(self, ros_: Ros):
+        self._lock = threading.Lock()
+        self._tokens: dict[str, tuple[str, str]] = {}  # key -> (topic, type)
+        self._count: collections.Counter = collections.Counter()  # (topic, type) -> its tokens
+        self._polled = _Polled(_raw(ros_.session).liveliness().declare_subscriber(
+            subscription_pattern(ros_.domain), history=True), self._seen, f"ros readers {ros_.domain}")
+
+    def _seen(self, sample):
+        key = str(sample.key_expr)
+        if sample.kind == zenoh.SampleKind.PUT:
+            try:
+                token = parse_token(key)
+            except RosError:
+                return
+            read = (token.topic, token.type_name)
+        with self._lock:
+            if sample.kind != zenoh.SampleKind.PUT:
+                read = self._tokens.pop(key, None)
+                if read is not None:
+                    self._count[read] -= 1
+                    if not self._count[read]:
+                        del self._count[read]
+            elif key not in self._tokens:
+                self._tokens[key] = read
+                self._count[read] += 1
+
+    def reads(self, topic: str, type_name: str) -> bool:
+        with self._lock:
+            return (topic, type_name) in self._count
+
+    def close(self):
+        self._polled.undeclare()
 
 
 def _below(topic: str, prefix: str) -> bool:
@@ -877,6 +956,7 @@ class Ros:
         self._no_parameters = None
         self._closed = False
         self._graph: Graph | None = None
+        self._readers: Readers | None = None
         self._clock_published = False
         self._clock_check = None
         self.node = self.add_node(node, namespace)
@@ -987,24 +1067,40 @@ class Ros:
                 self._graph = Graph(self)
             return self._graph
 
+    @property
+    def readers(self) -> Readers:
+        """ROS's subscriptions on the domain (Readers), made at the first use: a program that offers nothing to ROS
+        keeps none."""
+        with self._lock:
+            if self._closed:
+                raise RosError("the session's part in ROS 2 is closed")
+            if self._readers is None:
+                self._readers = Readers(self)
+            return self._readers
+
     def close(self):
+        """Closes every part (the graph, the readers, the services without parameters, the duplicate watch, the nodes), each also
+        when one before it raised (their threads stop); the first error is raised after the last part."""
         if self._clock_check is not None:
             self._clock_check.cancel()
         with self._lock:
             self._closed = True
             graph, self._graph = self._graph, None
+            readers, self._readers = self._readers, None
             no_parameters, self._no_parameters = self._no_parameters, None
-        if graph is not None:
-            graph.close()
-        if no_parameters is not None:
-            no_parameters.close()
-        if self._duplicates is not None:
-            self._duplicates.undeclare()
-            self._duplicates = None
-        with self._lock:
+            duplicates, self._duplicates = self._duplicates, None
             nodes, self._nodes = self._nodes, []
-        for node in nodes:
-            node.close()
+        steps = ([graph.close] if graph is not None else []) + ([readers.close] if readers is not None else []) \
+            + ([no_parameters.close] if no_parameters is not None else []) \
+            + ([duplicates.undeclare] if duplicates is not None else []) + [node.close for node in nodes]
+        first = None
+        for step in steps:
+            try:
+                step()
+            except Exception as error:  # noqa: BLE001 - raised after the other parts are closed
+                first = first or error
+        if first is not None:
+            raise first
 
     def _read_static(self):
         """The subscription to ROS's /tf_static that compares other programs' static transforms with this program's
@@ -1190,13 +1286,23 @@ class RosNode:
         return self._add(RosClient(self, name, type_name, qos))
 
     def close(self):
+        """Closes its entities and its token, each also when one before it raised (the first error is raised after
+        the token), and leaves the session's nodes (Ros._nodes): a program that makes and closes further parameters
+        keeps no node."""
+        with self.ros._lock:
+            if self in self.ros._nodes:
+                self.ros._nodes.remove(self)
         with self._lock:
             entities, self._entities = self._entities, []
-        for entity in entities:
-            entity.close()
-        if self._token is not None:
-            self._token.undeclare()
-            self._token = None
+            token, self._token = self._token, None
+        first = None
+        for step in [entity.close for entity in entities] + ([token.undeclare] if token is not None else []):
+            try:
+                step()
+            except Exception as error:  # noqa: BLE001 - raised after the other parts are closed
+                first = first or error
+        if first is not None:
+            raise first
 
 
 def _reliability(qos: Qos) -> zenoh.Reliability:
@@ -1224,29 +1330,40 @@ class _Entity:
         self._raw = _raw(node.ros.session)
         self._declared = None
         self._live = None
+        # a rename (its node's, in another thread) and close one after the other: a rename after close declares no
+        # token again for an entity that is gone
+        self._entity_lock = threading.Lock()
+        self._closed = False
 
     def _announce(self):
         self._live = self._raw.liveliness().declare_token(self.token.key())
 
     def _rename(self):
-        """Its node renamed (RosNode.rename): its token and gid of the node's new name."""
-        node = self.node
-        token = dataclasses.replace(self.token, namespace=node.namespace, node=node.name)
-        self.token, self.gid = token, gid(token.key())
-        node.ros.own(self.gid)
-        if self._live is not None:
-            self._live.undeclare()
-            self._announce()
+        """Its node renamed (RosNode.rename): its token and gid of the node's new name; nothing once it is closed."""
+        with self._entity_lock:
+            if self._closed:
+                return
+            node = self.node
+            token = dataclasses.replace(self.token, namespace=node.namespace, node=node.name)
+            self.token, self.gid = token, gid(token.key())
+            node.ros.own(self.gid)
+            if self._live is not None:
+                self._live.undeclare()
+                self._announce()
 
     def close(self):
         """Undeclares it and its token (again: nothing)."""
         self.node._forget(self)
-        if self._live is not None:
-            self._live.undeclare()
-            self._live = None
-        if self._declared is not None:
-            self._declared.undeclare()
-            self._declared = None
+        with self._entity_lock:
+            self._closed = True
+            live, self._live = self._live, None
+            declared, self._declared = self._declared, None
+        try:
+            if live is not None:
+                live.undeclare()
+        finally:
+            if declared is not None:
+                declared.undeclare()
 
 
 class RosPublisher(_Entity):
@@ -1273,11 +1390,14 @@ class RosPublisher(_Entity):
 
     @property
     def matched(self) -> bool:
-        """A ROS subscriber (or any other) of the key is known. Always True for a transient-local publisher: zenoh-ext's
-        AdvancedPublisher has no matching status, and its samples go into its cache for later subscribers anyway."""
+        """A ROS subscription of the topic in its type is known: a Zenoh subscriber of the key (Zenoh's matching
+        status) and a subscription token of the topic and type in ROS's graph (``Ros.readers``). A Zenoh subscriber
+        without such a token (one on ``**``: a storage, ``z_sub``, a traffic meter) is none. Always True for a
+        transient-local publisher: zenoh-ext's AdvancedPublisher has no matching status, and its samples go into its
+        cache for later subscribers anyway."""
         if self.qos.durability == TRANSIENT_LOCAL:
             return True
-        return self._declared.matching_status.matching
+        return self._declared.matching_status.matching and self.node.ros.readers.reads(self.topic, self.type_name)
 
     def attachment(self) -> bytes:
         """The attachment of the next message, its sequence number counted: for a message that goes on keys of its
@@ -1344,17 +1464,20 @@ class RosSubscriber(_Entity):
             super()._rename()
             return
         # the gid follows the token: the registry entry (before the new token) and the buffer key too
-        node = self.node
-        self.token = dataclasses.replace(self.token, namespace=node.namespace, node=node.name)
-        self.gid = gid(self.token.key())
-        node.ros.own(self.gid)
-        self._gpu.set_gid(self.gid)
-        old, self._buffer = self._buffer, self._raw.declare_subscriber(buffer_key(self.key, self.gid),
-                                                                      self._on_sample)
-        old.undeclare()
-        if self._live is not None:
-            self._live.undeclare()
-            self._announce()
+        with self._entity_lock:  # as _Entity._rename: nothing once it is closed
+            if self._closed:
+                return
+            node = self.node
+            self.token = dataclasses.replace(self.token, namespace=node.namespace, node=node.name)
+            self.gid = gid(self.token.key())
+            node.ros.own(self.gid)
+            self._gpu.set_gid(self.gid)
+            old, self._buffer = self._buffer, self._raw.declare_subscriber(buffer_key(self.key, self.gid),
+                                                                          self._on_sample)
+            old.undeclare()
+            if self._live is not None:
+                self._live.undeclare()
+                self._announce()
 
     @property
     def gpu(self):

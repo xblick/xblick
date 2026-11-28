@@ -23,8 +23,22 @@ is started with `--no-ros`.
 
 Every command and every node takes part in ROS 2. The program sends on our keys as before and also on the keys of
 `rmw_zenoh_cpp`. It needs `rmw_zenoh_cpp` 0.2.13 (ROS 2 Jazzy) or 0.10.6 or newer (ROS 2 Lyrical) on the ROS side.
-A publisher sends the ROS form only while a ROS subscriber is there. Until then the part in ROS 2 costs the ROS
-node's announcements and nothing else.
+A publisher sends the ROS form only while a ROS subscriber is there, that is a subscriber whose session announces it
+in ROS's graph, as every ROS 2 node does. A Zenoh subscriber on `**`, such as a storage or `z_sub`, announces
+nothing and switches no ROS form on.
+
+Without a ROS subscriber the part in ROS 2 costs the following:
+
+- the ROS node's announcements;
+- two threads that look for work 20 times a second: one watches for a second node of the same name, and one answers
+  ROS's parameter services until the program's first parameters take them over;
+- once any Zenoh subscriber covers one of the program's ROS keys, a third such thread that follows the
+  announcements of ROS's subscribers on the domain;
+- with `--ros-clock`, one check one second after the start;
+- in a program that publishes static transforms, a subscription to `/tf_static`, which asks the other publishers
+  for their latched transforms;
+- in a program that reads a ROS topic, or waits with `auto` for a publisher, a thread that follows ROS's publishers
+  and our programs' announcements on the domain, 20 times a second.
 
 The keys and the attachment are `rmw_zenoh_cpp`'s format, which ROS 2 itself does not define. Nodes on another RMW,
 such as one on DDS, do not use Zenoh and see nothing of it. For them see
