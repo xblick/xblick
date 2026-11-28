@@ -585,6 +585,7 @@ def _raw(session):
 
 
 POLL_PERIOD_S = 0.05  # how often a _Polled subscriber looks for samples
+HISTORY_TIMEOUT_S = 2.0  # Graph: the query of the declarations there are, which the publishers' tokens wait for
 
 
 class _Polled:
@@ -683,7 +684,12 @@ class Graph:
     and its tokens reach this session one after the other on the same way, so its declaration arrives before its ROS
     tokens. One thread reads both subscribers: each round it takes the publishers' samples first and the declarations'
     after, and applies the declarations first, so that a publisher it looks at has its program's declaration known.
-    A zid once declared stays ours (a session's zid is its own for its life): the tokens of a program that ends go in
+    That order holds for tokens that come live, not for the two subscribers' histories (each one a query of its own,
+    whose replies come in no fixed order): the publishers' tokens are held until a liveliness query of every
+    declaration, asked after both subscribers were declared, has its replies (at most ``HISTORY_TIMEOUT_S`` and the
+    deadline of session.replies). A publisher in the history had its program's declaration before it, so that query
+    has it. A query ended by its deadline under load gives the tokens as before: the declarations' subscriber still
+    brings what it missed, and the listeners are told then. A zid once declared stays ours (a session's zid is its own for its life): the tokens of a program that ends go in
     no fixed order. A declaration that arrives tells the listeners as a publisher does, so that a choice made before
     it (a program whose ROS tokens came another way first) is made again."""
 
@@ -697,9 +703,27 @@ class Graph:
         raw = _raw(ros_.session)
         self._declarations = raw.liveliness().declare_subscriber(declaration.ALL, history=True)
         self._publishers = raw.liveliness().declare_subscriber(publisher_pattern(ros_.domain), history=True)
+        # the declarations there now, asked after both subscribers exist: the publishers' tokens are held until it
+        # has its replies (the class's docstring)
+        self._history: list[str] | None = None
+        self._history_done = threading.Event()
+        threading.Thread(target=self._ask_history, args=(raw,), name=f"ros graph {ros_.domain} history",
+                         daemon=True).start()
+        self._held: list = []
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name=f"ros graph {ros_.domain}", daemon=True)
         self._thread.start()
+
+    def _ask_history(self, raw):
+        from . import declaration
+        from .session import replies
+        try:
+            self._history = [str(r.ok.key_expr) for r in replies(raw, declaration.ALL, HISTORY_TIMEOUT_S,
+                                                                 liveliness=True) if r.ok is not None]
+        except zenoh.ZError:  # closed with its session
+            self._history = []
+        finally:
+            self._history_done.set()
 
     @staticmethod
     def _drain(subscriber) -> list:
@@ -718,11 +742,18 @@ class Graph:
                 declared = self._drain(self._declarations)
             except zenoh.ZError:  # closed with its session
                 return
+            keys = [str(s.key_expr) for s in declared if s.kind == zenoh.SampleKind.PUT]
+            if self._held is not None:  # the publishers' tokens held until the declarations there are known
+                self._held += tokens
+                tokens = []
+                if self._history_done.is_set():
+                    keys += self._history or []
+                    tokens, self._held = self._held, None
             changed = False
             with self._lock:
-                for sample in declared:
-                    zid = declaration.zid_of(str(sample.key_expr))
-                    if sample.kind == zenoh.SampleKind.PUT and zid is not None and zid not in self._xblick:
+                for key in keys:
+                    zid = declaration.zid_of(key)
+                    if zid is not None and zid not in self._xblick:
                         self._xblick.add(zid)
                         changed = True
                 for sample in tokens:

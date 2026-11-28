@@ -420,6 +420,42 @@ def test_the_graph_knows_a_program_of_ours_before_its_ros_tokens(network):
         camera.close()
 
 
+def test_the_graph_holds_publishers_of_its_history_until_the_declarations_are_known(network, monkeypatch):
+    """A Graph made while a program of ours runs (its tokens in both subscribers' histories): the declarations'
+    history delayed (it comes by a query of its own, in no fixed order with the publishers'), the program's ROS
+    publisher is never in the graph as a foreign one; the Graph's query of the declarations holds it back."""
+    from xblick import declaration
+
+    endpoint, reader = network
+    ours = session.open_session(connect=[endpoint], ros_options=session.RosOptions(DOMAIN, "ours_history"))
+    publisher = ours.ros.node.publisher("/ours_history/image_raw", Image.TYPE)
+    zid = str(ours.info.zid())
+    drain = ros.Graph._drain
+    late = time.monotonic() + 1.0
+
+    def declarations_late(subscriber):
+        if str(subscriber.key_expr) == declaration.ALL and time.monotonic() < late:
+            return []
+        return drain(subscriber)
+
+    try:
+        assert wait_for(lambda: bool(ros.publishers(reader, 0.5, "/ours_history/image_raw")), True)
+        monkeypatch.setattr(ros.Graph, "_drain", staticmethod(declarations_late))
+        graph = reader.ros.graph
+        seen = False
+        end = time.monotonic() + 2.0
+        while time.monotonic() < end:
+            if graph.publishers("/ours_history/image_raw"):
+                seen = True
+                assert graph.by_xblick(zid)
+                assert "/ours_history/image_raw" not in [t for t, _, _ in ros.camera_topics(graph)]
+            time.sleep(0.005)
+        assert seen
+    finally:
+        publisher.close()
+        ours.close()
+
+
 def wait_for(get, expected, timeout=5.0):
     end = time.monotonic() + timeout
     got = get()
