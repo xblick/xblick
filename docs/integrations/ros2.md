@@ -321,8 +321,8 @@ Our other services are offered to ROS only where a ROS service type fits exactly
 
 A Zenoh router serves our programs and ROS nodes alike. Both default to port 7447, so run one router per PC: either
 `xblick router` or ROS's `rmw_zenohd`. Our programs find `rmw_zenohd` there without options, and ROS nodes find
-`xblick router` with their default configuration. Both ways were tested on another port: our tests run against
-`rmw_zenohd`, and ROS's `talker` and `listener` talked through `xblick router`.
+`xblick router` with their default configuration. On another port, give both sides the same endpoint: our programs
+`--connect`, ROS nodes their Zenoh configuration.
 
 ## Try it with ROS 2's tools
 

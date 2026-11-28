@@ -60,7 +60,7 @@ off. A node also declares these options as read-only parameters. A program print
 node and domain. It prints a second line when it takes the name of its parameters.
 
 A client whose `--connect` endpoints do not answer ends with one line and exit code 1. The line names the endpoints
-and says that a client needs its router there. In our tests Zenoh gave up within 10 s. Another error at the start of a
+and says that a client needs its router there. Another error at the start of a
 session, such as a `--listen` port that is taken, also ends with one line. Nodes that open their session with
 `session.open_from_args` and the C++ programs do the same.
 
@@ -110,7 +110,7 @@ from ROS with `auto`, as the subscribers do.
 
 | Option | Meaning |
 | --- | --- |
-| `--transport auto\|compressed\|raw\|shm\|ros` | the transport to measure. `ros` reads the ROS 2 topic `/<stream>/image_raw` of a ROS camera. For a ROS topic `/T`: `auto` reads `/T`, or `/T/compressed` when only that is published. `ros` and `raw` read `/T`, `compressed` reads `/T/compressed`. |
+| `--transport auto\|compressed\|raw\|shm\|ros` | the transport to measure. `ros` reads the ROS 2 topic `/<stream>/image_raw` of a ROS camera, and `/<stream>/cloud` of a point cloud stream. For a ROS topic `/T`: `auto` reads `/T`, or `/T/compressed` when only that is published. `ros` and `raw` read `/T`, `compressed` reads `/T/compressed`. |
 | `--seconds S` | stop after this time |
 
 ### `xblick snapshot <stream> <file>`

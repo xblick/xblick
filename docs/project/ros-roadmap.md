@@ -133,7 +133,7 @@ therefore never match a Humble node.
 
 What follows:
 
-- Our compatibility is "tested with `rmw_zenoh_cpp` 0.2.13 on Jazzy", not "ROS 2".
+- Our compatibility is a stated requirement, "`rmw_zenoh_cpp` 0.2.13 on Jazzy", not "ROS 2".
 - A program could check the version of the ROS side before it publishes on ROS keys. rmw_zenoh's tokens carry no
   version, so such a check needs another source, such as an option or a test of the attachment of a received sample.
 - Only a test matrix tells which versions work: Jazzy, Kilted and Rolling, in container images or RoboStack
