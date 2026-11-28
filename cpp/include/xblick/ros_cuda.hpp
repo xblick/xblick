@@ -93,7 +93,8 @@ namespace xblick::ros_cuda
     std::vector<std::uint8_t> image_payload(const ImageHeader& header, const Descriptor& descriptor);
 
     // An entry of the backend's host registry (/dev/shm/ros2_hem_d0_h<hash of the host name>, written by every ROS
-    // process that loads the backend; read here, never written).
+    // process that loads the backend; the Link reads it, a Receiver enters its subscription and makes the registry
+    // when it is missing).
     struct RegistryEntry
     {
         std::uint64_t instance_id = 0;  // the process id in the upper 32 bits
@@ -132,6 +133,7 @@ namespace xblick::ros_cuda
         // A block of nbytes that no reader holds and whose last publish is reuse_frames publishes back or more,
         // its uid 0 until publish(); -1 when there is none and the pool has as many blocks as it may (counted in
         // dropped()). A frame of another size retires the blocks of the old one (freed once nobody holds them).
+        // RingError when reuse_frames >= max_blocks: no block would ever come back.
         int acquire(std::uint64_t nbytes, std::uint32_t reuse_frames);
         // The device pointer of a block (of this device, in this process's primary context).
         std::uint64_t block_ptr(int index) const;
@@ -164,7 +166,10 @@ namespace xblick::ros_cuda
     //   * it uses this GPU: with one GPU open in it, that GPU (by the device files /dev/nvidia<minor>); with several,
     //     the same CUDA_VISIBLE_DEVICES and CUDA_DEVICE_ORDER as this program and the same ordinal (the backend
     //     compares ordinals only);
-    //   * it keeps the last so many messages (KEEP_LAST), not all: the pool holds up to its depth + 1 + kSpareBlocks.
+    //   * it keeps the last so many messages (KEEP_LAST), not all, and no more than the pool holds: the pool has up to
+    //     its depth + 1 + kSpareBlocks blocks, at most max_blocks (a depth of 59 at most by default);
+    //   * its process has a GPU open (one that has not initialised CUDA yet is looked up again every kRecheckS).
+    // A registry that cannot be read (another layout) gives every reader the CPU form, said once.
     // While at least one reader gets descriptors, a message goes on the buffer keys only, as a Lyrical publisher sends
     // it: <key>/_buf_cpu for "backends:cpu:" readers, <key>/_buf/<gid> in CPU form for the other buffer-aware ones.
     // A reader without a backends part (ROS 2 Jazzy, an older xblick) reads the key only: while one is there, every
@@ -274,8 +279,13 @@ namespace xblick::ros_cuda
     //     publisher's own Linux user and CUDA ordinal and "can import" (the backend's rule), the CPU form when it finds
     //     another entry, and (release 0.1.2) descriptors as well when it finds none. A publisher decides once per
     //     subscription, when it discovers it (rmw_zenoh 0.10 never forgets a subscription's gid either), so the entry
-    //     must be right before the subscription's token is announced. A Receiver writes it then (enter()), the only
-    //     thing it writes there, from the publishers known at that moment: "can import" with a publisher's ordinal
+    //     must be right before the subscription's token is announced. A Receiver writes it then (enter()), from the
+    //     publishers known at that moment. Without a registry yet (no ROS process with the backend has run on this
+    //     host, in this /dev/shm), it first makes the registry and its semaphore as the backend makes them (name, size,
+    //     mode 0666 less the umask, version 1, a semaphore of value 1), so that a publisher that starts later attaches
+    //     to it and finds the entry. An entry that can be written only later (refresh(): another user's registry, a
+    //     full one) is said with "may send the CPU form" for the publishers seen before it. The entry says
+    //     "can import" with a publisher's ordinal
     //     when that publisher uses this GPU (the rules of Link for readers, applied to the publisher's process) and
     //     has this program's /dev/shm (CUDA keeps the events that come with the buffers there); "cannot import" when
     //     publishers are known and none does; without a known publisher as a stock subscription enters itself ("can
@@ -283,7 +293,10 @@ namespace xblick::ros_cuda
     //     come from a publisher this rule lets through and the Receiver's own rules do not (another GPU numbered
     //     alike, another /dev/shm) are not read: one line says that its frames do not reach the subscription. The
     //     entry goes inactive when the Receiver goes (the registry file stays: the backend's last process removes
-    //     it). Each publisher that sends the CPU form is said in one line with the reason;
+    //     it). Each publisher that sends the CPU form is said in one line with the reason. A publisher whose process
+    //     has no GPU open yet is looked up again every kRecheckS;
+    //   * a descriptor is read only from a publisher's process found on this GPU and with that process's CUDA ordinal
+    //     (as the backend's reader compares it): a buffer on its other GPU is refused;
     //   * a descriptor, when the frame is taken (as the backend's reader, which counts at take too): one more in the
     //     block's record (<shm_dir>/cuda_vmm_<pid>_<block id>; a block without a record is not read), its uid compared
     //     with the descriptor's (another one: the block was rewritten, the frame is stale), the block's file descriptor
@@ -320,9 +333,12 @@ namespace xblick::ros_cuda
     public:
         // device: the CUDA ordinal the frames are wanted on; shm_dir: the ROS nodes' /dev/shm as this program sees it
         // (registry, records); gid: the subscription's. std::invalid_argument when shm_dir is no directory. Nothing
-        // is written before a publisher is decided, nothing allocated before the first descriptor.
+        // is written before enter() or refresh(), nothing allocated before the first descriptor.
         Receiver(std::string topic, int device, std::string shm_dir, const std::array<std::uint8_t, 16>& gid);
-        ~Receiver();  // the entry inactive, the blocks unmapped
+        ~Receiver();  // close()
+        // The entry inactive, the blocks unmapped (again: nothing). Afterwards nothing is entered and take() gives
+        // null (counted as stale). Never throws.
+        void close();
         Receiver(const Receiver&) = delete;
         Receiver& operator=(const Receiver&) = delete;
 
@@ -334,8 +350,8 @@ namespace xblick::ros_cuda
                            const std::string& node);
         void remove_publisher(const std::string& token_key);
         // Before the subscription's token is announced, with the publishers known then (add_publisher): decides them
-        // and enters the subscription in the registry (once; without a registry yet, refresh() enters it as soon as
-        // there is one).
+        // and enters the subscription in the registry, made first when there is none (once; when the entry cannot be
+        // written, refresh() tries again every kRecheckS).
         void enter();
         // Looks the undecided publishers up in the registry (each every kRecheckS), enters the subscription if it is
         // not yet, and says what each decided publisher sends. Cheap when nothing is undecided.

@@ -648,14 +648,20 @@ NB_MODULE(_core, m)
             "add",
             [gid_of](rc::Link& l, const std::string& key, const nb::bytes& gid, std::optional<std::string> backends,
                      bool keep_all, int depth, const std::string& node) {
-                l.add(key, rc::Reader{gid_of(gid), std::move(backends), keep_all, depth, node});
+                rc::Reader reader{gid_of(gid), std::move(backends), keep_all, depth, node};
+                nb::gil_scoped_release release;  // the link's lock, which plan() holds while it looks readers up
+                l.add(key, reader);
             },
             "key"_a, "gid"_a, "backends"_a.none(), "keep_all"_a, "depth"_a, "node"_a,
             "a reader's token came (again: decided anew)")
         .def(
             "remove",
             [gid_bytes](rc::Link& l, const std::string& key) -> std::optional<nb::bytes> {
-                const auto gid = l.remove(key);
+                std::optional<std::array<std::uint8_t, 16>> gid;
+                {
+                    nb::gil_scoped_release release;
+                    gid = l.remove(key);
+                }
                 return gid ? std::optional<nb::bytes>(gid_bytes(*gid)) : std::nullopt;
             },
             "key"_a, "a reader's token went: its gid, or None")
@@ -686,8 +692,13 @@ NB_MODULE(_core, m)
         .def(
             "notes",
             [](rc::Link& l) {
+                std::vector<rc::Note> notes;
+                {
+                    nb::gil_scoped_release release;
+                    notes = l.notes();
+                }
                 nb::list out;
-                for (const rc::Note& n : l.notes())
+                for (const rc::Note& n : notes)
                 {
                     out.append(nb::make_tuple(n.warning, n.text));
                 }
@@ -696,7 +707,11 @@ NB_MODULE(_core, m)
             "the lines to say since the last call: [(warning, text)]")
         .def("stats",
              [](const rc::Link& l) {
-                 const rc::LinkStats s = l.stats();
+                 rc::LinkStats s;
+                 {
+                     nb::gil_scoped_release release;
+                     s = l.stats();
+                 }
                  nb::dict out;
                  out["sent"] = s.sent;
                  out["dropped"] = s.dropped;
@@ -755,17 +770,28 @@ NB_MODULE(_core, m)
                 new (self) rc::Receiver(std::move(topic), device, std::move(shm_dir), gid_of(gid));
             },
             "topic"_a, "device"_a, "shm_dir"_a, "gid"_a)
+        // every call that takes the receiver's lock releases the GIL: take() holds the lock while it fetches a block
+        // (up to 2 s) and waits for the copy, and the registry's semaphore is waited for up to 2 s
         .def(
-            "set_gid", [gid_of](rc::Receiver& r, const nb::bytes& gid) { r.set_gid(gid_of(gid)); }, "gid"_a,
-            "the subscription's token changed: the old entry inactive, the new one at refresh()")
+            "set_gid",
+            [gid_of](rc::Receiver& r, const nb::bytes& gid) {
+                const auto key = gid_of(gid);
+                nb::gil_scoped_release release;
+                r.set_gid(key);
+            },
+            "gid"_a, "the subscription's token changed: the old entry inactive, the new one entered at once")
         .def(
             "add_publisher",
             [gid_of](rc::Receiver& r, const std::string& key, const nb::bytes& gid, const std::string& node) {
-                r.add_publisher(key, gid_of(gid), node);
+                const auto publisher = gid_of(gid);
+                nb::gil_scoped_release release;
+                r.add_publisher(key, publisher, node);
             },
             "key"_a, "gid"_a, "node"_a, "a publisher's token came (again: decided anew)")
-        .def("remove_publisher", &rc::Receiver::remove_publisher, "key"_a,
+        .def("remove_publisher", &rc::Receiver::remove_publisher, nb::call_guard<nb::gil_scoped_release>(), "key"_a,
              "a publisher's token went: its blocks unmapped")
+        .def("close", &rc::Receiver::close, nb::call_guard<nb::gil_scoped_release>(),
+             "the entry inactive, the blocks unmapped (again: nothing); then take() gives None")
         .def("enter", &rc::Receiver::enter, nb::call_guard<nb::gil_scoped_release>(),
              "before the subscription's token: the publishers known now decided, the subscription entered in the "
              "registry")
@@ -782,8 +808,13 @@ NB_MODULE(_core, m)
         .def(
             "notes",
             [](rc::Receiver& r) {
+                std::vector<rc::Note> notes;
+                {
+                    nb::gil_scoped_release release;
+                    notes = r.notes();
+                }
                 nb::list out;
-                for (const rc::Note& n : r.notes())
+                for (const rc::Note& n : notes)
                 {
                     out.append(nb::make_tuple(n.warning, n.text));
                 }
@@ -792,7 +823,11 @@ NB_MODULE(_core, m)
             "the lines to say since the last call: [(warning, text)]")
         .def("stats",
              [](const rc::Receiver& r) {
-                 const rc::ReceiverStats s = r.stats();
+                 rc::ReceiverStats s;
+                 {
+                     nb::gil_scoped_release release;
+                     s = r.stats();
+                 }
                  nb::dict out;
                  out["copied"] = s.copied;
                  out["stale"] = s.stale;

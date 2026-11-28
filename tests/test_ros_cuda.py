@@ -73,6 +73,48 @@ def test_registry_lookup(tmp_path):
     (tmp_path / name).write_bytes(b"\0" * 100)
     with pytest.raises(_core.RingError, match="another backend version"):
         _core.ros_cuda_registry_lookup(str(tmp_path), gid)
+    (tmp_path / name).write_bytes(b"")  # between its creation and its ftruncate: being made, as version 0
+    assert _core.ros_cuda_registry_lookup(str(tmp_path), gid) is None
+
+
+def test_link_gives_readers_the_pool_cannot_serve_the_cpu_form(tmp_path):
+    """A reader whose queue is deeper than the pool can hold back (depth + 1 + SPARE_BLOCKS > max_blocks) gets the
+    CPU form with one line, as a KEEP_ALL reader; before, the pool published all its blocks once and then dropped
+    every frame for good. A pool refuses a reuse count it never reaches. A registry of another layout gives the CPU
+    form with one line, and publishing goes on (it raised in every publish before)."""
+    gid = bytes(range(16))
+    write_registry(tmp_path / _core.ros_cuda_registry_name(),
+                   [((os.getpid() << 32) | 1, gid, 1, 0, os.getuid(), True, True, b"image")])
+    deepest = ros_cuda.MAX_BLOCKS - 1 - ros_cuda.SPARE_BLOCKS
+    link = _core.RosCudaLink("/deep/image", 0, str(tmp_path), str(tmp_path))
+    link.add("deep", gid, "backends:cuda:", False, deepest + 1, "/deep")
+    assert link.plan() is None
+    notes = link.notes()
+    assert len(notes) == 1 and f"keeps the last {deepest + 1} messages" in notes[0][1], notes
+    assert f"a queue depth of {deepest} at most" in notes[0][1]
+    pool = _core.RosCudaPool(0, str(tmp_path), str(tmp_path), max_blocks=4)
+    with pytest.raises(_core.RingError, match="never reach"):
+        pool.acquire(1000, 4)
+    del pool
+
+    (tmp_path / _core.ros_cuda_registry_name()).write_bytes(b"\0" * 100)
+    odd = _core.RosCudaLink("/odd/image", 0, str(tmp_path), str(tmp_path))
+    odd.add("a", gid, "backends:cuda:", False, 1, "/a")
+    odd.add("b", bytes(range(1, 17)), "backends:cuda:", False, 1, "/b")
+    assert odd.plan() is None and odd.plan() is None
+    notes = odd.notes()
+    assert len(notes) == 1 and "the ROS readers get the CPU form" in notes[0][1], notes
+
+
+def test_socket_directory_too_long_is_said_when_the_link_is_made(tmp_path):
+    """The sockets' names must fit a Unix socket address (107 bytes): before, a long XBLICK_ROS_CUDA_SOCKETS failed
+    only at the first frame, inside the pool's block making."""
+    longer = tmp_path / ("d" * 80)
+    longer.mkdir()
+    with pytest.raises(ValueError, match=ros_cuda.SOCKETS_ENV):
+        _core.RosCudaLink("/t/image", 0, str(longer), str(tmp_path))
+    with pytest.raises(_core.RingError, match="at most"):
+        _core.RosCudaPool(0, str(longer), str(tmp_path))
 
 
 def test_pool_needs_its_directories(tmp_path):
@@ -202,6 +244,116 @@ def test_pool_hands_the_block_to_readers_of_this_user_by_both_sockets(tmp_path):
     assert pool.accepts == 2 and pool.refused == 0
     del pool
     assert not os.path.exists(path)
+
+
+def fetch_block(path):
+    """One block's file descriptor from its socket file, as release 0.1.2's reader takes it; closed at once."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(5)
+        s.connect(path)
+        data, fds, _, _ = socket.recv_fds(s, 1, 1)
+    for fd in fds:
+        os.close(fd)
+    return data == b"X" and len(fds) == 1
+
+
+@needs_cuda
+def test_pool_that_fails_to_start_or_to_make_a_block_stays_usable(tmp_path):
+    """A failure while the pool starts (its list cannot be written) is undone, and the next acquire starts it anew,
+    with the server thread that hands out the blocks (before, the pool counted as started and made blocks nobody
+    served). A failure while a block is made (its record exists: another process of this pid number) releases it
+    under the pool's lock, while the server thread runs, and the pool goes on."""
+    sockets, shm = tmp_path / "sockets", tmp_path / "shm"
+    sockets.mkdir()
+    shm.mkdir()
+    pool = _core.RosCudaPool(0, str(sockets), str(shm), min_reuse_s=0.0)
+    sockets.chmod(0o500)
+    try:
+        with pytest.raises(_core.RingError, match="cannot write"):
+            pool.acquire(1000, 0)
+    finally:
+        sockets.chmod(0o700)
+    assert os.listdir(sockets) == [] and pool.blocks == 0
+    first = pool.publish(pool.acquire(1000, 0), 1000)
+    assert fetch_block(first["socket_path"])
+    taken = [shm / f"cuda_vmm_{os.getpid()}_{first['block_id'] + i}" for i in range(1, 20)]
+    for path in taken:
+        path.write_bytes(bytes(24))
+    with pytest.raises(_core.RingError, match="another process of this pid number"):
+        pool.acquire(3 * 1024 * 1024, 0)  # another size: a new block, whose record is there already
+    for path in taken:
+        path.unlink()
+    again = pool.publish(pool.acquire(3 * 1024 * 1024, 0), 3 * 1024 * 1024)
+    assert fetch_block(again["socket_path"])
+    lists = [p for p in os.listdir(sockets) if p.endswith(".files")]
+    assert len(lists) == 1 and "cuda_vmm" in (sockets / lists[0]).read_text()
+    del pool
+    assert os.listdir(sockets) == [] and os.listdir(shm) == []
+
+
+@needs_cuda
+def test_two_pools_in_one_process_keep_lists_of_their_own(tmp_path):
+    """Each pool (one per image topic with a GPU reader) lists its own files: before, all pools of a process wrote
+    one list, so that after a crash only one pool's files were removed, and the first to close removed the list of
+    the others."""
+    color = _core.RosCudaPool(0, str(tmp_path), str(tmp_path))
+    depth = _core.RosCudaPool(0, str(tmp_path), str(tmp_path))
+    a = color.publish(color.acquire(1000, 0), 1000)
+    b = depth.publish(depth.acquire(1000, 0), 1000)
+    lists = sorted(p for p in os.listdir(tmp_path) if p.endswith(".files"))
+    assert len(lists) == 2 and all(p.startswith(f"xblick_cuda_{os.getpid()}_pool") for p in lists)
+    texts = [(tmp_path / p).read_text() for p in lists]
+    assert sorted((a["socket_path"] in t, b["socket_path"] in t) for t in texts) == [(False, True), (True, False)]
+    del color
+    left = [p for p in os.listdir(tmp_path) if p.endswith(".files")]
+    assert len(left) == 1 and b["socket_path"] in (tmp_path / left[0]).read_text()
+    del depth
+    assert os.listdir(tmp_path) == []
+
+
+# a reader's process in the registry that has not opened a GPU yet: it maps the registry, and opens the GPU's
+# device file when told so on stdin
+NO_GPU_YET = r"""
+import mmap, os, sys
+f = open(sys.argv[1], "rb")
+view = mmap.mmap(f.fileno(), 0, prot=mmap.PROT_READ)
+print("ready", flush=True)
+sys.stdin.readline()
+gpu = os.open(sys.argv[2], os.O_RDONLY)
+print("opened", flush=True)
+sys.stdin.readline()
+"""
+
+
+@needs_cuda
+def test_reader_without_a_gpu_open_yet_is_decided_later(tmp_path):
+    """A reader whose process has no GPU open yet (it has not initialised CUDA when it is first seen) is looked up
+    again, not given the CPU form for good with the reason "it sees several GPUs"."""
+    minor = _core.ros_cuda_minor_of(_core.cuda_device_uuid(0))
+    if minor is None:
+        pytest.skip("the GPU's device file is not known (/proc/driver/nvidia/gpus)")
+    registry = tmp_path / _core.ros_cuda_registry_name()
+    write_registry(registry, [])
+    child = subprocess.Popen([sys.executable, "-c", NO_GPU_YET, str(registry), f"/dev/nvidia{minor}"],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert child.stdout.readline().strip() == "ready"
+        gid = bytes(range(16))
+        add_entry(tmp_path, ((child.pid << 32) | 1, gid, 1, 0, os.getuid(), True, True, b"image"))
+        link = _core.RosCudaLink("/later/image", 0, str(tmp_path), str(tmp_path))
+        link.add("reader", gid, "backends:cuda:", False, 5, "/later")
+        assert link.plan() is None and link.notes() == []  # not decided, nothing said yet
+        child.stdin.write("\n")
+        child.stdin.flush()
+        assert child.stdout.readline().strip() == "opened"
+        time.sleep(ros_cuda.RECHECK_S + 0.1)
+        plan = link.plan()
+        assert plan is not None and plan.gpu == [(gid, 0)], link.notes()
+        assert any("gets the frames as CUDA buffers" in text for _, text in link.notes())
+        del link
+    finally:
+        child.stdin.close()
+        child.wait(timeout=30)
 
 
 def test_files_of_a_crashed_pool_are_removed_and_only_those(tmp_path):
@@ -438,6 +590,9 @@ def test_receiver_takes_a_publishers_block_under_its_hold(stand_in_publisher):
     assert receiver.stats() == {"copied": 2, "stale": 1, "refused": 0, "blocks": 1, "registered": True}
     assert receiver.take({**second, "pid": 1}) is None and receiver.stats()["refused"] == 1
     assert any("process 1," in text for _, text in receiver.notes())
+    # a buffer of the publisher's process on another of its GPUs (the backend's reader compares device_id too)
+    assert receiver.take({**second, "device_id": 1}) is None and receiver.stats()["refused"] == 2
+    assert any("on its CUDA device 1, not on its device 0" in text for _, text in receiver.notes())
     receiver.remove_publisher("pub-token")
     assert receiver.stats()["blocks"] == 0
     assert receiver.take(second) is None and receiver.stats()["stale"] == 2  # its publisher went
@@ -480,6 +635,84 @@ def test_receiver_leaves_a_publisher_on_another_gpu_or_of_another_user_the_cpu_f
         assert any("uses CUDA device 0, this program 1" in text for _, text in on_other.notes())
         assert on_other.take(publish(3)) is None and on_other.stats()["refused"] == 1
         del on_other
+
+
+def test_receiver_makes_the_registry_as_the_backend_when_there_is_none(tmp_path):
+    """A subscriber that starts before any ROS process with the backend (a freshly booted PC): it makes the registry
+    and its semaphore as the backend makes them (name, size, mode, version 1, a semaphore of value 1) and enters
+    itself before its token, so that a publisher that starts later attaches and finds the entry; before, the entry
+    came only after the token, and a publisher of the current source had already chosen the CPU form."""
+    receiver = _core.RosCudaReceiver("/first/image", 0, str(tmp_path), bytes(range(16)))
+    receiver.enter()
+    assert any("made the CUDA buffer backend's registry" in text for _, text in receiver.notes())
+    registry = tmp_path / _core.ros_cuda_registry_name()
+    semaphore = tmp_path / f"sem.{_core.ros_cuda_registry_name()}_mtx"
+    mask = os.umask(0)
+    os.umask(mask)
+    assert registry.stat().st_size == 272 + 512 * REGISTRY_ENTRY.size and semaphore.stat().st_size == 32
+    assert {p.stat().st_mode & 0o777 for p in (registry, semaphore)} == {0o666 & ~mask}
+    version, host, most, count = REGISTRY_HEAD.unpack_from(registry.read_bytes(), 0)
+    assert (version, host.rstrip(b"\0").decode(), most, count) == (1, socket.gethostname(), 512, 1)
+    assert semaphore.read_bytes()[:16] == struct.pack("<QI4x", 1, 0x80)  # glibc's sem_open: value 1, shared
+    entry = _core.ros_cuda_registry_lookup(str(tmp_path), bytes(range(16)))
+    assert entry["pid"] == os.getpid() and entry["ipc_capable"] and receiver.stats()["registered"]
+    receiver.close()
+    receiver.close()  # again: nothing
+    assert _core.ros_cuda_registry_lookup(str(tmp_path), bytes(range(16))) is None
+    assert sorted(os.listdir(tmp_path)) == sorted([registry.name, semaphore.name])  # they stay, as the backend's
+
+
+@needs_cuda
+def test_receiver_says_when_its_entry_came_after_its_token(stand_in_publisher):
+    """An entry that could not be written before the token (here a registry this user cannot write) and is written
+    later: a publisher seen before it may have chosen the CPU form, and the line says so (before, it said that the
+    frames come as CUDA buffers)."""
+    shm, _, publisher_gid, _, _ = stand_in_publisher
+    registry = shm / _core.ros_cuda_registry_name()
+    receiver = _core.RosCudaReceiver("/late/image", 0, str(shm), bytes(range(5, 21)))
+    receiver.add_publisher("pub", publisher_gid, "/stand_in")
+    registry.chmod(0o444)
+    try:
+        receiver.enter()
+    finally:
+        registry.chmod(0o644)
+    notes = receiver.notes()
+    assert not receiver.stats()["registered"] and any("cannot enter" in text for _, text in notes), notes
+    time.sleep(ros_cuda.RECHECK_S + 0.1)
+    receiver.refresh()
+    notes = receiver.notes()
+    assert receiver.stats()["registered"]
+    assert any("uses this GPU, but may send the CPU form" in text for _, text in notes), notes
+    assert not any("come as such" in text for _, text in notes)
+    receiver.close()
+
+
+def test_closed_link_and_receiver_do_nothing(tmp_path, ros_session, monkeypatch):
+    """After close (another thread, a publish at exit): the GPU link plans nothing (the key as before), sends
+    nothing and takes no token; the receiver passes samples on and takes no token; both close again without
+    effect. Before, they raised AttributeError on the None they had left."""
+    node = ros_session.ros.node
+    publisher = node.publisher("/closed/image_raw", "sensor_msgs/msg/Image")
+    link = ros_cuda.GpuLink(publisher, 0, socket_dir=str(tmp_path), shm_dir=str(tmp_path))
+    link.close()
+    link.close()
+
+    class Sample:
+        key_expr = "@ros2_lv/91/z/1/2/MS/%/%/n/%closed%image_raw/sensor_msgs::msg::dds_::Image_/RIHS01_x/::,10:,:,:,,"
+        kind = ros.zenoh.SampleKind.DELETE
+
+    assert link.plan() is None and link.stats() is None
+    assert link.send_gpu(None, None, 0, 0, None, 0, 0, "rgb8", 0, b"") == []
+    link._on_token(Sample())
+    publisher.close()
+    monkeypatch.setenv(ros_cuda.SHM_ENV, str(tmp_path))
+    subscriber = node.subscriber("/closed/image", "sensor_msgs/msg/Image", lambda message: None, cuda_device=0)
+    gpu = subscriber.gpu
+    subscriber.close()
+    subscriber.close()  # its GpuReceiver closes again: nothing
+    assert gpu.received(STOCK) == STOCK and gpu.stats() is None
+    gpu._on_token(Sample())
+    gpu.set_gid(bytes(16))
 
 
 @needs_cuda

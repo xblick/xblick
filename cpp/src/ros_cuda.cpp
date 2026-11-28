@@ -27,6 +27,7 @@
 #include <cstring>
 #include <fstream>
 #include <mutex>
+#include <new>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -145,12 +146,38 @@ namespace xblick::ros_cuda
         class ContextGuard
         {
         public:
-            explicit ContextGuard(CUcontext context) { CU(cuCtxPushCurrent(context)); }
+            explicit ContextGuard(CUcontext context)
+            {
+                CU(cuCtxPushCurrent(context));
+                pushed_ = true;
+            }
+            // for destructors and cleanup: pushed() false when the context cannot be made current (the driver
+            // deinitialised at exit, a lost device); the caller then skips its driver calls
+            ContextGuard(CUcontext context, std::nothrow_t) noexcept
+            {
+                try
+                {
+                    pushed_ = driver().cuCtxPushCurrent(context) == CUDA_SUCCESS;
+                }
+                catch (...)
+                {
+                    pushed_ = false;
+                }
+            }
             ~ContextGuard()
             {
-                CUcontext popped = nullptr;
-                driver().cuCtxPopCurrent(&popped);
+                if (pushed_)
+                {
+                    CUcontext popped = nullptr;
+                    driver().cuCtxPopCurrent(&popped);
+                }
             }
+            ContextGuard(const ContextGuard&) = delete;
+            ContextGuard& operator=(const ContextGuard&) = delete;
+            bool pushed() const { return pushed_; }
+
+        private:
+            bool pushed_ = false;
         };
 
         std::string errno_text() { return std::strerror(errno); }
@@ -205,11 +232,29 @@ namespace xblick::ros_cuda
         }
 
         // ------------------------------------------------------------------------------------- files
-        // A pool lists what it created in <socket_dir>/xblick_cuda_<pid>.files (its boot id, pid namespace and start
-        // time first), so that a later process can remove what a crashed one left, and nothing else.
+        // A pool lists what it created in <socket_dir>/xblick_cuda_<pid>_pool<n>.files (its boot id, pid namespace and
+        // start time first; one list per pool, as a process can have several), so that a later process can remove what
+        // a crashed one left, and nothing else.
 
         constexpr const char* kFilePrefix = "xblick_cuda_";
         constexpr const char* kListSuffix = ".files";
+        constexpr const char* kSocketSuffix = ".sock";
+        // A socket directory too long for <dir>/xblick_cuda_<pid>_<block id>.sock to fit sun_path (with the NUL byte of
+        // a file name, or the leading NUL byte of an abstract name), with this process's pid and block ids of up to 4
+        // digits; checked when a link or pool is made. A later block whose longer id does not fit fails in make().
+        std::optional<std::string> socket_dir_too_long(const std::string& dir)
+        {
+            constexpr std::size_t kIdDigits = 4;
+            const std::size_t fixed = 1 + std::strlen(kFilePrefix) + std::to_string(::getpid()).size() + 1 + kIdDigits +
+                                      std::strlen(kSocketSuffix);
+            const std::size_t most = sizeof(sockaddr_un::sun_path) - 1 - fixed;
+            if (dir.size() <= most)
+            {
+                return std::nullopt;
+            }
+            return dir + " has " + std::to_string(dir.size()) + " characters; the GPU link's socket names fit a Unix "
+                   "socket address (107 bytes) with a directory of " + std::to_string(most) + " at most";
+        }
 
         std::string pid_namespace()
         {
@@ -406,7 +451,18 @@ namespace xblick::ros_cuda
             return std::nullopt;  // no ROS process with the backend on this host (in this /dev/shm)
         }
         struct stat s{};
-        if (::fstat(fd, &s) != 0 or static_cast<std::size_t>(s.st_size) < sizeof(EndpointRegistry))
+        if (::fstat(fd, &s) != 0)
+        {
+            const std::string why = errno_text();
+            ::close(fd);
+            throw RingError("fstat " + path + ": " + why);
+        }
+        if (s.st_size == 0)
+        {
+            ::close(fd);
+            return std::nullopt;  // being made (between its creation and its ftruncate), as version 0
+        }
+        if (static_cast<std::size_t>(s.st_size) < sizeof(EndpointRegistry))
         {
             ::close(fd);
             throw RingError(path + ": " + std::to_string(s.st_size) + " bytes, not the " +
@@ -500,6 +556,7 @@ namespace xblick::ros_cuda
         CUdevice cu_device{};
         CUcontext context{};
         bool retained = false;
+        bool started = false;  // start() went through: the context, the list and the server thread are there
         std::size_t granularity = 0;
         CUmemAllocationProp prop{};
         std::string list_path;
@@ -544,9 +601,11 @@ namespace xblick::ros_cuda
             }
         }
 
+        // all or nothing: a failure undoes what was done, so that the next acquire() tries again (and fails the same
+        // way) instead of making blocks that no server thread hands out
         void start()
         {
-            if (retained)
+            if (started)
             {
                 return;
             }
@@ -564,22 +623,48 @@ namespace xblick::ros_cuda
             }
             CU(cuDevicePrimaryCtxRetain(&context, cu_device));
             retained = true;
-            prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-            prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-            prop.location.id = cu_device;
-            prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
-            CU(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
-            if (::pipe2(wake, O_CLOEXEC | O_NONBLOCK) != 0)
+            try
             {
-                throw RingError("pipe: " + errno_text());
+                prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+                prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+                prop.location.id = cu_device;
+                prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+                CU(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+                if (::pipe2(wake, O_CLOEXEC | O_NONBLOCK) != 0)
+                {
+                    throw RingError("pipe: " + errno_text());
+                }
+                static std::atomic<std::uint32_t> next_pool{0};
+                std::ostringstream head;
+                head << host_id() << "\n" << pid_namespace() << "\n" << ::getpid() << "\n"
+                     << process_start_time(::getpid()) << "\n";
+                list_head = head.str();
+                list_path = socket_dir + "/" + kFilePrefix + std::to_string(::getpid()) + "_pool" +
+                            std::to_string(next_pool.fetch_add(1)) + kListSuffix;
+                write_list();
+                server = std::thread([this] { serve(); });
             }
-            std::ostringstream head;
-            head << host_id() << "\n" << pid_namespace() << "\n" << ::getpid() << "\n"
-                 << process_start_time(::getpid()) << "\n";
-            list_head = head.str();
-            list_path = socket_dir + "/" + kFilePrefix + std::to_string(::getpid()) + kListSuffix;
-            write_list();
-            server = std::thread([this] { serve(); });
+            catch (...)
+            {
+                for (int& fd : wake)
+                {
+                    if (fd >= 0)
+                    {
+                        ::close(fd);
+                        fd = -1;
+                    }
+                }
+                if (not list_path.empty())
+                {
+                    ::unlink(list_path.c_str());
+                    ::unlink((list_path + ".tmp").c_str());
+                    list_path.clear();
+                }
+                driver().cuDevicePrimaryCtxRelease(cu_device);
+                retained = false;
+                throw;
+            }
+            started = true;
         }
 
         Block& make(std::size_t size)
@@ -588,7 +673,7 @@ namespace xblick::ros_cuda
             b->id = next_block_id();
             b->size = size;
             const std::string pid = std::to_string(::getpid());
-            b->socket_path = socket_dir + "/" + kFilePrefix + pid + "_" + std::to_string(b->id) + ".sock";
+            b->socket_path = socket_dir + "/" + kFilePrefix + pid + "_" + std::to_string(b->id) + kSocketSuffix;
             b->record_path = shm_dir + "/cuda_vmm_" + pid + "_" + std::to_string(b->id);
             Block& block = *b;
             try
@@ -628,7 +713,10 @@ namespace xblick::ros_cuda
             }
             catch (...)
             {
-                release(block);
+                {
+                    std::lock_guard lock(mutex);  // release() hands fds to the server thread's closing list
+                    release(block);
+                }
                 write_list();
                 throw;
             }
@@ -673,18 +761,23 @@ namespace xblick::ros_cuda
                 ::unlink(b.record_path.c_str());
             }
             close_later(b.fd);
-            if (b.base != 0)
+            if (b.base == 0 and b.allocation == 0)
             {
-                ContextGuard guard(context);
+                return;
+            }
+            // never throws (it runs in the destructor): without the context the driver calls are skipped
+            ContextGuard guard(context, std::nothrow);
+            if (b.base != 0 and guard.pushed())
+            {
                 driver().cuMemUnmap(b.base, b.size);
                 driver().cuMemAddressFree(b.base, b.size);
-                b.base = 0;
             }
-            if (b.allocation != 0)
+            b.base = 0;
+            if (b.allocation != 0 and guard.pushed())
             {
                 driver().cuMemRelease(b.allocation);  // readers that imported it keep the memory until they unmap
-                b.allocation = 0;
             }
+            b.allocation = 0;
         }
 
         // the block may be written: nobody holds it (uid set to 0 first, so that a reader that takes a count
@@ -828,6 +921,10 @@ namespace xblick::ros_cuda
                 throw RingError(*dir + ": no such directory (the export pool's sockets and records go there)");
             }
         }
+        if (const auto too_long = socket_dir_too_long(socket_dir))
+        {
+            throw RingError(*too_long);
+        }
         Impl& m = *impl_;
         m.device = device;
         m.socket_dir = std::move(socket_dir);
@@ -879,6 +976,12 @@ namespace xblick::ros_cuda
     int ExportPool::acquire(std::uint64_t nbytes, std::uint32_t reuse_frames)
     {
         Impl& m = *impl_;
+        if (reuse_frames >= m.max_blocks)  // a block would come back only after more publishes than blocks: never
+        {
+            throw RingError("export pool: a block is rewritten " + std::to_string(reuse_frames) + " frames after its "
+                            "publish at the earliest, which " + std::to_string(m.max_blocks) + " blocks never reach "
+                            "(a reader's queue that deep gets the CPU form)");
+        }
         m.start();
         const std::size_t size = round_up(nbytes == 0 ? 1 : nbytes, m.granularity);
         const std::uint64_t now = now_us();
@@ -1219,10 +1322,20 @@ namespace xblick::ros_cuda
             double seen = seconds_now();
             double checked = -1e9;
             bool said = false;
+            bool said_waiting = false;  // that its process has no GPU open yet
 
             bool wants_cuda() const { return backends and backends->contains(kCudaBackend); }
             bool cpu_only() const { return token.backends == std::string(kCpuBackends); }
         };
+
+        // Whether the process of a registry entry shares CUDA blocks with this program (below); none: not decided
+        // yet, as the process has no GPU open yet (it has not initialised CUDA), looked up again later.
+        struct Sharing
+        {
+            std::optional<bool> shares;
+            std::string why;  // why not, or why not yet
+        };
+        Sharing shares_gpu(const RegistryEntry& entry, int device, std::optional<int> own);
     }  // namespace
 
     struct Link::Impl
@@ -1232,14 +1345,27 @@ namespace xblick::ros_cuda
         std::string socket_dir, shm_dir;
         std::uint32_t max_blocks = kMaxBlocks;
         double hold_limit_s = kHoldLimitS, min_reuse_s = kMinReuseS;
-        mutable std::mutex mutex;  // readers, notes
+        mutable std::mutex mutex;  // readers, notes, pool (the pointer)
         std::map<std::string, KnownReader> readers;
         std::vector<Note> notes;
         mutable std::mutex minor_mutex;  // own_minor (importable runs inside plan's lock and alone)
         mutable std::optional<int> own_minor;
-        std::unique_ptr<ExportPool> pool;  // made for the first reader that gets descriptors (the publisher's thread)
+        // made for the first reader that gets descriptors (the publisher's thread), under `mutex`, as stats() reads
+        // it from any thread; used by the publisher's thread alone
+        std::unique_ptr<ExportPool> pool;
         std::atomic<std::uint64_t> sent{0};
         bool said_drop = false;
+        bool said_registry = false;  // that the registry cannot be read
+
+        std::optional<int> own() const
+        {
+            std::lock_guard lock(minor_mutex);
+            if (not own_minor)
+            {
+                own_minor = minor_of(cuda_device_uuid(device));
+            }
+            return own_minor;
+        }
 
         void say(KnownReader& reader, const std::string& text)
         {
@@ -1251,14 +1377,29 @@ namespace xblick::ros_cuda
             }
         }
 
-        void decide(KnownReader& reader, double now, const Link& link)
+        // A reader looked up in the registry (every kRecheckS until decided). A registry that cannot be read (another
+        // layout) leaves it undecided: the CPU form, said once, as the Receiver does for publishers.
+        void decide(KnownReader& reader, double now)
         {
             if (reader.importable or now - reader.checked < kRecheckS)
             {
                 return;
             }
             reader.checked = now;
-            const std::optional<RegistryEntry> entry = registry_lookup(shm_dir, reader.token.gid);
+            std::optional<RegistryEntry> entry;
+            try
+            {
+                entry = registry_lookup(shm_dir, reader.token.gid);
+            }
+            catch (const RingError& error)
+            {
+                if (not said_registry)
+                {
+                    said_registry = true;
+                    notes.push_back({true, topic + ": " + error.what() + ": the ROS readers get the CPU form"});
+                }
+                return;
+            }
             if (not entry)
             {
                 if (now - reader.seen > kUnknownS)
@@ -1268,24 +1409,50 @@ namespace xblick::ros_cuda
                 }
                 return;
             }
-            std::pair<bool, std::string> decision;
+            const std::uint64_t depth = static_cast<std::uint64_t>(std::max(reader.token.depth, 0));
+            Sharing decision;
             if (reader.token.keep_all)
             {
                 decision = {false, "it keeps all messages (KEEP_ALL), more than any pool of blocks holds"};
             }
+            else if (depth + 1 + kSpareBlocks > max_blocks)
+            {
+                // a block comes back only after `depth` publishes: the pool needs depth + 1 blocks, and spares for
+                // the messages that readers hold
+                decision = {false, "it keeps the last " + std::to_string(depth) + " messages, more than the " +
+                                       std::to_string(max_blocks) + " blocks of the pool hold with " +
+                                       std::to_string(kSpareBlocks) + " spare (a queue depth of " +
+                                       std::to_string(max_blocks > kSpareBlocks + 1 ? max_blocks - kSpareBlocks - 1
+                                                                                    : 0) +
+                                       " at most)"};
+            }
+            else if (entry->entity_type != kSubscription)
+            {
+                decision = {false, "its registry entry is no subscription"};
+            }
             else
             {
-                decision = link.importable(*entry);
+                decision = shares_gpu(*entry, device, own());
             }
-            reader.importable = decision.first;
-            if (decision.first)
+            if (not decision.shares)  // its process has no GPU open yet: looked up again
+            {
+                if (now - reader.seen > kUnknownS and not reader.said_waiting)
+                {
+                    reader.said_waiting = true;
+                    notes.push_back({true, topic + ": ROS reader " + reader.token.node + " accepts CUDA buffers, gets "
+                                                   "the CPU form until " + decision.why});
+                }
+                return;
+            }
+            reader.importable = *decision.shares;
+            if (*decision.shares)
             {
                 reader.device_id = entry->device_id;
                 notes.push_back({false, topic + ": ROS reader " + reader.token.node + " gets the frames as CUDA buffers"});
             }
             else
             {
-                say(reader, decision.second);
+                say(reader, decision.why);
             }
         }
     };
@@ -1303,6 +1470,10 @@ namespace xblick::ros_cuda
                 throw std::invalid_argument("GPU link to ROS readers: " + *path + " (" + what + ") is no directory (" +
                                             env + ")");
             }
+        }
+        if (const auto too_long = socket_dir_too_long(socket_dir))  // said now, not at the first frame
+        {
+            throw std::invalid_argument("GPU link to ROS readers: " + *too_long + " (" + kSocketsEnv + ")");
         }
         Impl& m = *impl_;
         m.topic = std::move(topic);
@@ -1364,7 +1535,7 @@ namespace xblick::ros_cuda
         {
             if (r.wants_cuda())
             {
-                m.decide(r, now, *this);
+                m.decide(r, now);
             }
         }
         for (const auto& [key, r] : m.readers)
@@ -1394,12 +1565,17 @@ namespace xblick::ros_cuda
         const Plan& plan, CudaRingWriter& ring, std::uint32_t slot, std::uint64_t nbytes, const ImageHeader& header)
     {
         Impl& m = *impl_;
-        if (not m.pool)
+        ExportPool* pool = nullptr;
         {
-            m.pool = std::make_unique<ExportPool>(m.device, m.socket_dir, m.shm_dir, m.max_blocks, m.hold_limit_s,
-                                                  m.min_reuse_s);
+            std::lock_guard lock(m.mutex);
+            if (not m.pool)
+            {
+                m.pool = std::make_unique<ExportPool>(m.device, m.socket_dir, m.shm_dir, m.max_blocks, m.hold_limit_s,
+                                                      m.min_reuse_s);
+            }
+            pool = m.pool.get();  // kept until the link goes
         }
-        const int index = m.pool->acquire(nbytes, plan.depth);
+        const int index = pool->acquire(nbytes, plan.depth);
         if (index < 0)
         {
             if (not m.said_drop)
@@ -1413,8 +1589,8 @@ namespace xblick::ros_cuda
             }
             return {};
         }
-        ring.copy_slot(slot, m.pool->block_ptr(index), nbytes);
-        Descriptor descriptor = m.pool->publish(index, nbytes);
+        ring.copy_slot(slot, pool->block_ptr(index), nbytes);
+        Descriptor descriptor = pool->publish(index, nbytes);
         std::map<int, std::vector<std::uint8_t>> payloads;  // per reader's ordinal
         std::vector<std::pair<std::array<std::uint8_t, 16>, std::vector<std::uint8_t>>> out;
         for (const auto& [gid, device_id] : plan.gpu)
@@ -1442,6 +1618,7 @@ namespace xblick::ros_cuda
         const Impl& m = *impl_;
         LinkStats s;
         s.sent = m.sent.load();
+        std::lock_guard lock(m.mutex);  // the pool is made under it (the publisher's thread)
         if (m.pool)
         {
             s.dropped = m.pool->dropped();
@@ -1462,7 +1639,7 @@ namespace xblick::ros_cuda
         // Whether the process of a registry entry (a reader or a publisher) shares CUDA blocks with this program on
         // its GPU `device` (own: the device file minor of that GPU): this Linux user, a backend with an IPC-capable
         // memory pool, a process seen from here (the same pid namespace), this GPU. And why not.
-        std::pair<bool, std::string> shares_gpu(const RegistryEntry& entry, int device, std::optional<int> own)
+        Sharing shares_gpu(const RegistryEntry& entry, int device, std::optional<int> own)
         {
             if (entry.uid != ::getuid())
             {
@@ -1493,6 +1670,10 @@ namespace xblick::ros_cuda
             if (not own)
             {
                 return {false, "this program cannot tell its own GPU's device file (/proc/driver/nvidia/gpus)"};
+            }
+            if (theirs.empty())  // CUDA not initialised there yet: no GPU to compare
+            {
+                return {std::nullopt, "its process " + std::to_string(pid) + " has a GPU open (none yet)"};
             }
             if (theirs.size() == 1)
             {
@@ -1533,16 +1714,8 @@ namespace xblick::ros_cuda
         {
             return {false, "its registry entry is no subscription"};
         }
-        std::optional<int> own;
-        {
-            std::lock_guard lock(m.minor_mutex);
-            if (not m.own_minor)
-            {
-                m.own_minor = minor_of(cuda_device_uuid(m.device));
-            }
-            own = m.own_minor;
-        }
-        return shares_gpu(entry, m.device, own);
+        const Sharing sharing = shares_gpu(entry, m.device, m.own());
+        return {sharing.shares.value_or(false), sharing.why};  // not decided yet: not now
     }
 
     // ------------------------------------------------------------------------------- the link from ROS publishers
@@ -1611,11 +1784,13 @@ namespace xblick::ros_cuda
         // The backend's registry below shm_dir, mapped writable and locked by its named semaphore as the backend
         // locks it (glibc keeps sem_open's semaphore in <shm_dir>/sem.<name>; mapped here, so that another
         // directory than /dev/shm works too). RingError when either cannot be opened (no ROS process with the
-        // backend; a registry of another Linux user, mode 0644) or the semaphore is not free within 2 s.
+        // backend; a registry of another Linux user, mode 0644) or the semaphore is not free within 2 s. With
+        // `initialise`, a registry of version 0 (just made) gets its head as the backend writes it (version 1, the
+        // host name, 512 entries at most, none yet).
         class LockedRegistry
         {
         public:
-            explicit LockedRegistry(const std::string& shm_dir)
+            explicit LockedRegistry(const std::string& shm_dir, bool initialise = false)
             {
                 const std::string path = shm_dir + "/" + registry_name();
                 registry_ = static_cast<EndpointRegistry*>(map(path, sizeof(EndpointRegistry)));
@@ -1627,6 +1802,16 @@ namespace xblick::ros_cuda
                 catch (...)
                 {
                     ::munmap(registry_, sizeof(EndpointRegistry));
+                    throw;
+                }
+                std::string host;
+                try
+                {
+                    host = initialise ? hostname() : std::string();
+                }
+                catch (...)
+                {
+                    unmap();
                     throw;
                 }
                 timespec until{};
@@ -1641,6 +1826,18 @@ namespace xblick::ros_cuda
                     const std::string why = errno_text();
                     unmap();
                     throw RingError(semaphore + " not free within " + std::to_string(kSemaphoreWaitS) + " s: " + why);
+                }
+                if (registry_->version == 0 and initialise)  // the backend's HostEndpointManager, for version 0
+                {
+                    registry_->version = 1;
+                    std::strncpy(registry_->hostname, host.c_str(), 255);
+                    registry_->hostname[255] = '\0';
+                    registry_->max_entries = kMaxEndpoints;
+                    registry_->num_entries = 0;
+                    for (EndpointEntry& e : registry_->entries)
+                    {
+                        e.active = false;
+                    }
                 }
                 if (registry_->version != 1)
                 {
@@ -1692,11 +1889,96 @@ namespace xblick::ros_cuda
             sem_t* semaphore_ = nullptr;
         };
 
+        // The backend's registry and its semaphore below shm_dir, made when either is missing as a ROS process with the
+        // backend makes them (HostEndpointManager of host_endpoint_manager.cpp, the same in release 0.1.2 and in the
+        // current source: shm_open(O_CREAT | O_RDWR, 0666), ftruncate to the registry's size, sem_open(O_CREAT, 0666,
+        // value 1); glibc's shm_open is an open() below /dev/shm with O_NOFOLLOW, its sem_open writes a sem_t as
+        // sem_init(shared, 1) leaves it to a temporary file there and links it to its name), so that a backend process
+        // that starts later attaches to them. The head (version 1) is written under the semaphore by write_entry, as
+        // the backend writes it for version 0. Made once, they stay when this program goes, as after a backend
+        // process that crashed. True when this call made one of them. RingError when one cannot be made.
+        bool make_registry(const std::string& shm_dir)
+        {
+            bool made = false;
+            const std::string path = shm_dir + "/" + registry_name();
+            const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0666);
+            if (fd >= 0)  // only a registry made here is sized here: another one keeps its size (and its check)
+            {
+                made = true;
+                const bool sized = ::ftruncate(fd, sizeof(EndpointRegistry)) == 0;
+                const std::string why = errno_text();
+                ::close(fd);
+                if (not sized)
+                {
+                    throw RingError("cannot size " + path + ": " + why);
+                }
+            }
+            else if (errno != EEXIST)
+            {
+                throw RingError("cannot create " + path + ": " + errno_text());
+            }
+            const std::string semaphore = shm_dir + "/sem." + registry_name() + "_mtx";
+            struct stat s{};
+            if (::lstat(semaphore.c_str(), &s) == 0)
+            {
+                return made;
+            }
+            if (errno != ENOENT)
+            {
+                throw RingError("cannot look at " + semaphore + ": " + errno_text());
+            }
+            sem_t initial;
+            std::memset(&initial, 0, sizeof(initial));
+            if (::sem_init(&initial, 1, 1) != 0)
+            {
+                throw RingError("sem_init: " + errno_text());
+            }
+            std::mt19937_64 random{std::random_device{}()};
+            std::string temporary;
+            int tfd = -1;
+            for (int attempt = 0; attempt < 16 and tfd < 0; ++attempt)
+            {
+                std::ostringstream name;
+                name << shm_dir << "/sem.xblick_" << ::getpid() << "_" << std::hex << random();
+                temporary = name.str();
+                tfd = ::open(temporary.c_str(), O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0666);
+                if (tfd < 0 and errno != EEXIST)
+                {
+                    throw RingError("cannot create " + temporary + ": " + errno_text());
+                }
+            }
+            if (tfd < 0)
+            {
+                throw RingError("cannot create a temporary semaphore file in " + shm_dir);
+            }
+            bool done = ::write(tfd, &initial, sizeof(initial)) == static_cast<ssize_t>(sizeof(initial));
+            std::string why = done ? std::string() : "write " + temporary + ": " + errno_text();
+            ::close(tfd);
+            if (done)
+            {
+                if (::link(temporary.c_str(), semaphore.c_str()) == 0)
+                {
+                    made = true;
+                }
+                else if (errno != EEXIST)  // EEXIST: another process made it meanwhile
+                {
+                    done = false;
+                    why = "link " + semaphore + ": " + errno_text();
+                }
+            }
+            ::unlink(temporary.c_str());
+            if (not done)
+            {
+                throw RingError("cannot create the semaphore " + semaphore + ": " + why);
+            }
+            return made;
+        }
+
         // The backend's register_endpoint for a subscription: its gid's slot, else an inactive one, else a new one.
         void write_entry(const std::string& shm_dir, const std::array<std::uint8_t, 16>& gid, std::uint64_t instance_id,
                          std::int32_t device_id, bool ipc_capable, const std::string& name)
         {
-            LockedRegistry locked(shm_dir);
+            LockedRegistry locked(shm_dir, true);
             EndpointRegistry& r = *locked;
             const std::uint32_t count = std::min<std::uint32_t>(r.num_entries, kMaxEndpoints);
             EndpointEntry* slot = nullptr;
@@ -1899,6 +2181,10 @@ namespace xblick::ros_cuda
         std::optional<std::int32_t> entry_device;  // the ordinal in the subscription's entry; none: no entry
         bool entry_ipc = false;                    // the entry says it can import (else: the CPU form, please)
         double entry_tried = -1e9;
+        bool announced = false;  // enter() ran: the caller announces the subscription's token after it
+        bool entry_late = false;  // the entry was written after the token went out (none could be written before)
+        double entry_at = 0;      // when it was written
+        bool closed = false;      // close(): nothing is entered, mapped or taken any more
         std::vector<Note> notes;
         std::set<std::string> said;
         std::map<std::pair<int, std::uint32_t>, Import> imports;  // (pid, block id)
@@ -1942,18 +2228,22 @@ namespace xblick::ros_cuda
             pool = make_device_pool(device);
         }
 
+        // never throws (it runs in the destructor): without the context the driver calls are skipped
         void unmap(Import& i)
         {
-            if (i.va != 0)
+            if (i.va != 0 or i.handle != 0)
             {
-                ContextGuard guard(context);
-                driver().cuMemUnmap(i.va, i.size);
-                driver().cuMemAddressFree(i.va, i.size);
+                ContextGuard guard(context, std::nothrow);
+                if (i.va != 0 and guard.pushed())
+                {
+                    driver().cuMemUnmap(i.va, i.size);
+                    driver().cuMemAddressFree(i.va, i.size);
+                }
+                if (i.handle != 0 and guard.pushed())
+                {
+                    driver().cuMemRelease(i.handle);
+                }
                 i.va = 0;
-            }
-            if (i.handle != 0)
-            {
-                driver().cuMemRelease(i.handle);
                 i.handle = 0;
             }
             if (i.record != nullptr)
@@ -2010,17 +2300,27 @@ namespace xblick::ros_cuda
                     }
                     continue;
                 }
-                std::pair<bool, std::string> decision{false, "its registry entry is no publisher"};
+                Sharing decision{false, "its registry entry is no publisher"};
                 if (entry->entity_type == kPublisherEntity)
                 {
                     decision = shares_gpu(*entry, device, own());
                 }
-                if (decision.first)
+                if (not decision.shares)  // its process has no GPU open yet: looked up again
                 {
-                    decision = shares_shm(entry->pid());
+                    if (now - p.seen > kUnknownS)
+                    {
+                        say_once("no gpu " + key, true, topic + ": ROS publisher " + p.node + ": its CUDA buffers are "
+                                                    "not read until " + decision.why);
+                    }
+                    continue;
                 }
-                p.shares = decision.first;
-                p.reason = decision.second;
+                if (*decision.shares)
+                {
+                    const auto [shm, why] = shares_shm(entry->pid());
+                    decision = {shm, why};
+                }
+                p.shares = *decision.shares;
+                p.reason = decision.why;
                 p.pid = entry->pid();
                 p.device_id = entry->device_id;
                 p.uid = entry->uid;
@@ -2030,9 +2330,15 @@ namespace xblick::ros_cuda
         // The subscription's entry, once: "can import" with the ordinal of the first publisher decided to be on this
         // GPU; "cannot import" when publishers are decided and none is; with none decided, as a stock subscription
         // enters itself ("can import", this program's ordinal), so that a publisher that starts later decides by the
-        // backend's own rule (Linux user, CUDA ordinal).
-        void try_enter(double now)
+        // backend's own rule (Linux user, CUDA ordinal). Without a registry yet (no ROS process with the backend ran
+        // here), the registry is made first as the backend makes it, so that the entry is there before the token.
+        // late: the token went out already (the entry could not be written in enter()).
+        void try_enter(double now, bool late)
         {
+            if (closed)
+            {
+                return;
+            }
             const KnownPublisher* sharing = nullptr;
             bool decided = false;
             for (const auto& [key, p] : publishers)
@@ -2047,9 +2353,18 @@ namespace xblick::ros_cuda
             const std::int32_t ordinal = sharing != nullptr ? sharing->device_id : device;
             try
             {
+                if (make_registry(shm_dir))
+                {
+                    notes.push_back({false, topic + ": made the CUDA buffer backend's registry in " + shm_dir +
+                                                " as the backend makes it (no ROS process with the backend has run "
+                                                "here yet), so that ROS publishers starting later find this "
+                                                "subscription"});
+                }
                 write_entry(shm_dir, gid, instance_id, ordinal, ipc, topic);
                 entry_device = ordinal;
                 entry_ipc = ipc;
+                entry_late = late;
+                entry_at = now;
             }
             catch (const RingError& error)
             {
@@ -2080,7 +2395,17 @@ namespace xblick::ros_cuda
                 }
                 p.told = true;
                 const bool by_rule = entry_ipc and *entry_device == p.device_id and p.uid == ::getuid();
-                if (*p.shares and by_rule)
+                // a publisher seen before a late entry may have discovered the subscription without it, and decided
+                const bool maybe_before = entry_late and p.seen <= entry_at;
+                if (*p.shares and by_rule and maybe_before)
+                {
+                    notes.push_back({true, topic + ": ROS publisher " + p.node + " uses this GPU, but may send the "
+                                                   "CPU form: this subscription's registry entry was written only "
+                                                   "after its token went out, and a publisher decides once, when it "
+                                                   "discovers a subscription (one of release 0.1.2 that found no "
+                                                   "entry sends CUDA buffers)"});
+                }
+                else if (*p.shares and by_rule)
                 {
                     notes.push_back({false, topic + ": ROS publisher " + p.node + " uses this GPU: the frames it has "
                                                     "as CUDA buffers come as such"});
@@ -2131,8 +2456,8 @@ namespace xblick::ros_cuda
         // The block of a descriptor mapped on this GPU (its fd fetched once); RingError when it cannot be.
         void import(Import& i, const Descriptor& d)
         {
+            ContextGuard guard(context);  // first: nothing between fetch_fd and the close of its fd throws
             const int fd = fetch_fd(d.socket_path);
-            ContextGuard guard(context);
             const CUresult imported = driver().cuMemImportFromShareableHandle(
                 &i.handle, reinterpret_cast<void*>(static_cast<std::intptr_t>(fd)),
                 CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR);
@@ -2181,10 +2506,17 @@ namespace xblick::ros_cuda
         m.gid = gid;
     }
 
-    Receiver::~Receiver()
+    Receiver::~Receiver() { close(); }
+
+    void Receiver::close()
     {
         Impl& m = *impl_;
         std::lock_guard lock(m.mutex);
+        if (m.closed)
+        {
+            return;
+        }
+        m.closed = true;
         m.deactivate();
         for (auto& [key, i] : m.imports)
         {
@@ -2194,12 +2526,16 @@ namespace xblick::ros_cuda
         if (m.started)
         {
             {
-                ContextGuard guard(m.context);
-                driver().cuStreamSynchronize(m.stream);
-                driver().cuStreamDestroy(m.stream);
+                ContextGuard guard(m.context, std::nothrow);  // never throws (the destructor's)
+                if (guard.pushed())
+                {
+                    driver().cuStreamSynchronize(m.stream);
+                    driver().cuStreamDestroy(m.stream);
+                }
             }
             m.pool.reset();  // its buffers keep it (and the context) as long as they live
             driver().cuDevicePrimaryCtxRelease(m.cu_device);
+            m.started = false;
         }
     }
 
@@ -2218,7 +2554,7 @@ namespace xblick::ros_cuda
         m.entry_tried = -1e9;
         if (entered)  // entered anew before the new token, with the publishers decided so far
         {
-            m.try_enter(seconds_now());
+            m.try_enter(seconds_now(), false);
         }
     }
 
@@ -2265,7 +2601,8 @@ namespace xblick::ros_cuda
         const double now = seconds_now();
         std::lock_guard lock(m.mutex);
         m.decide(now, true);
-        m.try_enter(now);
+        m.try_enter(now, false);
+        m.announced = true;
         m.tell();
     }
 
@@ -2275,9 +2612,9 @@ namespace xblick::ros_cuda
         const double now = seconds_now();
         std::lock_guard lock(m.mutex);
         m.decide(now, false);
-        if (not m.entry_device and now - m.entry_tried >= kRecheckS)  // no registry at the start: as soon as there is one
+        if (not m.entry_device and now - m.entry_tried >= kRecheckS)  // not entered at the start: as soon as it can be
         {
-            m.try_enter(now);
+            m.try_enter(now, m.announced);
         }
         m.tell();
     }
@@ -2295,15 +2632,25 @@ namespace xblick::ros_cuda
         {
             return refuse("no ipc", "a CUDA buffer descriptor without a block to fetch (no IPC): not read");
         }
+        if (m.closed)
+        {
+            ++m.stale;  // a sample handed over while the receiver closed
+            return nullptr;
+        }
         if (d.size > d.block_size)
         {
             return refuse("size", "a CUDA buffer descriptor of " + std::to_string(d.size) + " bytes in a block of " +
                                       std::to_string(d.block_size) + ": not read");
         }
-        const bool known = std::any_of(m.publishers.begin(), m.publishers.end(), [&d](const auto& item) {
-            return item.second.shares.value_or(false) and item.second.pid == d.pid;
-        });
-        if (not known)
+        const KnownPublisher* known = nullptr;
+        for (const auto& [key, p] : m.publishers)
+        {
+            if (p.shares.value_or(false) and p.pid == d.pid and (known == nullptr or p.device_id == d.device_id))
+            {
+                known = &p;
+            }
+        }
+        if (known == nullptr)
         {
             if (m.gone.contains(d.pid))
             {
@@ -2313,6 +2660,13 @@ namespace xblick::ros_cuda
             return refuse("pid " + std::to_string(d.pid),
                           "a CUDA buffer descriptor of process " + std::to_string(d.pid) + ", which is no publisher of "
                           "the topic found on this GPU: not read");
+        }
+        if (known->device_id != d.device_id)  // as the backend's reader compares it: a buffer on its other GPU
+        {
+            return refuse("device " + std::to_string(d.pid),
+                          "a CUDA buffer descriptor of process " + std::to_string(d.pid) + " on its CUDA device " +
+                              std::to_string(d.device_id) + ", not on its device " + std::to_string(known->device_id) +
+                              " that was found on this GPU: not read");
         }
         m.start();
         const std::pair<int, std::uint32_t> key{d.pid, d.block_id};
