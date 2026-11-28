@@ -12,15 +12,18 @@ GpuLink); this module is the Zenoh part: the readers' tokens, the buffer keys, t
 A reader gets the descriptor only when the backend could import it, else the CPU form as before:
 
 * it is in the backend's host registry (``/dev/shm/ros2_hem_d0_h<hash>``, written by every ROS process that loads the
-  backend; read here, never written) under its gid, as a subscription of this Linux user that can import (the
+  backend; the publisher only reads it) under its gid, as a subscription of this Linux user that can import (the
   backend's own rule); so on this host, with this ``/dev/shm``;
 * its process is one this program can see (``/proc/<pid>`` maps that registry: the same pid namespace);
-* it uses this GPU: with one GPU visible to it, that GPU (by the device files it has open); with several, the same
-  ``CUDA_VISIBLE_DEVICES`` and ``CUDA_DEVICE_ORDER`` as this program and the same ordinal (the backend compares
-  ordinals only);
-* it keeps the last so many messages (its QoS depth), not all: a block is rewritten only after as many frames as the
-  deepest reader queue holds (a message that a reader takes from a rewritten block is dropped by the backend, and
-  Isaac ROS 5.1's ResizeNode then aborts), so the pool has up to depth + 1 + SPARE_BLOCKS blocks, at most MAX_BLOCKS.
+* it uses this GPU: with one GPU visible to it, that GPU (by the device files it has open; a process without one open
+  yet is looked up again); with several, the same ``CUDA_VISIBLE_DEVICES`` and ``CUDA_DEVICE_ORDER`` as this program
+  and the same ordinal (the backend compares ordinals only);
+* it keeps the last so many messages (its QoS depth), not all, and no more than the pool holds: a block is rewritten
+  only after as many frames as the deepest reader queue holds (a message that a reader takes from a rewritten block is
+  dropped by the backend, and Isaac ROS 5.1's ResizeNode then aborts), so the pool has up to depth + 1 +
+  SPARE_BLOCKS blocks, at most MAX_BLOCKS (a depth of MAX_BLOCKS - 1 - SPARE_BLOCKS at most).
+
+A registry that cannot be read (another layout) gives every reader the CPU form, said once.
 
 While at least one reader gets descriptors, a message goes on the buffer keys only, as a Lyrical publisher sends it (a
 Lyrical reader reads the topic's key as well and would get it twice): ``<key>/_buf_cpu`` for ``backends:cpu:``
@@ -33,8 +36,10 @@ image topic and works on a GPU (``ros.RosSubscriber`` with ``cuda_device``; an I
 ``device``) takes the frames a ROS publisher has as CUDA buffers on that GPU without a copy through the CPU, as a
 device buffer of its own (the CUDA ring reader's copy). Its token says ``backends:cuda:``. A publisher decides once,
 when it discovers the subscription, by the backend's rule (the subscription's registry entry has its Linux user and
-CUDA ordinal and says "can import"), so the subscription enters the registry before its token (the only thing it
-writes there), from the publishers known then: "can import" with a publisher's ordinal when that publisher uses this
+CUDA ordinal and says "can import"), so the subscription enters the registry before its token, from the publishers
+known then. Without a registry yet (no ROS process with the backend has run on this host), it first makes the
+registry and its semaphore as the backend makes them, so that a publisher that starts later attaches to it and finds
+the entry. The entry says "can import" with a publisher's ordinal when that publisher uses this
 GPU, as this Linux user, in a process seen from here, with this program's ``/dev/shm`` (CUDA's events of the buffers
 are there); "cannot import" when publishers are known and none does; with none known as a stock subscription enters
 itself (this program's ordinal). Every other publisher sends it the CPU form (one line each says why). A descriptor is
@@ -117,10 +122,16 @@ class GpuLink:
         # the session, also when the publisher is left open (its pool's files then go too)
         close_at_exit(self, f"the GPU link of {publisher.topic}")
 
+    # Each call reads ``_link`` once: close() may set it to None meanwhile (the tokens' thread, a camera's publish
+    # thread at exit); a closed link then does nothing (plan None: the key as before).
+
     def _on_token(self, sample):
+        link = self._link
+        if link is None:
+            return
         key = str(sample.key_expr)
         if sample.kind != ros.zenoh.SampleKind.PUT:
-            gid = self._link.remove(key)
+            gid = link.remove(key)
             with self._lock:
                 out = self._outs.pop(self._buf_key(gid), None) if gid is not None else None
             if out is not None:
@@ -131,14 +142,14 @@ class GpuLink:
         except ros.RosError:
             return
         qos = token.qos or ros.Qos()
-        self._link.add(key, ros.gid(key), token.backends, qos.history == ros.KEEP_ALL, qos.depth,
-                       token.fully_qualified_node)
+        link.add(key, ros.gid(key), token.backends, qos.history == ros.KEEP_ALL, qos.depth,
+                 token.fully_qualified_node)
 
     def _buf_key(self, gid: bytes) -> str:
         return f"{self.publisher.key}/_buf/{gid.hex()}"
 
-    def _say(self):
-        for warning, text in self._link.notes():
+    def _say(self, link):
+        for warning, text in link.notes():
             (log.warning if warning else log.info)(text)
 
     def _importable(self, entry: dict) -> tuple[bool, str]:
@@ -148,9 +159,12 @@ class GpuLink:
     def plan(self):
         """Where the next message goes (``_core.RosCudaPlan``: ``gpu`` [(gid, device_id)], ``cpu_group``, ``cpu``
         [gid], ``depth``, ``needs_cpu``), or None: on the topic's key as before (no reader gets descriptors, or one
-        reads the key only)."""
-        plan = self._link.plan()
-        self._say()
+        reads the key only, or the link is closed)."""
+        link = self._link
+        if link is None:
+            return None
+        plan = link.plan()
+        self._say(link)
         return plan
 
     def _out(self, key: str):
@@ -178,10 +192,13 @@ class GpuLink:
                  step: int, attachment: bytes) -> list[str]:
         """The frame in slot ``slot`` of the CUDA ring ``ring`` (``_core.CudaRingWriter``, this link's device) into
         a free block, its descriptor to the GPU readers of ``plan``. Nothing when every block is held (the pool
-        counts it): the writer never waits."""
-        messages = self._link.gpu_messages(plan, ring, slot, nbytes, header.stamp.sec, header.stamp.nanosec,
-                                           header.frame_id, height, width, encoding, step)
-        self._say()
+        counts it) or the link is closed: the writer never waits."""
+        link = self._link
+        if link is None:
+            return []
+        messages = link.gpu_messages(plan, ring, slot, nbytes, header.stamp.sec, header.stamp.nanosec,
+                                     header.frame_id, height, width, encoding, step)
+        self._say(link)
         sent = []
         for gid, payload in messages:
             key = self._buf_key(gid)
@@ -189,8 +206,10 @@ class GpuLink:
             sent.append(key)
         return sent
 
-    def stats(self) -> dict:
-        return self._link.stats()
+    def stats(self) -> dict | None:
+        """sent, dropped, expired, blocks, accepts, refused; None once closed."""
+        link = self._link
+        return link.stats() if link is not None else None
 
     def close(self):
         """Ends the tokens' thread, the buffer keys and the pool (again: nothing)."""
@@ -238,46 +257,54 @@ class GpuReceiver:
             if known.type_name == subscriber.type_name:
                 self._receiver.add_publisher(known.key(), ros.gid(known.key()), known.fully_qualified_node)
         self._receiver.enter()
-        self._say()
+        self._say(self._receiver)
         token = subscriber.token
         pattern = "/".join([ros.ADMIN_SPACE, str(token.domain), "*", "*", "*", ros.PUBLISHER, "*", "*", "*",
                             ros.mangle(subscriber.topic), ros.dds_type(subscriber.type_name), token.type_hash, "**"])
         self._tokens = ros._Polled(subscriber._raw.liveliness().declare_subscriber(pattern, history=True),
                                    self._on_token, f"ros gpu from {subscriber.topic}")
 
+    # Each call reads ``_receiver`` once: close() may set it to None meanwhile (the tokens' thread, Zenoh's sample
+    # threads); a closed receiver then does nothing.
+
     def _on_token(self, sample):
-        key = str(sample.key_expr)
-        if self._receiver is None:
+        receiver = self._receiver
+        if receiver is None:
             return
+        key = str(sample.key_expr)
         if sample.kind != ros.zenoh.SampleKind.PUT:
-            self._receiver.remove_publisher(key)
+            receiver.remove_publisher(key)
             return
         try:
             token = ros.parse_token(key)
         except ros.RosError:
             return
-        self._receiver.add_publisher(key, ros.gid(key), token.fully_qualified_node)
-        self._refresh()
+        receiver.add_publisher(key, ros.gid(key), token.fully_qualified_node)
+        self._refresh(receiver)
 
-    def _refresh(self):
-        self._receiver.refresh()
-        self._say()
+    def _refresh(self, receiver):
+        receiver.refresh()
+        self._say(receiver)
 
-    def _say(self):
-        for warning, text in self._receiver.notes():
+    def _say(self, receiver):
+        for warning, text in receiver.notes():
             (log.warning if warning else log.info)(text)
 
     def set_gid(self, gid: bytes):
         """The subscription's token changes (its node renamed): entered anew with the new gid, before the new token."""
-        self._receiver.set_gid(gid)
-        self._say()
+        receiver = self._receiver
+        if receiver is None:
+            return
+        receiver.set_gid(gid)
+        self._say(receiver)
 
     def received(self, payload: bytes) -> bytes:
         """A sample's payload: as it is in the CPU form, a Received in the buffer form. The registry looked at again
         (cheap once every publisher is decided). RingError for a buffer of another backend."""
-        if self._receiver is None:  # closed: a sample that Zenoh handed over meanwhile
+        receiver = self._receiver
+        if receiver is None:  # closed: a sample that Zenoh handed over meanwhile
             return payload
-        self._refresh()
+        self._refresh(receiver)
         parsed = _core.ros_cuda_parse_image(payload)
         if parsed is None:
             return payload
@@ -292,13 +319,20 @@ class GpuReceiver:
         if receiver is None:
             return None
         buffer = receiver.take(received.parsed["descriptor"])
-        self._say()
+        self._say(receiver)
         return buffer
 
-    def stats(self) -> dict:
-        """copied, stale, refused (descriptors), blocks (mapped now), registered (the entry is in the registry)."""
-        return self._receiver.stats()
+    def stats(self) -> dict | None:
+        """copied, stale, refused (descriptors), blocks (mapped now), registered (the entry is in the registry); None
+        once closed."""
+        receiver = self._receiver
+        return receiver.stats() if receiver is not None else None
 
     def close(self):
-        self._tokens.undeclare()
-        self._receiver = None  # its registry entry inactive, its blocks unmapped
+        """Ends the tokens' thread, makes the registry entry inactive and unmaps the blocks (again: nothing)."""
+        tokens, self._tokens = self._tokens, None
+        receiver, self._receiver = self._receiver, None
+        if tokens is not None:
+            tokens.undeclare()
+        if receiver is not None:
+            receiver.close()  # without the GIL: it may wait for a take() or the registry's semaphore

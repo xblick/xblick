@@ -687,6 +687,34 @@ def test_receiver_says_when_its_entry_came_after_its_token(stand_in_publisher):
     receiver.close()
 
 
+def test_closed_link_and_receiver_do_nothing(tmp_path, ros_session, monkeypatch):
+    """After close (another thread, a publish at exit): the GPU link plans nothing (the key as before), sends
+    nothing and takes no token; the receiver passes samples on and takes no token; both close again without
+    effect. Before, they raised AttributeError on the None they had left."""
+    node = ros_session.ros.node
+    publisher = node.publisher("/closed/image_raw", "sensor_msgs/msg/Image")
+    link = ros_cuda.GpuLink(publisher, 0, socket_dir=str(tmp_path), shm_dir=str(tmp_path))
+    link.close()
+    link.close()
+
+    class Sample:
+        key_expr = "@ros2_lv/91/z/1/2/MS/%/%/n/%closed%image_raw/sensor_msgs::msg::dds_::Image_/RIHS01_x/::,10:,:,:,,"
+        kind = ros.zenoh.SampleKind.DELETE
+
+    assert link.plan() is None and link.stats() is None
+    assert link.send_gpu(None, None, 0, 0, None, 0, 0, "rgb8", 0, b"") == []
+    link._on_token(Sample())
+    publisher.close()
+    monkeypatch.setenv(ros_cuda.SHM_ENV, str(tmp_path))
+    subscriber = node.subscriber("/closed/image", "sensor_msgs/msg/Image", lambda message: None, cuda_device=0)
+    gpu = subscriber.gpu
+    subscriber.close()
+    subscriber.close()  # its GpuReceiver closes again: nothing
+    assert gpu.received(STOCK) == STOCK and gpu.stats() is None
+    gpu._on_token(Sample())
+    gpu.set_gid(bytes(16))
+
+
 @needs_cuda
 def test_image_subscriber_with_a_device_reads_a_ros_topics_cuda_buffers(stand_in_publisher, ros_session,
                                                                         monkeypatch):
