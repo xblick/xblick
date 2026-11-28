@@ -51,11 +51,13 @@ def ros_compressed_depth(depth: np.ndarray, header: Header) -> CompressedImage:
 class RosCamera:
     """A stand-in for a ROS camera driver: ROS publishers of the given (topic, type) pairs in a session that declares
     no program of ours, publishing a 4 x 6 mono8 image (or its PNG; on a ``.../compressedDepth`` topic a 16UC1 image
-    as ROS's compressedDepth plugin writes it) and a CameraInfo every 50 ms until ``close``."""
+    as ROS's compressedDepth plugin writes it) and a CameraInfo every 50 ms until ``close``. ``stamp_ns``: every
+    header with that stamp (a driver whose stamps do not advance), else the time of sending."""
 
-    def __init__(self, endpoint: str, domain: int = DOMAIN, **topics_):
+    def __init__(self, endpoint: str, domain: int = DOMAIN, stamp_ns: int | None = None, **topics_):
         self.session = session.open_session(connect=[endpoint], declare=False,
                                             ros_options=session.RosOptions(domain, "ros_camera"))
+        self.stamp_ns = stamp_ns
         self.topics = dict(topics_)
         self.publishers = {name: self.session.ros.node.publisher(topic, kind)
                            for name, (topic, kind) in topics_.items()}
@@ -67,7 +69,8 @@ class RosCamera:
 
     def _run(self):
         while not self._stop.wait(0.05):
-            header = Header(Time.from_ns(time.time_ns()), "ros_camera_optical")
+            stamp = time.time_ns() if self.stamp_ns is None else self.stamp_ns
+            header = Header(Time.from_ns(stamp), "ros_camera_optical")
             for name, publisher in self.publishers.items():
                 if publisher.type_name == Image.TYPE:
                     payload = numpy_to_image(self.image, "mono8", header).serialize()
@@ -454,6 +457,35 @@ def test_the_graph_holds_publishers_of_its_history_until_the_declarations_are_kn
     finally:
         publisher.close()
         ours.close()
+
+
+def test_max_hz_says_once_that_a_publishers_stamps_do_not_advance(network, caplog):
+    """A ROS publisher whose header stamp stays the same: max_hz chooses by stamps (MaxRate), so the frame taken first
+    is the only one; one warning line says why, and every later frame is counted as skipped."""
+    endpoint, reader = network
+    camera = RosCamera(endpoint, stamp_ns=0, image=("/fixed/image_raw", Image.TYPE))
+    subscriber = ImageSubscriber(reader, "/fixed/image_raw", transport="ros", max_hz=5.0)
+    try:
+        with caplog.at_level(logging.WARNING, logger="xblick"):
+            assert first_frame(subscriber) is not None
+            end = time.monotonic() + 1.0
+            while time.monotonic() < end:
+                assert subscriber.latest(timeout=0.1) is None
+        said = [r for r in caplog.records if "header stamps do not advance" in r.getMessage()]
+        assert len(said) == 1 and "/fixed/image_raw" in said[0].getMessage()
+        assert subscriber.skipped_max_hz >= 5
+    finally:
+        subscriber.close()
+        camera.close()
+
+
+def test_max_rate_counts_frames_whose_stamps_do_not_advance():
+    from xblick.camera import MaxRate
+
+    rate = MaxRate(10.0)
+    assert rate.admit(0) and not rate.admit(0) and not rate.admit(0) and rate.stuck == 2
+    assert not rate.admit(1) and rate.stuck == 0  # another stamp of the same period: no publisher stuck
+    assert rate.admit(10**8) and rate.stuck == 0
 
 
 def wait_for(get, expected, timeout=5.0):

@@ -102,6 +102,10 @@ the Unix epoch. It takes a frame when the stamp lies in a later period than the 
 streams of one camera share their stamps, so they select the same frames. A stamp that goes back, as after a
 restart of the camera, is taken.
 
+The limit needs stamps that advance. Some ROS publishers send a zero or fixed `header.stamp`. All their frames
+then lie in one period, and the subscriber hands out the first frame and no other. It says so in one warning line.
+Read such a topic without `max_hz`.
+
 ### Limit paired streams as a pair
 
 Do not give each stream of a pair its own limit. Colour and depth of one exposure can have stamps a few
