@@ -316,21 +316,80 @@ class RosbagError(ValueError):
 
 
 def rosbag_files(path: str | Path) -> list[Path]:
-    """The files to play for ``path``: a rosbag2 directory (it has metadata.yaml) is its MCAP files in name order,
-    another path itself. RosbagError for rosbag2's sqlite3 storage (a directory of .db3 files, or such a file)."""
+    """The files to play for ``path``: a rosbag2 directory (it has metadata.yaml) is its MCAP files in the order of
+    metadata.yaml's ``relative_file_paths`` (the order they were recorded in; by name ``bag_10`` would come before
+    ``bag_2``), another path itself. RosbagError for rosbag2's sqlite3 storage (a directory of .db3 files, or such a
+    file), for a bag rosbag2 compressed (its files or its messages), for a metadata.yaml without
+    ``relative_file_paths`` and for a file it names that is missing or not MCAP."""
     path = Path(path)
     if path.is_dir() and (path / ROSBAG_METADATA).is_file():
-        files = sorted(path.glob("*.mcap"))
-        if not files:
+        metadata = rosbag_metadata(path / ROSBAG_METADATA)
+        if metadata["compression_format"] or metadata["compression_mode"] not in ("", "none", "NONE"):
+            raise RosbagError(
+                f"{path}: a rosbag2 with rosbag2's compression (compression_mode {metadata['compression_mode'] or '?'}, "
+                f"compression_format {metadata['compression_format'] or '?'}); xblick play reads uncompressed MCAP "
+                "files only. Convert it with ros2 bag convert -i BAG -o OUT.yaml, OUT.yaml naming an output bag with "
+                "storage_id: mcap and no compression_mode")
+        names = metadata["relative_file_paths"]
+        if names is None:
             if any(path.glob("*.db3")):
                 raise RosbagError(sqlite_text(path))
+            raise RosbagError(f"{path}: its {ROSBAG_METADATA} has no relative_file_paths (the order of its files); "
+                              "ros2 bag reindex writes it")
+        if not names:
             raise RosbagError(f"{path}: a rosbag2 directory without MCAP files")
+        files = [path / name for name in names]
+        for f in files:
+            if f.suffix == ".db3":
+                raise RosbagError(sqlite_text(path))
+            if f.suffix != ".mcap":
+                raise RosbagError(f"{path}: {f.name} (in {ROSBAG_METADATA}) is no MCAP file")
+            if not f.is_file():
+                raise RosbagError(f"{path}: {f.name} (in {ROSBAG_METADATA}) is missing")
         return files
     if path.is_file():
+        if path.suffix == ".zstd":
+            raise RosbagError(f"{path}: a file of a rosbag2 with rosbag2's compression; xblick play reads uncompressed "
+                              "MCAP files only (zstd -d makes the MCAP file of it)")
         with open(path, "rb") as stream:
             if stream.read(len(SQLITE_MAGIC)) == SQLITE_MAGIC:
                 raise RosbagError(sqlite_text(path))
     return [path]
+
+
+def rosbag_metadata(path: Path) -> dict:
+    """What ``rosbag_files`` needs of a rosbag2's metadata.yaml, as rosbag2 writes it (block style, the keys below
+    ``rosbag2_bagfile_information``): ``relative_file_paths`` (a list, None without the key), ``compression_format``
+    and ``compression_mode`` ("" without them). The list may be a block (``- name`` lines) or a flow ``[a, b]``."""
+    found = {"relative_file_paths": None, "compression_format": "", "compression_mode": ""}
+    lines = path.read_text().splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].split(" #")[0].rstrip()
+        key, sep, rest = line.strip().partition(":")
+        indent = len(line) - len(line.lstrip(" "))
+        i += 1
+        if not sep or key not in found:
+            continue
+        rest = rest.strip()
+        if key != "relative_file_paths":
+            found[key] = rest.strip("'\"")
+            continue
+        if rest.startswith("["):
+            found[key] = [n.strip().strip("'\"") for n in rest.strip("[]").split(",") if n.strip()]
+            continue
+        names = []
+        while i < len(lines):
+            item = lines[i].split(" #")[0].rstrip()
+            if not item.strip():
+                i += 1
+                continue
+            if len(item) - len(item.lstrip(" ")) < indent or not item.strip().startswith("- "):
+                break
+            names.append(item.strip()[2:].strip().strip("'\""))
+            i += 1
+        found[key] = names
+    return found
 
 
 def sqlite_text(path: Path) -> str:
