@@ -76,7 +76,6 @@ streams, transforms and parameters, and it reads theirs.
 - Keys with a part `command` never go to ROS.
 - A Jazzy subscriber gets no images, compressed images or clouds from a Lyrical publisher, between ROS nodes as well.
 - C++: a ROS subscriber that starts late may get a `/tf_static` message twice (zenoh-c's standalone build has no advanced publisher).
-- C++: ROS topics of any name and `auto`'s ROS form are not there yet; `Transport::Ros` reads `/<stream>/image_raw`.
 - A ROS publisher with the CUDA buffer backend decides once per subscriber: one that starts after our GPU subscriber and is on another GPU with the same CUDA ordinal sends buffers that the subscriber drops (one line says so).
 
 Compatible with 0.5.18: our own keys are unchanged, and with `--no-ros` no sample or payload changes; a `tf_static`

@@ -138,12 +138,11 @@ small: 0.15 ms per query against 0.10 ms for the direct iteration, measured on 2
 **A new session needs time to learn about the others.** A query directly after `open_session()` may find nothing.
 Durchblick's own queries repeat periodically. Do not query once and conclude that nothing is there.
 
-**Closing can block.** After a query that Zenoh did not end, `close()` of a Zenoh session can block without limit. We
-saw this in our tests. Zenoh's documentation does not describe it. The Python sessions from `open_session` and
-`open_from_args` therefore close within 5 s and continue with a warning otherwise. This also holds at the end of a
-`with` block. Wrap a session from your own `zenoh.open` call in `session.Session(...)`. C++ sessions close in the
-destructor of `zenoh::Session` without such a limit. We have not seen the hang in C++, because the C++ programs never
-query the router's admin space. A C++ program that does should close its session in a separate thread with a deadline.
+**Closing can block.** After a query that Zenoh did not end, `close()` of a Zenoh session can block without limit. Zenoh's
+documentation does not describe it. The Python sessions from `open_session` and `open_from_args` therefore close
+within 5 s and continue with a warning otherwise. This also holds at the end of a `with` block. Wrap a session from your own `zenoh.open` call in `session.Session(...)`. C++ sessions close in the
+destructor of `zenoh::Session` without such a limit. Our C++ programs never query the router's admin space. A C++
+program that does should close its session in a separate thread with a deadline.
 
 **A program that does not close its session still ends.** Zenoh runs the callbacks of a subscriber or queryable in a
 thread that is not a daemon, and that thread ends only when the subscriber or queryable is undeclared. A Python program

@@ -54,8 +54,7 @@ Leave out the source to choose one of the cameras of this PC and its mode in a l
 xblick cam
 ```
 
-The list is a tree with four levels: camera, pixel format, size and rate. This example was drawn with stand-in
-cameras in a test:
+The list is a tree with four levels: camera, pixel format, size and rate. An example with two stand-in cameras:
 
 ```text
 Select camera / configuration:

@@ -169,8 +169,7 @@ recorder drops them, and the blocking key in the same recording is complete.
 **Loops.** With `--loop`, each pass moves every stamp forward by the length of the recording plus one period of
 its slowest channel. This covers headers, transforms and `stamp_ns` of JSON samples, and it leaves `tf_static`
 unchanged. Time therefore goes on as with a camera, and nodes that accept only newer frames continue to work.
-`play` refuses `--loop` for a channel whose type it does not know. In a test, NeMO started on a playback and
-tracked the objects at 10 frames per second, as on the live simulation.
+`play` refuses `--loop` for a channel whose type it does not know.
 
 ### Files of `ros2 bag record`
 

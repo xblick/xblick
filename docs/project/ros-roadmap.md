@@ -43,7 +43,7 @@ What follows from the key format:
 - ROS names allow letters, digits and `_`, and no part may start with a digit. Most of our publishers check the same
   rule for their keys, with or without `--ros` ([Topic names](#topic-names)). A key that breaks it and reaches a ROS
   mirror stops a program with `--ros` at start. All default keys of the ten Python nodes and of the Azure Kinect
-  and rc_visard programs pass this rule (checked with `ros.topic_of` on their branches `ros2`).
+  and rc_visard programs pass this rule: `ros.topic_of` takes each of them on their branches `ros2`.
 - A recording keeps each channel's Zenoh key, encoding and info record ([recording](../guides/recording.md)).
   Recordings made before a change of keys hold our keys. `xblick play --ros` already maps them to ROS keys, so
   playback of old recordings stays possible if `play` keeps that mapping.
@@ -107,7 +107,7 @@ To carry our fields inside ROS's attachment, these parts would change:
 4. If our own keys used the same layout, `parse_attachment` in both languages would need to skip the 33 bytes first.
 
 That rmw_zenoh ignores the extra bytes is a property of its code that it does not document. The same decoding code
-is in the releases for Humble, Kilted and Rolling (next section). Only 0.2.13 was tested live.
+is in the releases for Humble, Kilted and Rolling (next section); for them this follows from the code alone.
 
 ### Which versions use these 33 bytes
 
@@ -160,7 +160,7 @@ installed. A typed `rclcpp` subscription deserialises our `Detection2DArray` and
 (`tests/test_ros_live.py`).
 
 A hash follows from the type's definition. A ROS distribution that changes a definition changes the hash, and with
-it the key. A table per distribution would then be needed. Only Jazzy is tested.
+it the key. A table per distribution would then be needed.
 
 ## Forms without a ROS type
 
@@ -218,8 +218,8 @@ side would then wait for ROS, or break the link to ROS.
 ## Routers and ports
 
 `xblick router` and ROS's `rmw_zenohd` both listen on 7447. Either one serves both sides, so one router per PC is
-enough. Our tests ran our sessions against `rmw_zenohd`, and ROS's `talker` and `listener` through `xblick router`,
-both on other ports. Two PCs are untested.
+enough. It may listen on another port when both sides name that endpoint. A setup across two PCs is an open
+question (below).
 
 ## The cost of the double publication
 
@@ -337,8 +337,8 @@ Each step is an option, with what it changes.
 
 - A sample on a ROS key with a short or foreign attachment aborts rmw_zenoh 0.2.13 subscribers. Every writer on ROS
   keys must be correct, including `xblick play` and tools made by hand.
-- Other ROS distributions, other rmw_zenoh versions and other RMWs are untested.
-- `ros2` command line tools, `rviz2` and two PCs are untested.
+- Whether ROS distributions other than Jazzy and Lyrical, other rmw_zenoh versions and other RMWs work is open.
+- Whether the `ros2` command line tools, `rviz2` and a setup across two PCs work is open.
 - The default domain, and how a lab keeps several setups apart, is open.
 - A node with parameters shows as two ROS nodes, the program's and its parameters'.
 - `/clock` is `/<world>/clock`, and diagnostics go to `/<camera>/diagnostics`. ROS tools expect `/clock` and

@@ -516,9 +516,10 @@ for line in sys.stdin:
 
 
 def fake_backend(shm):
-    """The backend's registry (no entries) and its semaphore as glibc's sem_open leaves it (value 1, shared)."""
+    """The backend's registry (no entries) and its semaphore as glibc's sem_open leaves it (value 1, shared: the
+    private field 0x80, as sem_init(pshared=1, 1) writes it on x86_64)."""
     write_registry(shm / _core.ros_cuda_registry_name(), [])
-    (shm / f"sem.{_core.ros_cuda_registry_name()}_mtx").write_bytes(b"\x01" + bytes(31))
+    (shm / f"sem.{_core.ros_cuda_registry_name()}_mtx").write_bytes(b"\x01" + bytes(7) + b"\x80" + bytes(23))
 
 
 def add_entry(shm, entry):

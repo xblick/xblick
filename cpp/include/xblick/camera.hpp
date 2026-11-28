@@ -87,7 +87,8 @@ namespace xblick
     // tcp/<host>:<port>; a full locator (containing '/') is returned unchanged.
     std::string endpoint(const std::string& host, std::uint16_t port = 7447);
     // A session as the options say. A session that Zenoh cannot open throws std::runtime_error with one line that
-    // says why (in client mode: no connect endpoint answered, a client needs its router there).
+    // says why (in client mode: no connect endpoint answered, a client needs its router there). Move the session it
+    // returns only before the first object is made on it (ros.hpp: the session stays in place).
     zenoh::Session open_session(const SessionOptions& options);
 
     // A peer that connects only to other PCs and listens on loopback only (Python's session.across_pcs): its connect

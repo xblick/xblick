@@ -77,7 +77,8 @@ def test_compressed_stream_with_camera_info(sessions):
     info = CameraInfo.pinhole(64, 48, 50.0, 50.0, 31.5, 23.5, frame_id="cam")
     publisher = CameraPublisher(a, BASE, encoding="rgb8", frame_id="cam", camera_info=info, source="sim")
     subscriber = ImageSubscriber(b, BASE, transport="compressed", camera_info=True)
-    wait_until(lambda: publisher.subscribed)
+    # its camera_info subscription known too, not only the image's: else the first frame may go out without it
+    wait_until(lambda: publisher.subscribed and publisher._info.matching_status.matching)
     stamp = time.time_ns()
     image = pattern(3)
     sent = publisher.publish(image, stamp_ns=stamp)
