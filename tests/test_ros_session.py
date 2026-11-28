@@ -437,6 +437,32 @@ def test_closed_parameters_of_their_own_leave_the_sessions_nodes():
         a.close()
 
 
+def test_parameters_that_fail_on_ros_give_the_node_back(monkeypatch):
+    """A Parameters whose ROS side fails after it took the program's node: the error is raised, the node's services
+    without parameters are back, and the next Parameters serve on the program's node."""
+    a = session.open_session(local_router=False, ros_options=session.RosOptions(DOMAIN, "xblick_undo"))
+    try:
+        made = ros.RosNode.publisher
+
+        def failing(node, topic, *args, **kwargs):
+            if topic == "/parameter_events":
+                raise ros.RosError("no events publisher")
+            return made(node, topic, *args, **kwargs)
+
+        monkeypatch.setattr(ros.RosNode, "publisher", failing)
+        services = len([e for e in a.ros.node._entities if isinstance(e, ros.RosService)])
+        with pytest.raises(ros.RosError, match="no events publisher"):
+            Parameters(a, "boxer", "rostest/undo")
+        monkeypatch.undo()
+        assert not a.ros._parameters_taken and a.ros._no_parameters is not None
+        assert len([e for e in a.ros.node._entities if isinstance(e, ros.RosService)]) == services
+        params = Parameters(a, "boxer", "rostest/undo")
+        assert not params._ros_own_node and params._ros_node is a.ros.node
+        params.close()
+    finally:
+        a.close()
+
+
 def test_one_node_per_program_named_after_its_parameters(capsys):
     """A default node name gives way to the name of the program's first parameters: one node, which carries the
     publishers made before (their tokens declared anew), the six services and the publishers made after. Further

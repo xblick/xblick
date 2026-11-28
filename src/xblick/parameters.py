@@ -215,12 +215,19 @@ class Parameters:
             taking_part = getattr(session, "ros", None)
             if taking_part is not None:  # the program's ROS node (ros.Ros.parameters_node): the services, the events
                 self._ros_node, self._ros_own_node = taking_part.parameters_node(self.name)
-                self._ros_name = self._ros_node.fully_qualified
-                self._ros_services = [
-                    (service, self._ros_node.service(f"{self._ros_name}/{service}", ROS_SERVICES[service]))
-                    for service in SERVICES]
-                self._ros_events = self._ros_node.publisher("/parameter_events", ParameterEvent.TYPE,
-                                                            ros.PARAMETERS_QOS)
+                try:
+                    self._ros_name = self._ros_node.fully_qualified
+                    for service in SERVICES:
+                        self._ros_services.append(
+                            (service, self._ros_node.service(f"{self._ros_name}/{service}", ROS_SERVICES[service])))
+                    self._ros_events = self._ros_node.publisher("/parameter_events", ParameterEvent.TYPE,
+                                                                ros.PARAMETERS_QOS)
+                except BaseException:
+                    self._undo_ros()
+                    for _, q in self._queryables:
+                        q.undeclare()
+                    self._events.undeclare()
+                    raise
             self._server = threading.Thread(target=self._serve, name=f"parameters {self.key}", daemon=True)
             self._server.start()
             self._token = session.liveliness().declare_token(f"{self.key}/{P.PARAMETERS_TOKEN}")
@@ -679,18 +686,28 @@ class Parameters:
             q.undeclare()
         if self._events is not None:
             self._events.undeclare()
-        if self._ros_node is not None:
-            if self._ros_own_node:
-                self._ros_node.close()  # its services, its events publisher and its token
-            else:  # the program's node: only what these parameters put on it
+        self._undo_ros()
+        self._token = None
+
+    def _undo_ros(self):
+        """What these parameters put on their ROS node closed (close; a constructor that failed after
+        ros.Ros.parameters_node): a node of their own closed, else their services and events publisher, and the
+        program's node released (ros.Ros.release_parameters: its services without parameters back, the next
+        Parameters on it)."""
+        if self._ros_node is None:
+            return
+        if self._ros_own_node:
+            self._ros_node.close()  # its services, its events publisher and its token
+        else:  # the program's node: only what these parameters put on it
+            try:
                 for _, server in self._ros_services:
                     server.close()
                 if self._ros_events is not None:
                     self._ros_events.close()
+            finally:
                 if not self._ros_none:
                     self._ros_node.ros.release_parameters()
-            self._ros_node = None
-        self._token = None
+        self._ros_node = None
 
 
 def _option_help(parser, action) -> str:
