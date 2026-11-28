@@ -417,7 +417,7 @@ def test_playback_controls_as_parameters(sessions, tmp_path):  # noqa: F811
             c.close()
 
 
-def write_rosbag(path, frames=5, compressed_too=False, static_twice=False):
+def write_rosbag(path, frames=5, compressed_too=False, static_twice=False, log_offset_ns=0):
     """An MCAP file as ros2 bag record writes it (profile ros2, ros2msg schemas, channels on ROS topics without our
     metadata): a colour camera's image_raw and camera_info, a depth camera's compressed frames only, /tf_static, a
     point cloud, and an image topic outside image_transport's names. Frames 100 ms apart, stamped 1 s, 2 s, ..."""
@@ -460,7 +460,7 @@ def write_rosbag(path, frames=5, compressed_too=False, static_twice=False):
             if k == 0 or (static_twice and k == frames - 1):  # ros2 bag record can hold a /tf_static twice
                 payloads["/tf_static"] = TFMessage([transform("rb_base", "rb_cam", 0.1)])
             for topic, message in payloads.items():
-                log_ns = 100_000_000 * k + 1
+                log_ns = 100_000_000 * k + 1 + log_offset_ns
                 writer.add_message(channels[topic], log_time=log_ns, data=bytes(message.serialize()),
                                    publish_time=log_ns)
         writer.finish()
@@ -521,10 +521,77 @@ def test_a_rosbag2_with_raw_and_compressed_plays_the_raw_frames(sessions, tmp_pa
         player.close()
 
 
+def test_a_rosbag2_with_raw_and_compressed_publishes_each_frame_once(sessions, tmp_path):  # noqa: F811
+    """The bag's own image_raw/compressed is not played beside the frames the camera compresses from image_raw."""
+    a, b = sessions
+    path = tmp_path / "both.mcap"
+    write_rosbag(path, frames=3, compressed_too=True)
+    player = recording.Player(a, [path])
+    stamps = []
+    sub = b.declare_subscriber("rb/cam/color/image_raw/compressed", lambda s: stamps.append(
+        CompressedImage.deserialize(s.payload.to_bytes()).header.stamp.to_ns()))
+    time.sleep(0.5)
+    thread = threading.Thread(target=player.run)
+    thread.start()
+    try:
+        thread.join(timeout=10.0)
+        time.sleep(0.3)
+        assert player.error is None
+        assert stamps == [1_000_000_000, 2_000_000_000, 3_000_000_000]
+    finally:
+        sub.undeclare()
+        player.end()
+        thread.join()
+        player.close()
+
+
+def test_the_camera_info_of_an_image_topic_that_is_no_stream_reaches_ros(sessions, tmp_path):  # noqa: F811
+    """A bag's /resize/image and /resize/camera_info (no image_transport names, so no stream of ours): both play on
+    their keys and on their ROS topics."""
+    from xblick.encodings import numpy_to_image
+
+    a, b = sessions
+    path = tmp_path / "resize.mcap"
+    mcap = recording.import_mcap()
+    with open(path, "wb") as stream:
+        writer = mcap.writer.Writer(stream)
+        writer.start(profile="ros2", library="rosbag2")
+        channels = {}
+        for topic, name in (("/resize/image", "sensor_msgs/msg/Image"),
+                            ("/resize/camera_info", "sensor_msgs/msg/CameraInfo")):
+            schema = writer.register_schema(name, "ros2msg", MSGDEFS[name].encode())
+            channels[topic] = writer.register_channel(topic, "cdr", schema, {"offered_qos_profiles": ""})
+        for k in range(20):
+            header = Header(Time.from_ns(1_000_000_000 * (k + 1)), "resized")
+            for topic, message in (("/resize/image", numpy_to_image(np.zeros((4, 6), np.uint8), "mono8", header)),
+                                   ("/resize/camera_info", CameraInfo.pinhole(6, 4, 5.0, 5.0, 2.5, 1.5,
+                                                                              frame_id="resized"))):
+                writer.add_message(channels[topic], log_time=50_000_000 * k + 1, data=bytes(message.serialize()),
+                                   publish_time=50_000_000 * k + 1)
+        writer.finish()
+    infos = []
+    subscriber = b.ros.node.subscriber("/resize/camera_info", CameraInfo.TYPE, lambda payload, *_: infos.append(
+        CameraInfo.deserialize(payload)), daemon=True)
+    player = recording.Player(a, [path])
+    try:
+        assert {"resize/image", "resize/camera_info"} <= set(player._ros)
+        wait_until(lambda: player._ros["resize/camera_info"].matched, timeout=5.0)
+        thread = threading.Thread(target=player.run)
+        thread.start()
+        thread.join(timeout=10.0)
+        assert player.error is None
+        wait_until(lambda: infos, timeout=2.0)
+        assert infos and infos[0].header.frame_id == "resized"
+    finally:
+        subscriber.close()
+        player.end()
+        player.close()
+
+
 def test_rosbag2_directories_and_the_sqlite3_storage(tmp_path):
     bag = tmp_path / "bag"
     bag.mkdir()
-    (bag / "metadata.yaml").write_text("rosbag2_bagfile_information:\n  storage_identifier: mcap\n")
+    (bag / "metadata.yaml").write_text(rosbag_metadata(["bag_0.mcap", "bag_1.mcap"]))
     for name in ("bag_1.mcap", "bag_0.mcap"):
         write_rosbag(bag / name, frames=1)
     assert recording.rosbag_files(bag) == [bag / "bag_0.mcap", bag / "bag_1.mcap"]
@@ -537,9 +604,57 @@ def test_rosbag2_directories_and_the_sqlite3_storage(tmp_path):
             recording.rosbag_files(given)
     empty = tmp_path / "empty"
     empty.mkdir()
-    (empty / "metadata.yaml").write_text("")
+    (empty / "metadata.yaml").write_text(rosbag_metadata([]))
     with pytest.raises(recording.RosbagError, match="without MCAP files"):
         recording.rosbag_files(empty)
+    (empty / "metadata.yaml").write_text("")
+    with pytest.raises(recording.RosbagError, match="has no relative_file_paths"):
+        recording.rosbag_files(empty)
+    (empty / "metadata.yaml").write_text(rosbag_metadata(["empty_0.mcap"]))
+    with pytest.raises(recording.RosbagError, match="empty_0.mcap .in metadata.yaml. is missing"):
+        recording.rosbag_files(empty)
+
+
+def rosbag_metadata(names, compression=("", "")) -> str:
+    """The part of a metadata.yaml that xblick play reads, as rosbag2 (Jazzy) writes it."""
+    files = "".join(f"    - {n}\n" for n in names) if names else ""
+    return ("rosbag2_bagfile_information:\n  version: 9\n  storage_identifier: mcap\n"
+            f"  compression_format: \"{compression[0]}\"\n  compression_mode: \"{compression[1]}\"\n"
+            f"  relative_file_paths:{'' if names else ' []'}\n{files}  files:\n"
+            + "".join(f"    - path: {n}\n      message_count: 1\n" for n in names) + "  custom_data: ~\n")
+
+
+def test_a_split_rosbag2_plays_its_files_in_the_order_of_its_metadata(sessions, tmp_path):  # noqa: F811
+    """A bag of 11 files: bag_10.mcap comes after bag_9.mcap (metadata.yaml's order), not after bag_1.mcap (by
+    name), so log time never goes back."""
+    a, _ = sessions
+    bag = tmp_path / "bag"
+    bag.mkdir()
+    names = [f"bag_{k}.mcap" for k in range(11)]
+    for k, name in enumerate(names):
+        write_rosbag(bag / name, frames=1, log_offset_ns=100_000_000 * k)
+    (bag / "metadata.yaml").write_text(rosbag_metadata(names))
+    files = recording.rosbag_files(bag)
+    assert files == [bag / n for n in names]
+    player = recording.Player(a, files)
+    try:
+        times = [t for t, _, _ in player._messages()]
+        assert times == sorted(times) and len(times) > 11
+    finally:
+        player.close()
+
+
+def test_a_rosbag2_with_rosbag2s_compression_is_refused(tmp_path):
+    for mode, name in (("FILE", "bag_0.mcap.zstd"), ("MESSAGE", "bag_0.mcap")):
+        bag = tmp_path / mode
+        bag.mkdir()
+        (bag / name).write_bytes(b"\0")
+        (bag / "metadata.yaml").write_text(rosbag_metadata([name], ("zstd", mode)))
+        with pytest.raises(recording.RosbagError, match=f"rosbag2's compression .compression_mode {mode}, "
+                                                        "compression_format zstd.; xblick play reads uncompressed"):
+            recording.rosbag_files(bag)
+    with pytest.raises(recording.RosbagError, match="a file of a rosbag2 with rosbag2's compression"):
+        recording.rosbag_files(tmp_path / "FILE" / "bag_0.mcap.zstd")
 
 
 def test_the_ros_copy_of_tf_static_holds_every_camera_and_is_not_played(sessions, tmp_path):  # noqa: F811
@@ -580,3 +695,24 @@ def test_a_rosbag2_loops_without_a_gap_for_its_tf_static(sessions, tmp_path):  #
         assert player._pass_ns == 400_000_000 + 100_000_000
     finally:
         player.close()
+
+
+def test_a_ros_camera_is_recorded_in_the_form_that_keeps_its_encoding():
+    """ros_record_form: compressedDepth for 16-bit and float depth, compressed for 8-bit images, else the image itself;
+    a form that is the only one offered as it is; none where no offered form keeps the encoding."""
+    t, c, d = "/cam/image_raw", "/cam/image_raw/compressed", "/cam/image_raw/compressedDepth"
+    every = [t, c, d]
+    assert recording.ros_record_form(t, "16UC1", every)[0] == d
+    assert recording.ros_record_form(t, "32FC1", every)[0] == d
+    assert recording.ros_record_form(t, "mono16", every)[0] == d
+    assert recording.ros_record_form(t, "rgb8", every) == (c, "rgb8: its compressed form")
+    assert recording.ros_record_form(t, "bayer_rggb8", every)[0] == c
+    assert recording.ros_record_form(t, "rgb16", every)[0] == t
+    assert recording.ros_record_form(t, "yuv422", every)[0] == t  # not an encoding of ours: as it is
+    assert recording.ros_record_form(t, "16UC1", [t, c])[0] == t  # never the 8-bit JPEG of depth
+    assert recording.ros_record_form(t, None, [c]) == (c, "the only form offered")
+    assert recording.ros_record_form(t, None, [d])[0] == d
+    form, why = recording.ros_record_form(t, None, [c, d])
+    assert form is None and "encoding is not known" in why
+    form, why = recording.ros_record_form(t, "32FC1", [c, d][:1] + ["/cam/image_raw/other"])
+    assert form is None and "none of the offered forms" in why

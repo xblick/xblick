@@ -449,7 +449,8 @@ def _rerun(args, parser) -> int:
         try:
             bridge = rerun_bridge.RerunBridge(z, rr, cloud_rate=args.cloud_rate, stale_after=args.stale_after,
                                               ages=not args.no_ages, no_transforms=args.no_transforms or [],
-                                              camera_extras=discover, layout_after=args.layout_after, **found)
+                                              camera_extras=discover, layout_after=args.layout_after,
+                                              drop_unshown=discover, **found)
         except ValueError as error:
             raise SystemExit(f"xblick rerun: {error}") from None
         params = Parameters(z, args.name, "xblick")
@@ -486,6 +487,8 @@ def _rerun(args, parser) -> int:
                 else:
                     time.sleep(args.report)
                 bridge.check()
+                for _, why in bridge.unshown():  # a ROS camera found by discovery, of an encoding not shown
+                    print(f"xblick rerun: {why}: left out", flush=True)
                 params.refresh()  # the selection and where results are drawn, changed by themselves
                 if bridge.layout_sent and not said_layout:
                     said_layout = True
@@ -658,6 +661,9 @@ def _param(args) -> int:
     from . import parameters
     from .msg import ParameterType
 
+    if args.nodes and args.via_ros:
+        raise SystemExit("xblick param: --nodes lists the nodes of ours, not ROS's: leave out --via-ros "
+                         "(ros2 node list lists ROS's)")
     with zsession.open_from_args(args, prog=f"xblick {args.command}") as z:
         if args.nodes:
             found = parameters.find_nodes(z, args.timeout)

@@ -127,6 +127,7 @@ from . import stamps
 from .camera import (ImageSubscriber, ProtocolError, StaticTransformSubscriber, TransformSubscriber, _check_encoding,
                      parse_attachment)
 from .codecs import JPEG, decompress, parse_format
+from .encodings import EncodingError
 from .detections import DetectionSubscriber
 from .msg import (CameraInfo, Classification, CompressedImage, Detection2DArray, DiagnosticArray, DiagnosticStatus, Imu,
                   TFMessage)
@@ -336,6 +337,10 @@ def declare_selection(params, bridge: RerunBridge, live: bool, said=None):
                    description="each result drawn over images, and over which: <result>: <stream>, ...")
 
 
+class UnshownEncoding(ProtocolError):
+    """A ROS camera's frame of an encoding the bridge does not show."""
+
+
 class RerunBridge:
     """Logs the frames and calibrations of camera streams, the point clouds of point cloud streams (``clouds``), and the
     results of nodes, to a Rerun recording. ``rr``: the rerun module, initialised and connected to a viewer or file by
@@ -351,19 +356,26 @@ class RerunBridge:
     ``layout_after`` None: the layout (blueprint) is sent at the start and again when what it is made from changes. A
     number: sent once, that many seconds after the start, from what has arrived by then (the frames of the streams
     tell where results are drawn); what is added or arrives later goes only into the viewer's data, so that nothing the
-    user arranged is rearranged."""
+    user arranged is rearranged.
+
+    ``drop_unshown`` (``xblick rerun`` without a selection, where ROS cameras come from discovery): a ROS camera whose
+    encoding is not shown ends its own entry instead of the bridge; :meth:`unshown` hands it over once, and it is not
+    added again. Without it such a camera's error ends the bridge (:meth:`check`), as for a topic named."""
 
     def __init__(self, session: zenoh.Session, rr, bases: list[str], clouds: list[str] = (), cloud_rate: float = 5.0,
                  detections: list[str] = (), segmentations: list[str] = (), stale_after: float = 0.0,
                  ages: bool = True, trajectories: list[str] = (), bodies: list[str] = (), imu: list[str] = (),
                  diagnostics: list[str] = (), no_transforms: list[str] = (), camera_extras: bool = True,
-                 layout_after: float | None = None):
+                 layout_after: float | None = None, drop_unshown: bool = False):
         if not any((bases, clouds, detections, segmentations, trajectories, bodies, imu, diagnostics)):
             raise ValueError("nothing to bridge")
         self.rr = rr
         self._session = session
         self._cloud_rate = cloud_rate
         self.camera_extras = camera_extras
+        self.drop_unshown = drop_unshown
+        self._unshown: dict[str, str] = {}  # ROS image topic -> why it is not shown (drop_unshown), for good
+        self._unshown_new: list[tuple[str, str]] = []  # those not handed over by unshown() yet
         self.bases, self.clouds, self.detections, self.segmentations, self.cameras = [], [], [], [], []
         self.trajectories, self.bodies, self.imu, self.diagnostics = [], [], [], []
         self.no_transforms = [topics.check_name(c) for c in no_transforms]
@@ -469,7 +481,8 @@ class RerunBridge:
         given = dict(bases=bases, clouds=clouds, detections=detections, segmentations=segmentations,
                      trajectories=trajectories, bodies=bodies, imu=imu, diagnostics=diagnostics)
         with self._select_lock:
-            new = {kind: [k for k in dict.fromkeys(check_entry(kind, k) for k in keys) if k not in getattr(self, kind)]
+            new = {kind: [k for k in dict.fromkeys(check_entry(kind, k) for k in keys) if k not in getattr(self, kind)
+                          and not (kind == "bases" and k in self._unshown)]
                    for kind, keys in given.items()}
             both = (set(new["segmentations"]) | set(self.segmentations)) & (set(new["bases"]) | set(self.bases))
             if both:
@@ -715,13 +728,30 @@ class RerunBridge:
             subscriber = ImageSubscriber(session, topic, transport="auto", camera_info=True)
             try:
                 while not stop.is_set():
-                    frame = subscriber.latest(timeout=0.5)
-                    if frame is not None and not stop.is_set():
-                        self._log_frame(topic, frame, subscriber.camera_info)
+                    try:
+                        frame = subscriber.latest(timeout=0.5)
+                        if frame is not None and not stop.is_set():
+                            self._log_frame(topic, frame, subscriber.camera_info)
+                    except (UnshownEncoding, EncodingError) as error:
+                        if not self.drop_unshown:
+                            raise
+                        with self._lock:
+                            self._unshown[topic] = str(error)
+                            self._unshown_new.append((topic, str(error)))
+                        return  # unshown() hands it over; the caller removes the entry
             finally:
                 subscriber.close()
         except BaseException as error:  # noqa: BLE001 - raised in the caller's thread by check()
             self._error = error
+
+    def unshown(self) -> list[tuple[str, str]]:
+        """(ROS image topic, why) of the cameras that ``drop_unshown`` ended since the last call, each once; their
+        entries are removed here (in the caller's thread) and never added again."""
+        with self._lock:
+            dropped, self._unshown_new = self._unshown_new, []
+        if dropped:
+            self.remove(bases=[topic for topic, _ in dropped])
+        return dropped
 
     def _log_frame(self, base: str, frame, info):
         """A decoded frame (a ROS camera's) at the entity ``base``, its camera_info (None: none yet) as its
@@ -729,7 +759,7 @@ class RerunBridge:
         rr = self.rr
         image, encoding = frame.image, frame.encoding
         if encoding not in _FRAME_COLOR_MODELS and encoding not in _DEPTH_METERS:
-            raise ProtocolError(f"{base}: {encoding} images are not shown ({', '.join(_FRAME_COLOR_MODELS)}, "
+            raise UnshownEncoding(f"{base}: {encoding} images are not shown ({', '.join(_FRAME_COLOR_MODELS)}, "
                                 f"{', '.join(_DEPTH_METERS)})")
         if encoding in _DEPTH_METERS:
             archetype = rr.DepthImage(image, meter=_DEPTH_METERS[encoding])

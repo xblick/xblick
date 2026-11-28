@@ -60,7 +60,7 @@ off. A node also declares these options as read-only parameters. A program print
 node and domain. It prints a second line when it takes the name of its parameters.
 
 A client whose `--connect` endpoints do not answer ends with one line and exit code 1. The line names the endpoints
-and says that a client needs its router there. In our tests Zenoh gave up within 10 s. Another error at the start of a
+and says that a client needs its router there. Another error at the start of a
 session, such as a `--listen` port that is taken, also ends with one line. Nodes that open their session with
 `session.open_from_args` and the C++ programs do the same.
 
@@ -110,7 +110,7 @@ from ROS with `auto`, as the subscribers do.
 
 | Option | Meaning |
 | --- | --- |
-| `--transport auto\|compressed\|raw\|shm\|ros` | the transport to measure. `ros` reads the ROS 2 topic `/<stream>/image_raw` of a ROS camera. For a ROS topic `/T`: `auto` reads `/T`, or `/T/compressed` when only that is published. `ros` and `raw` read `/T`, `compressed` reads `/T/compressed`. |
+| `--transport auto\|compressed\|raw\|shm\|ros` | the transport to measure. `ros` reads the ROS 2 topic `/<stream>/image_raw` of a ROS camera, and `/<stream>/cloud` of a point cloud stream. For a ROS topic `/T`: `auto` reads `/T`, or `/T/compressed` when only that is published. `ros` and `raw` read `/T`, `compressed` reads `/T/compressed`. |
 | `--seconds S` | stop after this time |
 
 ### `xblick snapshot <stream> <file>`
@@ -131,7 +131,9 @@ Prints the state of every program that publishes for a camera, once per second.
 ### `xblick rerun [streams ...]`
 
 Shows streams and node results in the Rerun viewer. It shows its selection: the streams given as arguments and the
-topics that the options below name. Without a selection it shows everything that it finds. Needs the extra
+topics that the options below name. Without a selection it shows everything that it finds. A ROS camera that it
+finds with an encoding it does not show, such as `yuv422` or `bayer_rggb8`, is named in one line and left out; a ROS
+topic named in the selection with such an encoding ends `xblick rerun` with that error. Needs the extra
 `xblick[rerun]`. See the [viewer guide](../guides/viewer.md).
 
 | Option | Meaning |
@@ -234,7 +236,7 @@ Reads and changes the parameters of a node. See [parameters](parameters.md).
 | `--atomically` | with `--set`: change all or none |
 | `--dump FILE` | write the parameters as a ROS params file |
 | `--timeout S` | how long to wait for the node |
-| `--via-ros` | the parameters of the ROS node `/<--node>` through ROS 2's keys, such as `--node talker`. A set carries no node and no deadline, because ROS has neither. |
+| `--via-ros` | the parameters of the ROS node `/<--node>` through ROS 2's keys, such as `--node talker`. A set carries no node and no deadline, because ROS has neither. Refused with `--nodes`, which lists our nodes only. |
 
 ## Record and play
 

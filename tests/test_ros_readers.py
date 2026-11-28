@@ -52,15 +52,20 @@ class RosCamera:
     """A stand-in for a ROS camera driver: ROS publishers of the given (topic, type) pairs in a session that declares
     no program of ours, publishing a 4 x 6 mono8 image (or its PNG; on a ``.../compressedDepth`` topic a 16UC1 image
     as ROS's compressedDepth plugin writes it) and a CameraInfo every 50 ms until ``close``. ``stamp_ns``: every
-    header with that stamp (a driver whose stamps do not advance), else the time of sending."""
+    header with that stamp (a driver whose stamps do not advance), else the time of sending. A (topic, type, "16UC1")
+    triple publishes the 16UC1 depth image instead: on an Image topic as it is, on a ``.../compressed`` topic as
+    image_transport's compressed plugin turns depth into 8-bit JPEG (here an 8-bit PNG of the clamped values). A
+    (topic, Image type, encoding) triple of another encoding publishes the mono8 image's bytes under that encoding."""
 
     def __init__(self, endpoint: str, domain: int = DOMAIN, stamp_ns: int | None = None, **topics_):
         self.session = session.open_session(connect=[endpoint], declare=False,
                                             ros_options=session.RosOptions(domain, "ros_camera"))
         self.stamp_ns = stamp_ns
-        self.topics = dict(topics_)
+        self.topics = {name: spec[:2] for name, spec in topics_.items()}
+        self.encodings = {name: spec[2] for name, spec in topics_.items() if len(spec) > 2}
+        self.depth_topics = {name for name, encoding in self.encodings.items() if encoding == "16UC1"}
         self.publishers = {name: self.session.ros.node.publisher(topic, kind)
-                           for name, (topic, kind) in topics_.items()}
+                           for name, (topic, kind) in self.topics.items()}
         self.image = np.arange(24, dtype=np.uint8).reshape(4, 6)
         self.depth = (np.arange(24, dtype=np.uint16).reshape(4, 6) * 1000 + 7).astype(np.uint16)
         self._stop = threading.Event()
@@ -72,11 +77,18 @@ class RosCamera:
             stamp = time.time_ns() if self.stamp_ns is None else self.stamp_ns
             header = Header(Time.from_ns(stamp), "ros_camera_optical")
             for name, publisher in self.publishers.items():
-                if publisher.type_name == Image.TYPE:
+                if publisher.type_name == Image.TYPE and name in self.depth_topics:
+                    payload = numpy_to_image(self.depth, "16UC1", header).serialize()
+                elif publisher.type_name == Image.TYPE and name in self.encodings:
+                    payload = Image(header, 4, 6, self.encodings[name], 0, 6, self.image.tobytes()).serialize()
+                elif publisher.type_name == Image.TYPE:
                     payload = numpy_to_image(self.image, "mono8", header).serialize()
                 elif publisher.type_name == ros.COMPRESSED_TYPE and self.topics[name][0].endswith(
                         "/" + ros.COMPRESSED_DEPTH):
                     payload = ros_compressed_depth(self.depth, header).serialize()
+                elif publisher.type_name == ros.COMPRESSED_TYPE and name in self.depth_topics:
+                    clamped = compress(np.clip(self.depth, 0, 255).astype(np.uint8), "mono8", "png", header=header)
+                    payload = CompressedImage(header, "16UC1; jpeg compressed mono8", clamped.data).serialize()
                 elif publisher.type_name == ros.COMPRESSED_TYPE:
                     payload = compress(self.image, "mono8", "png", header=header).serialize()
                 elif publisher.type_name == CameraInfo.TYPE:
@@ -557,10 +569,55 @@ def test_xblick_rerun_bridges_a_ros_camera(network):
         camera.close()
 
 
-def test_a_ros_camera_is_recorded_under_its_topics_and_plays_as_a_stream(network, tmp_path):
-    """xblick record in ROS 2: a ROS camera's topics under their ROS names, as ros2 bag record writes them (the
-    compressed form first, else compressedDepth, else the image topic; its camera_info); xblick play makes streams
-    of ours of image_transport's names, a compressedDepth-only camera's frames decoded."""
+def test_xblick_rerun_leaves_out_a_found_ros_camera_it_does_not_show(network):
+    """Found by discovery (drop_unshown), a ROS camera of an encoding not shown (bayer_rggb8: not drawn; yuv422: not
+    an encoding of ours) is handed over once by unshown(), removed and not added again; the bridge goes on. Named, the
+    same camera ends the bridge with its error."""
+    from test_rerun_bridge import FakeRerun
+
+    from xblick.camera import ProtocolError
+    from xblick.rerun_bridge import RerunBridge
+
+    endpoint, reader = network
+    camera = RosCamera(endpoint, ok=("/fine/image_raw", Image.TYPE),
+                       bayer=("/bayer/image_raw", Image.TYPE, "bayer_rggb8"),
+                       yuv=("/yuv/image_raw", Image.TYPE, "yuv422"))
+    topics_ = ["/fine/image_raw", "/bayer/image_raw", "/yuv/image_raw"]
+    bridge = RerunBridge(reader, FakeRerun(), topics_, drop_unshown=True)
+    try:
+        dropped = []
+        end = time.monotonic() + 8.0
+        while len(dropped) < 2 and time.monotonic() < end:
+            bridge.check()
+            dropped += bridge.unshown()
+            time.sleep(0.05)
+        assert sorted(t for t, _ in dropped) == ["/bayer/image_raw", "/yuv/image_raw"], dropped
+        assert "bayer_rggb8 images are not shown" in dict(dropped)["/bayer/image_raw"]
+        assert "yuv422" in dict(dropped)["/yuv/image_raw"]
+        assert bridge.bases == ["/fine/image_raw"]
+        assert bridge.add(bases=topics_) == [] and bridge.bases == ["/fine/image_raw"]
+        time.sleep(0.3)
+        bridge.check()
+        assert bridge.unshown() == [] and bridge.frames["/fine/image_raw"] > 0
+    finally:
+        bridge.close()
+    named = RerunBridge(reader, FakeRerun(), ["/bayer/image_raw"])
+    try:
+        with pytest.raises(ProtocolError, match="bayer_rggb8 images are not shown"):
+            end = time.monotonic() + 8.0
+            while time.monotonic() < end:
+                named.check()
+                time.sleep(0.05)
+    finally:
+        named.close()
+        camera.close()
+
+
+def test_a_ros_camera_is_recorded_under_its_topics_and_plays_as_a_stream(network, tmp_path, capsys):
+    """xblick record in ROS 2: a ROS camera's topics under their ROS names, as ros2 bag record writes them (the form
+    that keeps the encoding: compressed for mono8, compressedDepth for 16UC1, never the 8-bit compressed form of depth
+    image_transport offers as well; its camera_info), the choice in its line; xblick play makes streams of ours of
+    image_transport's names, a compressedDepth camera's frames decoded."""
     from test_recording import mcap_reader
 
     from xblick import recording
@@ -569,6 +626,8 @@ def test_a_ros_camera_is_recorded_under_its_topics_and_plays_as_a_stream(network
     camera = RosCamera(endpoint, image=("/roscam/color/image_raw", Image.TYPE),
                        compressed=("/roscam/color/image_raw/compressed", ros.COMPRESSED_TYPE),
                        info=("/roscam/color/camera_info", CameraInfo.TYPE),
+                       depth_raw=("/roscam/depth/image_raw", Image.TYPE, "16UC1"),
+                       depth_jpeg=("/roscam/depth/image_raw/compressed", ros.COMPRESSED_TYPE, "16UC1"),
                        depth=("/roscam/depth/image_raw/compressedDepth", ros.COMPRESSED_TYPE),
                        depth_info=("/roscam/depth/camera_info", CameraInfo.TYPE))
     recorder = recording.Recorder(reader, tmp_path, look_every=0.5)
@@ -580,12 +639,17 @@ def test_a_ros_camera_is_recorded_under_its_topics_and_plays_as_a_stream(network
         result = recorder.stop()
     finally:
         camera.close()
+    out = capsys.readouterr().out
+    assert ("recording the ROS camera /roscam/depth/image_raw as /roscam/depth/image_raw/compressedDepth "
+            "(16UC1: its compressedDepth form)") in out, out
+    assert "as /roscam/color/image_raw/compressed (mono8: its compressed form)" in out, out
     path = result["recording"]["files"][0]
     with open(path, "rb") as stream:
         channels = {c.topic: c.metadata for c in mcap_reader.make_reader(stream).get_summary().channels.values()}
     assert {"/roscam/color/image_raw/compressed", "/roscam/color/camera_info", "/roscam/depth/image_raw/compressedDepth",
             "/roscam/depth/camera_info"} <= set(channels), channels
-    assert "/roscam/color/image_raw" not in channels  # the compressed form first
+    assert not {"/roscam/color/image_raw", "/roscam/depth/image_raw", "/roscam/depth/image_raw/compressed"} & set(
+        channels)  # one form each
     assert all("zenoh_key" not in channels[t] for t in channels if t.startswith("/roscam/"))
     played = session.open_session(connect=[endpoint], ros_options=False)
     player = recording.Player(played, [path], loop=True)

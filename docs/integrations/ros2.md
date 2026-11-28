@@ -222,8 +222,11 @@ millimetres, `32FC1` as depth in metres. A ROS camera has no transforms in the v
 diagnostics: ROS keeps its transforms on its global `/tf` and `/tf_static`.
 
 `xblick record` records such cameras under their ROS topic names, each channel as `ros2 bag record` writes it. Of an
-image topic `/T` it records the first form its publishers offer of `/T/compressed`, `/T/compressedDepth` and `/T`,
-and the camera_info beside it. With `--points` it records the PointCloud2 topics too. `xblick play` plays these
+image topic `/T` it records one form, chosen by the image's encoding: `/T/compressedDepth` for `16UC1`, `mono16` and
+`32FC1`, `/T/compressed` for 8-bit images, else `/T` itself; a form that is the only one offered is taken as it is.
+image_transport offers every installed plugin for every image, and its `compressed` form of a depth image is 8-bit
+JPEG. Where more than one form is offered, the recorder reads the encoding from one message of `/T` (or the format of
+`/T/compressed`) first, and prints the form it chose. It records the camera_info beside it. With `--points` it records the PointCloud2 topics too. `xblick play` plays these
 channels as it plays a rosbag2: a camera on image_transport's names, `/<base>/image_raw`, its compressed or its
 compressedDepth form with `/<base>/camera_info`, becomes the stream `<base>` of ours. A compressedDepth form is
 decoded and compressed again as a live camera's frames are. Other topics play on their keys and their ROS topics.
@@ -332,8 +335,8 @@ Our other services are offered to ROS only where a ROS service type fits exactly
 
 A Zenoh router serves our programs and ROS nodes alike. Both default to port 7447, so run one router per PC: either
 `xblick router` or ROS's `rmw_zenohd`. Our programs find `rmw_zenohd` there without options, and ROS nodes find
-`xblick router` with their default configuration. Both ways were tested on another port: our tests run against
-`rmw_zenohd`, and ROS's `talker` and `listener` talked through `xblick router`.
+`xblick router` with their default configuration. On another port, give both sides the same endpoint: our programs
+`--connect`, ROS nodes their Zenoh configuration.
 
 ## Try it with ROS 2's tools
 

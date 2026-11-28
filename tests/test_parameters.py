@@ -277,6 +277,14 @@ def test_xblick_param(capsys, tmp_path):
     a.close()
 
 
+def test_xblick_param_refuses_nodes_with_via_ros():
+    """--nodes lists our nodes only: with --via-ros it is refused, not --via-ros left unheeded."""
+    from xblick import cli
+
+    with pytest.raises(SystemExit, match="--nodes lists the nodes of ours, not ROS's: leave out --via-ros"):
+        cli.main(["param", "--nodes", "--via-ros"])
+
+
 def test_apply_all_in_declaration_order():
     """apply_all writes in the order of declaration, not of the names: the value (which switches the device to
     manual) before its auto_* bool, so a control given auto at the start ends in auto."""

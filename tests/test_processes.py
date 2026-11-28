@@ -494,6 +494,7 @@ PY = sys.executable
     (["/venv/bin/xblick", "list"], [PY, "/venv/bin/xblick", "list"], "note"),
     (["-m", "hz", "/T"], [PY, "-X", "importtime", "-m", "xblick.cli", "hz", "/T"], "note"),
     (["-m", "router"], [PY, "-mxblick.cli", "router"], "note"),
+    (["-m", "list"], [PY, "-Im", "xblick.cli", "list"], "note"),
     (["/venv/bin/xblick", "relay"], [PY, "/venv/bin/xblick", "relay"], "SIG_DFL"),
     (["/venv/bin/xblick"], [PY, "/venv/bin/xblick"], "SIG_DFL"),
     (["/venv/bin/xblick", "--connect", "pc"], [PY, "/venv/bin/xblick", "--connect", "pc"], "SIG_DFL"),
@@ -509,6 +510,22 @@ def test_signals_are_held_from_the_first_line_of_the_package(argv, orig_argv, ha
     done = subprocess.run([sys.executable, "-c", HELD.format(argv=argv, orig_argv=orig_argv)],
                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60, env=ENV)
     assert done.returncode == 0 and done.stdout == f"{handler}\nTrue\n" and not done.stderr, done.stdout + done.stderr
+
+
+@pytest.mark.parametrize("orig_argv, module", [
+    ([PY, "-m", "xblick.cli"], "xblick.cli"), ([PY, "-mxblick.cli"], "xblick.cli"),
+    ([PY, "-Im", "xblick.cli"], "xblick.cli"), ([PY, "-um", "xblick.cli"], "xblick.cli"),
+    ([PY, "-Bm", "xblick.cli"], "xblick.cli"), ([PY, "-OOm", "xblick.cli"], "xblick.cli"),
+    ([PY, "-Imxblick.cli"], "xblick.cli"), ([PY, "-X", "dev", "-m", "xblick.cli"], "xblick.cli"),
+    ([PY, "-Xdev", "-Im", "xblick.cli"], "xblick.cli"), ([PY, "-IW", "error", "-m", "xblick.cli"], "xblick.cli"),
+    ([PY, "-IWmodule", "-m", "xblick.cli"], "xblick.cli"),  # m inside W's value is no -m
+    ([PY, "--check-hash-based-pycs", "always", "-m", "xblick.cli"], "xblick.cli"),
+    ([PY, "-Ic", "import xblick"], None), ([PY, "-I", "script.py", "-m", "xblick.cli"], None),
+    ([PY, "-"], None), ([PY], None)])
+def test_the_module_of_python_m_with_combined_options(orig_argv, module):
+    from xblick import _signals
+
+    assert _signals._module_of(orig_argv) == module
 
 
 STARTING = """

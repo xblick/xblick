@@ -175,8 +175,9 @@ tracked the objects at 10 frames per second, as on the live simulation.
 ### Files of `ros2 bag record`
 
 `play` also plays rosbag2 files in the MCAP storage, which `ros2 bag record` uses by default. Give the bag's
-directory, which holds `metadata.yaml`, or its `.mcap` files. `play` maps each ROS topic to a key by the rule
-of live reading: the topic `/a/b` becomes the key `a/b`.
+directory, which holds `metadata.yaml`, or its `.mcap` files. Of a directory `play` plays the files in the order
+`relative_file_paths` of `metadata.yaml` gives, which is the order they were recorded in. `play` maps each ROS topic
+to a key by the rule of live reading: the topic `/a/b` becomes the key `a/b`.
 
 | Topics in the bag | What `play` publishes |
 | --- | --- |
@@ -188,7 +189,8 @@ of live reading: the topic `/a/b` becomes the key `a/b`.
 
 A bag with both `image_raw` and `image_raw/compressed` of one stream plays `image_raw`. `play` says so in one line.
 In ROS 2 the playback offers its streams to ROS as every publisher does, so `/tf` and `/tf_static` reach ROS's
-global topics again. rosbag2's sqlite3 storage (`.db3` files) is refused with a message. Convert such a bag to MCAP:
+global topics again. rosbag2's sqlite3 storage (`.db3` files) is refused with a message, and so is a bag that
+rosbag2 compressed (`ros2 bag record --compression-mode file` or `message`). Convert such a bag to uncompressed MCAP:
 
 ```yaml
 # out.yaml

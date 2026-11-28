@@ -19,10 +19,9 @@ bag play`` feeds tf2 from a recording; ``play`` leaves that copy out (``ROS_COPY
 
 In a session in ROS 2 it also records the cameras that exist only as ROS topics (ros.camera_streams, below
 ``prefix``; never the ROS copies of our programs' streams), under their ROS topic names as they are, each channel as
-``ros2 bag record`` writes it (CDR with its ros2msg schema, no ``zenoh_key``): of an image topic ``T`` the first form
-its publishers offer of image_transport's ``T/compressed``, ``T/compressedDepth`` and ``T`` itself (compressed
-first, as for a stream of ours), and its ``camera_info`` beside it (ROS's convention); with ``points`` its
-PointCloud2 topics. ``play`` plays them as a rosbag2's channels (below).
+``ros2 bag record`` writes it (CDR with its ros2msg schema, no ``zenoh_key``): of an image topic ``T`` the one of
+image_transport's ``T/compressedDepth``, ``T/compressed`` and ``T`` that keeps its encoding (``ros_record_form``), and
+its ``camera_info`` beside it (ROS's convention); with ``points`` its PointCloud2 topics. ``play`` plays them as a rosbag2's channels (below).
 
 **One node records and plays** (``Recorder``; ``xblick record`` starts it recording, ``xblick play`` playing,
 both take every command later). On ``xblick/<name>/control`` (plain text or JSON ``{"command": ...}``) it takes
@@ -91,6 +90,7 @@ import threading
 import time
 from pathlib import Path
 
+import numpy as np
 import zenoh
 
 from . import _core, declaration, ros, topics
@@ -98,7 +98,8 @@ from .camera import (FIND_PERIOD, INFO_VERSION, SENT_VERSION, CameraPublisher, P
                      _check_encoding, _declare_advanced_history, _undeclare, congestion, find_streams,
                      parse_attachment)
 from .codecs import CODEC_ENCODINGS, JPEG, RVL, decompress, parse_format
-from .encodings import image_to_numpy
+from .encodings import EncodingError, image_to_numpy
+from .encodings import info as encoding_info
 from .msg import CameraInfo, Clock, CompressedImage, Image, Message, PointCloud2, TFMessage, Time
 from .msgdefs import MSGDEFS
 from .parameters import Parameters
@@ -315,21 +316,80 @@ class RosbagError(ValueError):
 
 
 def rosbag_files(path: str | Path) -> list[Path]:
-    """The files to play for ``path``: a rosbag2 directory (it has metadata.yaml) is its MCAP files in name order,
-    another path itself. RosbagError for rosbag2's sqlite3 storage (a directory of .db3 files, or such a file)."""
+    """The files to play for ``path``: a rosbag2 directory (it has metadata.yaml) is its MCAP files in the order of
+    metadata.yaml's ``relative_file_paths`` (the order they were recorded in; by name ``bag_10`` would come before
+    ``bag_2``), another path itself. RosbagError for rosbag2's sqlite3 storage (a directory of .db3 files, or such a
+    file), for a bag rosbag2 compressed (its files or its messages), for a metadata.yaml without
+    ``relative_file_paths`` and for a file it names that is missing or not MCAP."""
     path = Path(path)
     if path.is_dir() and (path / ROSBAG_METADATA).is_file():
-        files = sorted(path.glob("*.mcap"))
-        if not files:
+        metadata = rosbag_metadata(path / ROSBAG_METADATA)
+        if metadata["compression_format"] or metadata["compression_mode"] not in ("", "none", "NONE"):
+            raise RosbagError(
+                f"{path}: a rosbag2 with rosbag2's compression (compression_mode {metadata['compression_mode'] or '?'}, "
+                f"compression_format {metadata['compression_format'] or '?'}); xblick play reads uncompressed MCAP "
+                "files only. Convert it with ros2 bag convert -i BAG -o OUT.yaml, OUT.yaml naming an output bag with "
+                "storage_id: mcap and no compression_mode")
+        names = metadata["relative_file_paths"]
+        if names is None:
             if any(path.glob("*.db3")):
                 raise RosbagError(sqlite_text(path))
+            raise RosbagError(f"{path}: its {ROSBAG_METADATA} has no relative_file_paths (the order of its files); "
+                              "ros2 bag reindex writes it")
+        if not names:
             raise RosbagError(f"{path}: a rosbag2 directory without MCAP files")
+        files = [path / name for name in names]
+        for f in files:
+            if f.suffix == ".db3":
+                raise RosbagError(sqlite_text(path))
+            if f.suffix != ".mcap":
+                raise RosbagError(f"{path}: {f.name} (in {ROSBAG_METADATA}) is no MCAP file")
+            if not f.is_file():
+                raise RosbagError(f"{path}: {f.name} (in {ROSBAG_METADATA}) is missing")
         return files
     if path.is_file():
+        if path.suffix == ".zstd":
+            raise RosbagError(f"{path}: a file of a rosbag2 with rosbag2's compression; xblick play reads uncompressed "
+                              "MCAP files only (zstd -d makes the MCAP file of it)")
         with open(path, "rb") as stream:
             if stream.read(len(SQLITE_MAGIC)) == SQLITE_MAGIC:
                 raise RosbagError(sqlite_text(path))
     return [path]
+
+
+def rosbag_metadata(path: Path) -> dict:
+    """What ``rosbag_files`` needs of a rosbag2's metadata.yaml, as rosbag2 writes it (block style, the keys below
+    ``rosbag2_bagfile_information``): ``relative_file_paths`` (a list, None without the key), ``compression_format``
+    and ``compression_mode`` ("" without them). The list may be a block (``- name`` lines) or a flow ``[a, b]``."""
+    found = {"relative_file_paths": None, "compression_format": "", "compression_mode": ""}
+    lines = path.read_text().splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].split(" #")[0].rstrip()
+        key, sep, rest = line.strip().partition(":")
+        indent = len(line) - len(line.lstrip(" "))
+        i += 1
+        if not sep or key not in found:
+            continue
+        rest = rest.strip()
+        if key != "relative_file_paths":
+            found[key] = rest.strip("'\"")
+            continue
+        if rest.startswith("["):
+            found[key] = [n.strip().strip("'\"") for n in rest.strip("[]").split(",") if n.strip()]
+            continue
+        names = []
+        while i < len(lines):
+            item = lines[i].split(" #")[0].rstrip()
+            if not item.strip():
+                i += 1
+                continue
+            if len(item) - len(item.lstrip(" ")) < indent or not item.strip().startswith("- "):
+                break
+            names.append(item.strip()[2:].strip().strip("'\""))
+            i += 1
+        found[key] = names
+    return found
 
 
 def sqlite_text(path: Path) -> str:
@@ -384,6 +444,35 @@ def rosbag_streams(channels, wanted) -> tuple[set[str], set[str]]:
 
 
 COMPRESSED_DEPTH = f"{topics.IMAGE_RAW}/{ros.COMPRESSED_DEPTH}"  # image_transport's compressedDepth of image_raw
+DEPTH_ENCODINGS = ("16UC1", "mono16", "32FC1")  # the encodings image_transport's compressedDepth takes
+PROBE_S = 1.0  # s xblick record waits for one message of a ROS camera to read its encoding (Recorder._look_ros)
+
+
+def ros_record_form(image: str, encoding: str | None, offers: list[str]) -> tuple[str | None, str]:
+    """(the topic xblick record takes of the ROS camera ``image``, why), or (None, why) for none. ``offers``: the
+    forms its publishers offer of ``image``, ``image/compressed``, ``image/compressedDepth``; ``encoding``: the
+    camera's (needed only for more than one form). The form keeps the encoding: compressedDepth for 16-bit and float
+    depth, compressed for 8-bit images, else the image itself. image_transport offers every installed plugin for every
+    image, and its compressed form of depth is 8-bit JPEG (16-bit depth clamped to 0-255; 32FC1 not published)."""
+    if len(offers) == 1:
+        return offers[0], "the only form offered"
+    if encoding is None:
+        return None, "its encoding is not known (no image topic, and the compressed format names none)"
+    compressed, depth = ros.compressed_topic(image), ros.compressed_depth_topic(image)
+    if encoding in DEPTH_ENCODINGS and depth in offers:
+        return depth, f"{encoding}: its compressedDepth form"
+    if encoding not in DEPTH_ENCODINGS and _eight_bit(encoding) and compressed in offers:
+        return compressed, f"{encoding}: its compressed form"
+    if image in offers:
+        return image, f"{encoding}: raw, no compressed form keeps it"
+    return None, f"{encoding}: none of the offered forms ({', '.join(offers)}) keeps it"
+
+
+def _eight_bit(encoding: str) -> bool:
+    try:
+        return encoding_info(encoding).dtype == np.uint8
+    except EncodingError:
+        return False
 
 
 def rosbag_depth_streams(channels, wanted) -> set[str]:
@@ -1127,6 +1216,7 @@ class Recorder:
     def _look(self):
         """Thread: the streams and detections, looked for every look_every seconds; in ROS 2 the ROS cameras too
         (``_look_ros``)."""
+        probes, decided = {}, {}  # _look_ros's, of this recording
         try:
             graph = self.session.ros.graph if getattr(self.session, "ros", None) is not None else None
             while not self._stopping.is_set():
@@ -1145,30 +1235,78 @@ class Recorder:
                     elif kind == "points" and self.points:
                         self._subscribe(topics.cloud(base), record)
                 if graph is not None:  # after find_streams: the graph, made before it, knows ROS's publishers by then
-                    self._look_ros(graph)
+                    self._look_ros(graph, probes, decided)
                 self._stopping.wait(self.look_every)
         except BaseException as error:  # noqa: BLE001 - raised in the caller's thread by check()
             self._error = error
+        finally:
+            for subscriber, _ in probes.values():
+                _undeclare(subscriber)
 
-    def _look_ros(self, graph: ros.Graph):
-        """The cameras that exist only as ROS topics (ros.camera_streams): of each image topic the first form its
-        publishers offer of ``T/compressed``, ``T/compressedDepth`` and ``T``, and its camera_info beside it; with
-        ``points`` the PointCloud2 topics. Said once each."""
+    def _look_ros(self, graph: ros.Graph, probes: dict, decided: dict):
+        """The cameras that exist only as ROS topics (ros.camera_streams): of each image topic ``T`` the form
+        ``ros_record_form`` picks by its encoding, and its camera_info beside it; with ``points`` the PointCloud2
+        topics. Said once each. Where its publishers offer more than one form, the encoding comes from one message of
+        the first offered of ``T``, ``T/compressed``, ``T/compressedDepth`` (``probes``: image -> (subscriber,
+        [encoding])), waited for up to PROBE_S here, else taken on a later look. ``decided``: image -> form, of this
+        recording."""
         found = ros.camera_streams(graph, self.prefix)
         offered = {(t.topic, t.type_name) for t in graph.publishers() if not graph.by_xblick(t.zid)}
+        forms = {}  # image -> the forms its publishers offer, in the probe's order
         for image in found["images"]:
-            form = next((topic for topic, kind in ((ros.compressed_topic(image), ros.COMPRESSED_TYPE),
-                                                   (ros.compressed_depth_topic(image), ros.COMPRESSED_TYPE),
-                                                   (image, ros.IMAGE_TYPE)) if (topic, kind) in offered), None)
-            if form is None:  # gone meanwhile
+            if image in decided:
                 continue
-            if form not in self._subscribers:
-                print(f"{self.prog}: recording the ROS camera {image} as {form} and {ros.camera_info_topic(image)}",
-                      flush=True)
+            forms[image] = [topic for topic, kind in ((image, ros.IMAGE_TYPE),
+                                                      (ros.compressed_topic(image), ros.COMPRESSED_TYPE),
+                                                      (ros.compressed_depth_topic(image), ros.COMPRESSED_TYPE))
+                            if (topic, kind) in offered]
+            if len(forms[image]) > 1 and image not in probes:
+                probes[image] = self._probe(forms[image][0], image)
+        end = time.monotonic() + PROBE_S
+        while (any(not probes[i][1] for i in forms if i in probes) and time.monotonic() < end
+               and not self._stopping.is_set()):
+            self._stopping.wait(0.02)
+        for image, offers in forms.items():
+            if not offers:  # gone meanwhile
+                continue
+            encoding = unread = None
+            if image in probes:
+                if not probes[image][1]:
+                    continue  # no message yet: a later look
+                encoding, unread = probes[image][1][0]
+                _undeclare(probes.pop(image)[0])
+            form, why = (None, unread) if unread is not None else ros_record_form(image, encoding, offers)
+            decided[image] = form
+            if form is None:
+                print(f"{self.prog}: the ROS camera {image}: {why}: not recorded", flush=True)
+                continue
+            print(f"{self.prog}: recording the ROS camera {image} as {form} ({why}) and "
+                  f"{ros.camera_info_topic(image)}", flush=True)
             self._subscribe_ros(form, ros.COMPRESSED_TYPE if form != image else ros.IMAGE_TYPE)
             self._subscribe_ros(ros.camera_info_topic(image), ros.CAMERA_INFO_TYPE)
         for cloud in found["clouds"] if self.points else ():
             self._subscribe_ros(cloud, ros.CLOUD_TYPE)
+
+    def _probe(self, topic: str, image: str):
+        """(subscriber, [(encoding, None) or (None, why)]): the encoding of ``topic``'s first message, an Image's, or
+        the one a CompressedImage's format names (``"<encoding>; ..."``; None if it names none); ``why`` if that
+        message cannot be read."""
+        got: list = []
+
+        def take(payload, *_):
+            if got:
+                return
+            try:
+                if topic == image:
+                    got.append((Image.deserialize(payload).encoding, None))
+                else:
+                    text = CompressedImage.deserialize(payload).format
+                    got.append((text.split(";")[0].strip() if ";" in text else None, None))
+            except Exception as error:  # noqa: BLE001 - said in the camera's line, the camera not recorded
+                got.append((None, f"its first message on {topic} cannot be read ({type(error).__name__}: {error})"))
+
+        kind = ros.IMAGE_TYPE if topic == image else ros.COMPRESSED_TYPE
+        return self.session.ros.node.subscriber(topic, kind, take, daemon=True), got
 
     def _log_ns(self, key: str, encoding: str, payload: bytes, received_ns: int) -> int:
         return received_ns if self.log_time == "receive" else header_stamp(key, encoding, payload)
@@ -1832,6 +1970,9 @@ class Player(Paced):
             if key[: -len(topics.CAMERA_INFO) - 1] not in self._cameras:  # camera_info of a stream not played
                 self._publishers[key] = self.session.declare_publisher(
                     self._out(key), encoding=zenoh.Encoding(self._encodings[key]), congestion_control=self._congestion)
+                mirrored = self._ros_publisher(self._out(key), self._encodings[key])  # as the image beside it
+                if mirrored is not None:
+                    self._ros[key] = mirrored
 
     def _serve_cloud_info(self, key: str, cloud):
         """The info record of a rosbag2's point cloud ``<base>/cloud``, from its first cloud: raw only."""
@@ -1911,15 +2052,21 @@ class Player(Paced):
             self._static[key] = payload
 
     def _messages(self, from_ns: int | None = None):
-        """(log time ns, key, payload) of all files in log-time order (from log time ``from_ns`` on)."""
+        """(log time ns, key, payload) of all files in log-time order (from log time ``from_ns`` on). A rosbag2's
+        ``<base>/image_raw/compressed`` is left out when its stream plays from ``<base>/image_raw`` (``_raw_streams``):
+        the playback camera compresses those frames itself, and the bag's would go out a second time."""
         for path in self.files:
             self._file = str(path)
             with open(path, "rb") as stream:
                 for _, channel, message in self.mcap.reader.make_reader(stream).iter_messages(
                         log_time_order=True, **({"starting_at": from_ns} if from_ns is not None else {})):
                     key = key_of(channel)
-                    if key is not None and self._wanted(key):
-                        yield message.log_time, key, message.data
+                    if key is None or not self._wanted(key):
+                        continue
+                    if (key.endswith("/" + topics.COMPRESSED) and "zenoh_key" not in channel.metadata
+                            and key[: -len(topics.COMPRESSED) - 1] in self._raw_streams):
+                        continue
+                    yield message.log_time, key, message.data
 
     def run(self):
         """Play until the end of the files (with ``loop`` until :meth:`end`). An error ends it and stays in
