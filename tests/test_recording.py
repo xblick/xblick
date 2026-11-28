@@ -604,3 +604,24 @@ def test_a_rosbag2_loops_without_a_gap_for_its_tf_static(sessions, tmp_path):  #
         assert player._pass_ns == 400_000_000 + 100_000_000
     finally:
         player.close()
+
+
+def test_a_ros_camera_is_recorded_in_the_form_that_keeps_its_encoding():
+    """ros_record_form: compressedDepth for 16-bit and float depth, compressed for 8-bit images, else the image itself;
+    a form that is the only one offered as it is; none where no offered form keeps the encoding."""
+    t, c, d = "/cam/image_raw", "/cam/image_raw/compressed", "/cam/image_raw/compressedDepth"
+    every = [t, c, d]
+    assert recording.ros_record_form(t, "16UC1", every)[0] == d
+    assert recording.ros_record_form(t, "32FC1", every)[0] == d
+    assert recording.ros_record_form(t, "mono16", every)[0] == d
+    assert recording.ros_record_form(t, "rgb8", every) == (c, "rgb8: its compressed form")
+    assert recording.ros_record_form(t, "bayer_rggb8", every)[0] == c
+    assert recording.ros_record_form(t, "rgb16", every)[0] == t
+    assert recording.ros_record_form(t, "yuv422", every)[0] == t  # not an encoding of ours: as it is
+    assert recording.ros_record_form(t, "16UC1", [t, c])[0] == t  # never the 8-bit JPEG of depth
+    assert recording.ros_record_form(t, None, [c]) == (c, "the only form offered")
+    assert recording.ros_record_form(t, None, [d])[0] == d
+    form, why = recording.ros_record_form(t, None, [c, d])
+    assert form is None and "encoding is not known" in why
+    form, why = recording.ros_record_form(t, "32FC1", [c, d][:1] + ["/cam/image_raw/other"])
+    assert form is None and "none of the offered forms" in why
